@@ -69,19 +69,13 @@ mod tests {
     use super::*;
 
     /// Files that fail Step 6c for reasons outside the parser's control:
-    /// they reference types from system headers this corpus doesn't include
-    /// (`FILE`/`va_list` from libc, `Display` from X11) or need `#define`
-    /// macro *expansion* (not just conditional resolution, which is all
-    /// Step 3 does) to parse a string built from a macro constant. See
-    /// docs/KNOWN_LIMITATIONS.md.
-    const EXPECTED_FAILURES: &[&str] = &[
-        "d_main.c",
-        "g_game.c",
-        "i_system.c",
-        "i_video.c",
-        "m_menu.c",
-        "z_zone.c",
-    ];
+    /// `d_main.c`/`g_game.c`/`m_menu.c` need `#define` macro *expansion*
+    /// (not just conditional resolution, which is all Step 3 does) to parse
+    /// a string built from a macro constant; `i_video.c` needs a large
+    /// chunk of X11's `<Xlib.h>` type vocabulary (`Display`, `Window`,
+    /// `Colormap`, `Visual`, ... -- large enough that hand-seeding it isn't
+    /// "small" the way `FILE`/`va_list` were). See docs/KNOWN_LIMITATIONS.md.
+    const EXPECTED_FAILURES: &[&str] = &["d_main.c", "g_game.c", "i_video.c", "m_menu.c"];
 
     #[test]
     fn test_full_corpus_c_files_parse_except_known_limitations() {

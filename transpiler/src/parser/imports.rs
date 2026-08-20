@@ -8,8 +8,9 @@
 //! `.c`/`.h` file as its own translation unit.
 //!
 //! System includes (`#include <...>`) can't be resolved against this
-//! corpus and are simply left out of the set (e.g. `i_video.c`'s X11 types
-//! stay unresolved -- see `docs/KNOWN_LIMITATIONS.md`).
+//! corpus, since there's no local file to read -- there's a small hand-seeded
+//! table of well-known system typedefs below for the few that this corpus
+//! actually needs (see `docs/KNOWN_LIMITATIONS.md`).
 
 use crate::parser::grammar::extract_top_level_typedefs;
 use crate::parser::partitioner::PreprocessorDirective;
@@ -18,6 +19,15 @@ use crate::parser::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Typedef names `linuxdoom-1.10` references from system headers this repo
+/// doesn't include the source for, so they can never be resolved via
+/// imports. Hand-seeded rather than derived; add to this list as more turn
+/// up (see `docs/KNOWN_LIMITATIONS.md`).
+const WELL_KNOWN_SYSTEM_TYPEDEFS: &[&str] = &[
+    "FILE",    // <stdio.h>
+    "va_list", // <stdarg.h>
+];
 
 /// Resolves and caches each file's transitively-imported typedef set, so a
 /// header `#include`d from many places is only scanned once.
@@ -33,10 +43,12 @@ impl ImportResolver {
 
     /// The full set of typedef names visible to `path`: its own top-level
     /// typedefs, unioned with everything transitively imported via local
-    /// `#include`s.
+    /// `#include`s, plus the well-known system typedefs above.
     pub fn resolve(&mut self, path: &Path) -> HashSet<String> {
         let mut visiting = HashSet::new();
-        self.resolve_inner(path, &mut visiting)
+        let mut result = self.resolve_inner(path, &mut visiting);
+        result.extend(WELL_KNOWN_SYSTEM_TYPEDEFS.iter().map(|s| s.to_string()));
+        result
     }
 
     fn resolve_inner(&mut self, path: &Path, visiting: &mut HashSet<PathBuf>) -> HashSet<String> {
@@ -114,6 +126,14 @@ mod tests {
             types.contains("fixed_t"),
             "expected fixed_t to be resolved via imports, got: {types:?}"
         );
+    }
+
+    #[test]
+    fn test_resolve_includes_well_known_system_typedefs() {
+        let mut resolver = ImportResolver::new();
+        let types = resolver.resolve(&corpus_dir().join("i_system.c"));
+        assert!(types.contains("va_list"));
+        assert!(types.contains("FILE"));
     }
 
     #[test]
