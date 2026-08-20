@@ -109,17 +109,16 @@ Both apply unconditionally (unioned in on every `resolve()` call, real headers o
 so `i_video.c`/`i_system.c`/`z_zone.c` all resolve the same way regardless of what's
 installed on the machine running the pipeline -- no longer environment-dependent.
 
-**`d_main.c`/`g_game.c`/`m_menu.c` are a different issue entirely, not typedefs**: see
-the macro-expansion entry below -- fixing `FILE` on `d_main.c` revealed its real
-remaining blocker is a `#define`d string constant, unrelated to system headers.
+**`d_main.c`/`g_game.c`/`m_menu.c` were a different issue entirely, not typedefs**: see
+the macro-substitution entry below -- fixing `FILE` on `d_main.c` revealed its real
+remaining blocker was a `#define`d string constant, unrelated to system headers. Now
+fixed there too (Step 4b), so all 62 `.c` translation units pass Step 6.
 
-**Impact today**: 3 of 62 `.c` translation units still fail Step 6, all for the
-macro-expansion reason below (`d_main.c`/`g_game.c`/`m_menu.c`) -- 0 for missing system
-types.
+**Impact today**: 0 of 62 `.c` translation units fail Step 6 for missing system types.
 
 ---
 
-## Step 6 doesn't perform `#define` macro expansion
+## Step 6 doesn't perform general `#define` macro expansion (fixed narrowly, for the one case that mattered)
 
 **Where**: Step 3 (`transpiler/src/parser/preprocessor.rs`) only ever resolves
 conditional compilation (`#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif`); it never
@@ -127,18 +126,37 @@ substitutes an object-like or function-like macro's body into the token stream w
 the macro is *used* in code (only into `#if`/`#elif` *expressions*, where
 `evaluate_expr` needs the value).
 
-**Impact today**: 3 of 62 `.c` translation units fail to parse for this reason --
-`g_game.c` and `m_menu.c` both write `sprintf(name, "..." SAVEGAMENAME "...", ...)`,
-and `d_main.c` writes `D_AddFile(DEVDATA"doom1.wad")`, relying on `SAVEGAMENAME`/
-`DEVDATA` (object-like `#define`d string constants) being substituted with their
-literal text *before* parsing, so the result is adjacent string-literal tokens that
-concatenate per C89 translation phase 6. Since we never substitute the macro, the
-parser sees a plain identifier sitting where an expression can't have one, and fails.
-This is a narrow case (found via exactly these 3 files across the whole corpus), not a
-systemic problem with the adjacent-string-literal handling itself (which is otherwise
-exercised constantly and works, e.g. `d_main.c:820-830`).
+**Root cause found via corpus analysis, not guesswork**: rather than assume this was a
+big open-ended problem, the actual scope was measured by scanning the real lexed token
+stream of every `.c` file for "an identifier sitting immediately next to a string/char
+literal, where that identifier is genuinely `#define`d somewhere in the corpus" (814
+macro names total). Result: exactly **4 distinct macros**, all in **3 files**:
+`SAVEGAMENAME` (`d_main.c`, `g_game.c`, `m_menu.c`; defined in `dstrings.h`), `DEVDATA`
+and `DEVMAPS` (`d_main.c`, defined in `d_main.c` itself), and `DOSY` (`m_menu.c`;
+defined in `d_englsh.h`/`d_french.h`). All four are object-like macros whose body is
+*just* a single string literal.
 
-**If it starts mattering**: implement macro expansion as a pass between Steps 3 and 4
-(object-like macros are a straightforward token-substitution; function-like macros
-additionally need argument matching/substitution and are common enough elsewhere in
-the corpus that a real transpiler would eventually need this anyway).
+**Fixed**: added Step 4b (`docs/01_PARSER.md`), a narrow substitution pass rather than a
+general macro expander:
+
+- `transpiler/src/parser/macro_literals.rs` (`LiteralMacroResolver`) resolves every
+  literal-bodied object-like `#define` visible to a file (its own, plus everything
+  transitively `#include`d -- mirroring Step 6b's import treatment, reusing the same
+  `system_headers.rs` include resolution).
+- `transpiler/src/parser/macro_literal_subst.rs` walks the Step 4 token stream and
+  substitutes each such macro's identifier with its literal token, but *only* where a
+  string/char literal token sits immediately before or after it. Once substituted, it's
+  a literal like any other, so Step 6c's existing adjacent-string-literal-concatenation
+  handling (already exercised constantly, e.g. `d_main.c:820-830`) picks up the rest --
+  no separate concatenation logic needed.
+- A macro used anywhere *other* than directly touching a literal (assigned to a
+  variable, passed as a lone argument, referenced inside another macro's body) is left
+  as a plain, unexpanded identifier -- deliberately, this is not a general preprocessor.
+
+**Impact today**: 0 of 62 `.c` translation units fail for this reason anymore -- all 62
+now parse (see `transpiler/src/parser/mod.rs`'s corpus test).
+
+**If general macro expansion starts mattering** (e.g. function-like macros used as
+actual expressions, not just adjacent to literals): implement full expansion as a pass
+between Steps 3 and 4 (object-like macros are a straightforward token-substitution;
+function-like macros additionally need argument matching/substitution).

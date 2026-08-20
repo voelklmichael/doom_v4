@@ -142,7 +142,7 @@ fn main() {
         c_files.len()
     );
     println!("  External Declarations Parsed:      {}", ast_items);
-    println!("  Files Failed (known limitations):  {}", ast_failures);
+    println!("  Files Failed:                      {}", ast_failures);
     println!("  Total Time Elapsed:                {:.2?}", elapsed);
     println!("============================================================");
 
@@ -153,7 +153,7 @@ fn main() {
         );
     }
     println!(
-        "{}/{} .c translation units passed Step 6 (remaining failures are known external/macro-expansion limitations).",
+        "{}/{} .c translation units passed Step 6.",
         c_files.len() - ast_failures,
         c_files.len()
     );

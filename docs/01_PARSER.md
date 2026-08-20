@@ -12,7 +12,8 @@ flowchart TD
     S1 --> S2[Step 2: High-Level Partitioning]
     S2 --> S3[Step 3: Preprocessor Resolution]
     S3 --> S4[Step 4: Lexing]
-    S4 --> S5[Step 5: Comment Attaching]
+    S4 --> S4b[Step 4b: Literal Macro Substitution]
+    S4b --> S5[Step 5: Comment Attaching]
     S5 --> S6[Step 6: AST Grammar Parser]
 ```
 
@@ -89,6 +90,14 @@ flowchart TD
 
 ---
 
+### Step 4b: Literal Macro Substitution
+* **Objective**: Substitute a `#define`d macro with its own literal token wherever the macro identifier sits immediately next to a real string/char literal in code -- the one place a missing macro definition actually breaks parsing (declaration-specifier positions are never ambiguous; only C89's adjacent-string-literal-concatenation grammar rejects a bare identifier sitting where only literals are valid). Deliberately narrow: **not** a general preprocessor macro expander. A macro used anywhere else (assigned to a variable, passed as a lone argument, referenced in another macro's body) is left as a plain identifier, unexpanded.
+* **Resolution**: Mirrors Step 6b's treatment of `#include` as an import -- for a file, recursively unions its own top-level literal-bodied `#define`s (an object-like macro whose body is *just* one string- or char-literal token, e.g. `#define SAVEGAMENAME "doomsav"`) with those of everything it transitively `#include`s (memoized, cycle-guarded, reusing the same include resolution as Step 6b).
+* **Substitution**: Walks the Step 4 token stream; for every `Identifier` token naming a resolved literal macro with a string/char literal token immediately before or after it (comments/directives in between don't count), replaces it in place with that macro's literal token. Once substituted, the token is a literal like any other, so Step 6c's existing adjacent-string-literal-concatenation handling picks up the rest automatically -- no separate concatenation logic needed.
+* **Validation Criteria**: Confirmed via corpus analysis that exactly 4 macros across the whole codebase need this (`SAVEGAMENAME`, `DEVDATA`, `DEVMAPS`, `DOSY`, previously causing 3 files to fail Step 6c); with this step, all 62 `.c` translation units in `linuxdoom-1.10` now parse.
+
+---
+
 ### Step 5: Comment Attaching
 * **Objective**: Attach each comment to the single token it documents, collapsing the token/comment stream from Step 4 into a stream of tokens only.
 * **Attachment Rule**:
@@ -125,4 +134,4 @@ flowchart TD
   - **Expressions**:
     - Unary & Binary operators with standard C operator precedence.
     - Function calls, array indexing, member access (`.` and `->`), explicit casts.
-* **Validation Criteria**: Complete AST construction for every translation unit in `linuxdoom-1.10`. Only `.c` files are real translation units in C -- `.h` files are never compiled standalone, so this is checked over the 62 `.c` files, not all 124 `.c`/`.h` files. 59/62 pass, deterministically (independent of what's installed on the machine running it); the remaining 3 need `#define` macro expansion, which Step 6 doesn't attempt (see `docs/KNOWN_LIMITATIONS.md`).
+* **Validation Criteria**: Complete AST construction for every translation unit in `linuxdoom-1.10`. Only `.c` files are real translation units in C -- `.h` files are never compiled standalone, so this is checked over the 62 `.c` files, not all 124 `.c`/`.h` files. All 62 pass, deterministically (independent of what's installed on the machine running it), with Step 4b's narrow literal-macro substitution handling the last remaining gap (see `docs/KNOWN_LIMITATIONS.md`).

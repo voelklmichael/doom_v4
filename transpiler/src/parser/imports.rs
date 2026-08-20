@@ -10,31 +10,20 @@
 //! `#include "..."` (local) resolves relative to the including file's
 //! directory. `#include <...>` (system) is resolved the way a real
 //! preprocessor would: searched for across the build machine's standard
-//! system include directories (see `SYSTEM_INCLUDE_DIRS`), in the same
-//! order `gcc -Wp,-v` reports them. If a system header genuinely isn't
-//! present on the machine running this, or fails to process cleanly, its
-//! typedefs are simply missing from the result (fails soft, not hard) --
-//! `WELL_KNOWN_SYSTEM_TYPEDEFS` and `xlib_typedefs::XLIB_TYPEDEFS` below
-//! exist as fallbacks for exactly that, so the result is the same whether or
-//! not the real headers happen to be installed on this machine.
+//! system include directories (see `system_headers::SYSTEM_INCLUDE_DIRS`).
+//! If a system header genuinely isn't present on the machine running this,
+//! or fails to process cleanly, its typedefs are simply missing from the
+//! result (fails soft, not hard) -- `WELL_KNOWN_SYSTEM_TYPEDEFS` and
+//! `xlib_typedefs::XLIB_TYPEDEFS` below exist as fallbacks for exactly that,
+//! so the result is the same whether or not the real headers happen to be
+//! installed on this machine.
 
 use crate::parser::grammar::extract_top_level_typedefs;
-use crate::parser::partitioner::PreprocessorDirective;
+use crate::parser::system_headers::{read_resolved_chunks_and_includes, resolve_include_path};
 use crate::parser::xlib_typedefs::XLIB_TYPEDEFS;
-use crate::parser::{
-    PreprocessorEnv, SourceChunk, attach_comments, lex_chunks, parse_chunks, resolve_conditionals,
-};
+use crate::parser::{attach_comments, lex_chunks};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-
-/// Where a real preprocessor looks for `#include <...>` on a typical Linux
-/// build machine, in search order (matches `gcc -E -Wp,-v -xc /dev/null`).
-const SYSTEM_INCLUDE_DIRS: &[&str] = &[
-    "/usr/lib/gcc/x86_64-linux-gnu/13/include",
-    "/usr/local/include",
-    "/usr/include/x86_64-linux-gnu",
-    "/usr/include",
-];
 
 /// Typedef names this corpus references from system headers, as a fallback
 /// for when the real header isn't found on the build machine (or doesn't
@@ -82,8 +71,11 @@ impl ImportResolver {
         }
 
         let mut result = HashSet::new();
-        if let Some((own, includes)) = own_and_include_paths(&key) {
-            result.extend(own);
+        if let Some((resolved, includes)) = read_resolved_chunks_and_includes(&key) {
+            if let Ok(entries) = lex_chunks(&resolved) {
+                let stream = attach_comments(entries);
+                result.extend(extract_top_level_typedefs(&stream));
+            }
             let dir = key.parent().unwrap_or_else(|| Path::new("."));
             for inc in includes {
                 if let Some(resolved_path) = resolve_include_path(&inc, dir) {
@@ -96,59 +88,6 @@ impl ImportResolver {
         self.cache.insert(key, result.clone());
         result
     }
-}
-
-/// An `#include`'d path together with whether it was `<...>` (system) or
-/// `"..."` (local).
-struct IncludePath {
-    text: String,
-    is_system: bool,
-}
-
-/// Resolves an `#include` to an actual file on disk: local includes relative
-/// to the including file's own directory; system includes by searching
-/// `SYSTEM_INCLUDE_DIRS` in order. `None` if no such file exists anywhere
-/// searched.
-fn resolve_include_path(inc: &IncludePath, including_dir: &Path) -> Option<PathBuf> {
-    if !inc.is_system {
-        let candidate = including_dir.join(&inc.text);
-        return candidate.is_file().then_some(candidate);
-    }
-    SYSTEM_INCLUDE_DIRS
-        .iter()
-        .map(|dir| Path::new(dir).join(&inc.text))
-        .find(|p| p.is_file())
-}
-
-/// Reads and processes `path` through Steps 1-4, returning its own
-/// top-level typedef names (Step 6a) and the paths of everything it
-/// `#include`s (local and system). `None` if the file can't be read or
-/// fails Steps 1-3.
-fn own_and_include_paths(path: &Path) -> Option<(HashSet<String>, Vec<IncludePath>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let (_, chunks) = parse_chunks(&content);
-    let mut env = PreprocessorEnv::linux_doom_defaults();
-    let resolved = resolve_conditionals(&chunks, &mut env).ok()?;
-
-    let includes = resolved
-        .iter()
-        .filter_map(|c| match c {
-            SourceChunk::Preprocessor {
-                directive: PreprocessorDirective::Include { path, is_system },
-                ..
-            } => Some(IncludePath {
-                text: path.clone(),
-                is_system: *is_system,
-            }),
-            _ => None,
-        })
-        .collect();
-
-    let entries = lex_chunks(&resolved).ok()?;
-    let stream = attach_comments(entries);
-    let own = extract_top_level_typedefs(&stream).into_iter().collect();
-
-    Some((own, includes))
 }
 
 #[cfg(test)]
