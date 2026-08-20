@@ -6,6 +6,7 @@ pub mod lexer;
 pub mod partitioner;
 pub mod preprocessor;
 pub mod splicer;
+pub mod xlib_typedefs;
 
 pub use comment_attach::{Anchor, Commented, CommentedStream, attach_comments};
 pub use grammar::{
@@ -68,20 +69,15 @@ pub fn parse_full(path: &str) -> Result<(SplicedSource, ast::TranslationUnit), S
 mod tests {
     use super::*;
 
-    /// Files that fail Step 6c for a reason outside the parser's control and
-    /// unrelated to the local machine: they need `#define` macro
-    /// *expansion* (not just conditional resolution, which is all Step 3
-    /// does) to parse a string built from a macro constant. See
-    /// docs/KNOWN_LIMITATIONS.md.
-    const MACRO_EXPANSION_FAILURES: &[&str] = &["d_main.c", "g_game.c", "m_menu.c"];
-
-    /// `i_video.c` needs real X11 headers (Step 6b resolves `#include <...>`
-    /// by searching the build machine's actual system include directories --
-    /// see `imports.rs`'s `SYSTEM_INCLUDE_DIRS`), so whether it passes
-    /// depends on whether X11 dev headers happen to be installed here.
-    fn x11_dev_headers_available() -> bool {
-        std::path::Path::new("/usr/include/X11/Xlib.h").is_file()
-    }
+    /// Files that fail Step 6c for a reason outside the parser's control:
+    /// they need `#define` macro *expansion* (not just conditional
+    /// resolution, which is all Step 3 does) to parse a string built from a
+    /// macro constant. See docs/KNOWN_LIMITATIONS.md. (`i_video.c`'s X11
+    /// types resolve unconditionally now, via the real system headers when
+    /// present and `xlib_typedefs::XLIB_TYPEDEFS` as a hardcoded fallback
+    /// otherwise -- see `imports.rs` -- so it's no longer environment-
+    /// dependent and isn't in this list.)
+    const EXPECTED_FAILURES: &[&str] = &["d_main.c", "g_game.c", "m_menu.c"];
 
     #[test]
     fn test_full_corpus_c_files_parse_except_known_limitations() {
@@ -94,11 +90,6 @@ mod tests {
             .collect();
         files.sort();
 
-        let mut expected_failures: Vec<&str> = MACRO_EXPANSION_FAILURES.to_vec();
-        if !x11_dev_headers_available() {
-            expected_failures.push("i_video.c");
-        }
-
         let mut unexpected_failures = Vec::new();
         let mut unexpected_successes = Vec::new();
         let mut ok_count = 0;
@@ -106,7 +97,7 @@ mod tests {
         for path in &files {
             let name = path.file_name().unwrap().to_str().unwrap();
             let result = parse_full(path.to_str().unwrap());
-            let expected_to_fail = expected_failures.contains(&name);
+            let expected_to_fail = EXPECTED_FAILURES.contains(&name);
             match (result, expected_to_fail) {
                 (Ok(_), false) => ok_count += 1,
                 (Ok(_), true) => unexpected_successes.push(name.to_string()),
@@ -123,7 +114,7 @@ mod tests {
             unexpected_successes.is_empty(),
             "files expected to fail now parse successfully -- remove from the expected-failures list: {unexpected_successes:#?}"
         );
-        assert_eq!(ok_count, files.len() - expected_failures.len());
+        assert_eq!(ok_count, files.len() - EXPECTED_FAILURES.len());
         assert!(
             files.len() > 50,
             "expected to check the full Doom .c corpus, only found {}",

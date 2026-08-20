@@ -92,16 +92,22 @@ local header -- including recursively following *its* `#include`s, which is how
 
 If a system header isn't present on the machine actually running this (or fails to
 process cleanly), its typedefs are just missing from the result -- fails soft, not
-hard. `WELL_KNOWN_SYSTEM_TYPEDEFS` (`FILE`, `va_list`) exists as a fallback for exactly
-that case, so `i_system.c`/`z_zone.c` still resolve even without libc headers present.
+hard. Two hardcoded fallback tables cover this so the result no longer depends on what
+happens to be installed:
 
-**Environment-dependent**: whether `i_video.c` passes Step 6 now depends on whether X11
-dev headers are installed on the machine running the tests -- confirmed present and
-working on this dev machine (Xlib.h alone yields 89 typedefs; the transitive chain
-through X.h supplies the rest). The Step 6 corpus test
-(`transpiler/src/parser/mod.rs`) checks for `/usr/include/X11/Xlib.h` at test time and
-only expects `i_video.c` to fail when it's genuinely absent, so the test stays honest
-either way rather than assuming one environment.
+- `WELL_KNOWN_SYSTEM_TYPEDEFS` (`imports.rs`): `FILE`, `va_list` -- hand-picked, the two
+  libc typedefs this corpus actually references.
+- `xlib_typedefs::XLIB_TYPEDEFS` (`transpiler/src/parser/xlib_typedefs.rs`, **generated**):
+  every one of the 108 typedef names transitively exported by this dev machine's real
+  `/usr/include/X11/Xlib.h` (`Display`, `Window`, `GC`, `Visual`, `XEvent`, ...),
+  captured by actually resolving it once and hardcoding the result. Regenerate with
+  `cargo run --example update_xlib_typedefs` on a machine with X11 dev headers
+  installed (e.g. after a distro upgrade changes Xlib.h) -- the example re-resolves
+  Xlib.h via `ImportResolver` and overwrites the file. Never hand-edit it.
+
+Both apply unconditionally (unioned in on every `resolve()` call, real headers or not),
+so `i_video.c`/`i_system.c`/`z_zone.c` all resolve the same way regardless of what's
+installed on the machine running the pipeline -- no longer environment-dependent.
 
 **`d_main.c`/`g_game.c`/`m_menu.c` are a different issue entirely, not typedefs**: see
 the macro-expansion entry below -- fixing `FILE` on `d_main.c` revealed its real
@@ -109,7 +115,7 @@ remaining blocker is a `#define`d string constant, unrelated to system headers.
 
 **Impact today**: 3 of 62 `.c` translation units still fail Step 6, all for the
 macro-expansion reason below (`d_main.c`/`g_game.c`/`m_menu.c`) -- 0 for missing system
-types, on a machine with X11 dev headers installed.
+types.
 
 ---
 

@@ -14,10 +14,13 @@
 //! order `gcc -Wp,-v` reports them. If a system header genuinely isn't
 //! present on the machine running this, or fails to process cleanly, its
 //! typedefs are simply missing from the result (fails soft, not hard) --
-//! `WELL_KNOWN_SYSTEM_TYPEDEFS` below exists as a fallback for exactly that.
+//! `WELL_KNOWN_SYSTEM_TYPEDEFS` and `xlib_typedefs::XLIB_TYPEDEFS` below
+//! exist as fallbacks for exactly that, so the result is the same whether or
+//! not the real headers happen to be installed on this machine.
 
 use crate::parser::grammar::extract_top_level_typedefs;
 use crate::parser::partitioner::PreprocessorDirective;
+use crate::parser::xlib_typedefs::XLIB_TYPEDEFS;
 use crate::parser::{
     PreprocessorEnv, SourceChunk, attach_comments, lex_chunks, parse_chunks, resolve_conditionals,
 };
@@ -55,12 +58,14 @@ impl ImportResolver {
 
     /// The full set of typedef names visible to `path`: its own top-level
     /// typedefs, unioned with everything transitively imported via local and
-    /// system `#include`s, plus the well-known system typedefs above as a
-    /// fallback for anything that couldn't actually be resolved.
+    /// system `#include`s, plus the hardcoded fallbacks above (which apply
+    /// unconditionally, so the result doesn't depend on what's actually
+    /// installed on the machine running this).
     pub fn resolve(&mut self, path: &Path) -> HashSet<String> {
         let mut visiting = HashSet::new();
         let mut result = self.resolve_inner(path, &mut visiting);
         result.extend(WELL_KNOWN_SYSTEM_TYPEDEFS.iter().map(|s| s.to_string()));
+        result.extend(XLIB_TYPEDEFS.iter().map(|s| s.to_string()));
         result
     }
 
@@ -191,7 +196,9 @@ mod tests {
     #[test]
     fn test_resolve_i_video_c_finds_real_x11_types() {
         // Only meaningful if X11 headers are actually installed on the
-        // machine running this test; skip gracefully otherwise.
+        // machine running this test; skip gracefully otherwise. (The result
+        // should be the same either way, via the XLIB_TYPEDEFS fallback --
+        // see test_resolve_i_video_c_works_without_real_headers.)
         if !Path::new("/usr/include/X11/Xlib.h").is_file() {
             return;
         }
@@ -201,6 +208,35 @@ mod tests {
             assert!(
                 types.contains(name),
                 "expected {name} to be resolved from the real Xlib.h, got: {types:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_xlib_typedefs_fallback_is_populated() {
+        // Guards against the generated file silently reverting to the empty
+        // placeholder (e.g. after a bad regen on a machine without X11
+        // headers) without anyone noticing.
+        assert!(
+            crate::parser::xlib_typedefs::XLIB_TYPEDEFS.len() > 50,
+            "expected a substantial hardcoded Xlib typedef list, got {} entries -- \
+             run `cargo run --example update_xlib_typedefs` on a machine with X11 dev headers",
+            crate::parser::xlib_typedefs::XLIB_TYPEDEFS.len()
+        );
+    }
+
+    #[test]
+    fn test_resolve_i_video_c_works_without_real_headers() {
+        // Even with no real system headers involved at all, the hardcoded
+        // XLIB_TYPEDEFS fallback alone should be enough to resolve i_video.c.
+        let types: std::collections::HashSet<String> = crate::parser::xlib_typedefs::XLIB_TYPEDEFS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for name in ["Display", "Window", "GC", "Visual", "XEvent"] {
+            assert!(
+                types.contains(name),
+                "expected {name} in the hardcoded fallback, got: {types:?}"
             );
         }
     }
