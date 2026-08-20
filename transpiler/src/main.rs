@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use transpiler::parser::{PreprocessorEnv, lex_chunks, parse_chunks, resolve_conditionals};
+use transpiler::parser::{
+    PreprocessorEnv, attach_comments, lex_chunks, parse_chunks, resolve_conditionals,
+};
 
 fn collect_c_source_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -29,7 +31,7 @@ fn main() {
     };
 
     println!("============================================================");
-    println!(" Doom C Transpiler: Steps 1-4 Pipeline Runner              ");
+    println!(" Doom C Transpiler: Steps 1-5 Pipeline Runner              ");
     println!(" Target directory: {:?}", target_dir);
     println!("============================================================");
 
@@ -45,6 +47,8 @@ fn main() {
     let mut total_raw_chunks = 0;
     let mut total_resolved_chunks = 0;
     let mut total_lex_items = 0;
+    let mut total_commented_items = 0;
+    let mut total_trailing_comments = 0;
     let mut files_with_errors = 0;
 
     let global_env = PreprocessorEnv::linux_doom_defaults();
@@ -77,13 +81,21 @@ fn main() {
             }
         };
 
-        match lex_chunks(&resolved) {
-            Ok(items) => total_lex_items += items.len(),
+        let entries = match lex_chunks(&resolved) {
+            Ok(entries) => {
+                total_lex_items += entries.len();
+                entries
+            }
             Err(err) => {
                 eprintln!("  Lex error in {}: {}", file_path.display(), err);
                 files_with_errors += 1;
+                continue;
             }
-        }
+        };
+
+        let stream = attach_comments(entries);
+        total_commented_items += stream.items.len();
+        total_trailing_comments += stream.trailing_comments.len();
     }
 
     let elapsed = start_time.elapsed();
@@ -104,13 +116,21 @@ fn main() {
         total_raw_chunks.saturating_sub(total_resolved_chunks)
     );
     println!("  Total Lex Items (Step 4):          {}", total_lex_items);
+    println!(
+        "  Total Commented Anchors (Step 5):  {}",
+        total_commented_items
+    );
+    println!(
+        "  Unattached Trailing Comments:      {}",
+        total_trailing_comments
+    );
     println!("  Files with Errors:                 {}", files_with_errors);
     println!("  Total Time Elapsed:                {:.2?}", elapsed);
     println!("============================================================");
 
     if files_with_errors == 0 {
         println!(
-            "All {} files passed Steps 1-4 with 100% success!",
+            "All {} files passed Steps 1-5 with 100% success!",
             total_files
         );
     }

@@ -223,6 +223,15 @@ pub enum LexItem {
     Directive(PreprocessorDirective),
 }
 
+/// A `LexItem` paired with its 1-based starting line, counted within the
+/// Step 3-resolved (i.e. post-filtering) source text. Step 5 needs this to
+/// decide whether a comment shares a line with a neighboring token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexEntry {
+    pub item: LexItem,
+    pub start_line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexError {
     UnrecognizedChar { ch: char, context: String },
@@ -240,44 +249,68 @@ impl std::fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
-/// Lexes Step 3-resolved chunks into an ordered stream of tokens/comments/directives.
-pub fn lex_chunks(chunks: &[SourceChunk]) -> Result<Vec<LexItem>, LexError> {
-    let mut items = Vec::new();
+/// Lexes Step 3-resolved chunks into an ordered stream of tokens/comments/directives,
+/// each tagged with its starting line.
+pub fn lex_chunks(chunks: &[SourceChunk]) -> Result<Vec<LexEntry>, LexError> {
+    let mut entries = Vec::new();
+    let mut line = 1usize;
+
     for chunk in chunks {
         match chunk {
             SourceChunk::Code(text) => {
-                for tok in lex_code(text)? {
-                    items.push(LexItem::Token(tok));
+                for (start_line, tok) in lex_code(text, line)? {
+                    entries.push(LexEntry {
+                        item: LexItem::Token(tok),
+                        start_line,
+                    });
                 }
             }
-            SourceChunk::StringLiteral(s) => items.push(LexItem::Token(Token {
-                kind: TokenKind::StringLiteral,
-                text: s.clone(),
-            })),
-            SourceChunk::CharLiteral(s) => items.push(LexItem::Token(Token {
-                kind: TokenKind::CharLiteral,
-                text: s.clone(),
-            })),
-            SourceChunk::Comment(c) => items.push(LexItem::Comment(c.clone())),
-            SourceChunk::Preprocessor { directive, .. } => {
-                items.push(LexItem::Directive(directive.clone()))
-            }
+            SourceChunk::StringLiteral(s) => entries.push(LexEntry {
+                item: LexItem::Token(Token {
+                    kind: TokenKind::StringLiteral,
+                    text: s.clone(),
+                }),
+                start_line: line,
+            }),
+            SourceChunk::CharLiteral(s) => entries.push(LexEntry {
+                item: LexItem::Token(Token {
+                    kind: TokenKind::CharLiteral,
+                    text: s.clone(),
+                }),
+                start_line: line,
+            }),
+            SourceChunk::Comment(c) => entries.push(LexEntry {
+                item: LexItem::Comment(c.clone()),
+                start_line: line,
+            }),
+            SourceChunk::Preprocessor { directive, .. } => entries.push(LexEntry {
+                item: LexItem::Directive(directive.clone()),
+                start_line: line,
+            }),
         }
+        line += chunk.raw_text().matches('\n').count();
     }
-    Ok(items)
+
+    Ok(entries)
 }
 
 /// Lexes a single `Code` chunk's text into C89 tokens, skipping whitespace.
-pub fn lex_code(text: &str) -> Result<Vec<Token>, LexError> {
+/// `start_line` is the 1-based line the chunk begins on; each returned token
+/// is tagged with the line it starts on.
+pub fn lex_code(text: &str, start_line: usize) -> Result<Vec<(usize, Token)>, LexError> {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut tokens = Vec::new();
     let mut i = 0;
+    let mut line = start_line;
 
     while i < len {
         let c = chars[i];
 
         if c.is_whitespace() {
+            if c == '\n' {
+                line += 1;
+            }
             i += 1;
             continue;
         }
@@ -293,7 +326,7 @@ pub fn lex_code(text: &str) -> Result<Vec<Token>, LexError> {
                 Some(kw) => TokenKind::Keyword(kw),
                 None => TokenKind::Identifier,
             };
-            tokens.push(Token { kind, text: word });
+            tokens.push((line, Token { kind, text: word }));
             continue;
         }
 
@@ -347,33 +380,42 @@ pub fn lex_code(text: &str) -> Result<Vec<Token>, LexError> {
             } else {
                 TokenKind::IntegerConstant
             };
-            tokens.push(Token { kind, text: word });
+            tokens.push((line, Token { kind, text: word }));
             continue;
         }
 
         // Punctuators: maximal munch, longest match first.
         let remaining: String = chars[i..(i + 3).min(len)].iter().collect();
         if let Some(&(s, p)) = PUNCTS_3.iter().find(|(s, _)| remaining.starts_with(s)) {
-            tokens.push(Token {
-                kind: TokenKind::Punct(p),
-                text: s.to_string(),
-            });
+            tokens.push((
+                line,
+                Token {
+                    kind: TokenKind::Punct(p),
+                    text: s.to_string(),
+                },
+            ));
             i += s.chars().count();
             continue;
         }
         if let Some(&(s, p)) = PUNCTS_2.iter().find(|(s, _)| remaining.starts_with(s)) {
-            tokens.push(Token {
-                kind: TokenKind::Punct(p),
-                text: s.to_string(),
-            });
+            tokens.push((
+                line,
+                Token {
+                    kind: TokenKind::Punct(p),
+                    text: s.to_string(),
+                },
+            ));
             i += s.chars().count();
             continue;
         }
         if let Some(p) = punct_1(c) {
-            tokens.push(Token {
-                kind: TokenKind::Punct(p),
-                text: c.to_string(),
-            });
+            tokens.push((
+                line,
+                Token {
+                    kind: TokenKind::Punct(p),
+                    text: c.to_string(),
+                },
+            ));
             i += 1;
             continue;
         }
@@ -393,7 +435,11 @@ mod tests {
     use crate::parser::{PreprocessorEnv, parse_chunks, resolve_conditionals};
 
     fn kinds(src: &str) -> Vec<TokenKind> {
-        lex_code(src).unwrap().into_iter().map(|t| t.kind).collect()
+        lex_code(src, 1)
+            .unwrap()
+            .into_iter()
+            .map(|(_, t)| t.kind)
+            .collect()
     }
 
     #[test]
@@ -410,26 +456,29 @@ mod tests {
 
     #[test]
     fn test_integer_constants() {
-        let toks = lex_code("42 0x1F 017 123UL 0XFFu").unwrap();
-        assert!(toks.iter().all(|t| t.kind == TokenKind::IntegerConstant));
-        assert_eq!(toks[0].text, "42");
-        assert_eq!(toks[1].text, "0x1F");
-        assert_eq!(toks[3].text, "123UL");
+        let toks = lex_code("42 0x1F 017 123UL 0XFFu", 1).unwrap();
+        assert!(
+            toks.iter()
+                .all(|(_, t)| t.kind == TokenKind::IntegerConstant)
+        );
+        assert_eq!(toks[0].1.text, "42");
+        assert_eq!(toks[1].1.text, "0x1F");
+        assert_eq!(toks[3].1.text, "123UL");
     }
 
     #[test]
     fn test_float_constants() {
-        let toks = lex_code("3.14 1. .5 1e10 2.5e-3f").unwrap();
-        assert!(toks.iter().all(|t| t.kind == TokenKind::FloatConstant));
+        let toks = lex_code("3.14 1. .5 1e10 2.5e-3f", 1).unwrap();
+        assert!(toks.iter().all(|(_, t)| t.kind == TokenKind::FloatConstant));
         assert_eq!(toks.len(), 5);
     }
 
     #[test]
     fn test_punctuators_maximal_munch() {
-        let toks = lex_code("a<<=b>>c...d->e++f--g&&h||i").unwrap();
+        let toks = lex_code("a<<=b>>c...d->e++f--g&&h||i", 1).unwrap();
         let puncts: Vec<Punct> = toks
             .iter()
-            .filter_map(|t| match t.kind {
+            .filter_map(|(_, t)| match t.kind {
                 TokenKind::Punct(p) => Some(p),
                 _ => None,
             })
@@ -450,8 +499,15 @@ mod tests {
     }
 
     #[test]
+    fn test_token_lines_track_embedded_newlines() {
+        let toks = lex_code("a b\nc\n\nd", 1).unwrap();
+        let lines: Vec<usize> = toks.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, vec![1, 1, 2, 4]);
+    }
+
+    #[test]
     fn test_unrecognized_char_errors() {
-        let err = lex_code("int a = 1 @ 2;").unwrap_err();
+        let err = lex_code("int a = 1 @ 2;", 1).unwrap_err();
         assert!(matches!(err, LexError::UnrecognizedChar { ch: '@', .. }));
     }
 
@@ -459,20 +515,32 @@ mod tests {
     fn test_lex_chunks_preserves_strings_comments_and_directives() {
         let code = "#define FOO 1\n// hi\nchar *s = \"hello\"; /* c */\n";
         let chunks = crate::parser::partitioner::partition_source(code);
-        let items = lex_chunks(&chunks).unwrap();
+        let entries = lex_chunks(&chunks).unwrap();
 
-        assert!(items.iter().any(|i| matches!(i, LexItem::Directive(PreprocessorDirective::Define { name, .. }) if name == "FOO")));
+        assert!(entries.iter().any(|e| matches!(&e.item, LexItem::Directive(PreprocessorDirective::Define { name, .. }) if name == "FOO")));
         assert!(
-            items
-                .iter()
-                .any(|i| matches!(i, LexItem::Comment(CommentChunk::Line(s)) if s == "// hi"))
+            entries.iter().any(
+                |e| matches!(&e.item, LexItem::Comment(CommentChunk::Line(s)) if s == "// hi")
+            )
         );
-        assert!(
-            items
-                .iter()
-                .any(|i| matches!(i, LexItem::Comment(CommentChunk::Block(s)) if s == "/* c */"))
-        );
-        assert!(items.iter().any(|i| matches!(i, LexItem::Token(t) if t.kind == TokenKind::StringLiteral && t.text == "\"hello\"")));
+        assert!(entries.iter().any(
+            |e| matches!(&e.item, LexItem::Comment(CommentChunk::Block(s)) if s == "/* c */")
+        ));
+        assert!(entries.iter().any(|e| matches!(&e.item, LexItem::Token(t) if t.kind == TokenKind::StringLiteral && t.text == "\"hello\"")));
+
+        // Line 1: the #define. Line 2: the "// hi" comment. Line 3: the rest.
+        let define_line = entries
+            .iter()
+            .find(|e| matches!(&e.item, LexItem::Directive(_)))
+            .unwrap()
+            .start_line;
+        let comment_line = entries
+            .iter()
+            .find(|e| matches!(&e.item, LexItem::Comment(CommentChunk::Line(_))))
+            .unwrap()
+            .start_line;
+        assert_eq!(define_line, 1);
+        assert_eq!(comment_line, 2);
     }
 
     #[test]

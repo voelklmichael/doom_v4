@@ -1,9 +1,13 @@
+pub mod comment_attach;
 pub mod lexer;
 pub mod partitioner;
 pub mod preprocessor;
 pub mod splicer;
 
-pub use lexer::{Keyword, LexError, LexItem, Punct, Token, TokenKind, lex_chunks, lex_code};
+pub use comment_attach::{Anchor, Commented, CommentedStream, attach_comments};
+pub use lexer::{
+    Keyword, LexEntry, LexError, LexItem, Punct, Token, TokenKind, lex_chunks, lex_code,
+};
 pub use partitioner::{
     CommentChunk, PreprocessorDirective, SourceChunk, parse_preprocessor_directive,
     partition_source,
@@ -29,8 +33,15 @@ pub fn parse(path: &str) -> Result<(SplicedSource, Vec<SourceChunk>), String> {
 }
 
 /// Runs Steps 1-4 on a source file: splicing, partitioning, conditional resolution, and lexing.
-pub fn parse_and_lex(path: &str) -> Result<(SplicedSource, Vec<LexItem>), String> {
+pub fn parse_and_lex(path: &str) -> Result<(SplicedSource, Vec<LexEntry>), String> {
     let (spliced, resolved) = parse(path)?;
-    let items = lex_chunks(&resolved).map_err(|e| format!("lex error in {path}: {e}"))?;
-    Ok((spliced, items))
+    let entries = lex_chunks(&resolved).map_err(|e| format!("lex error in {path}: {e}"))?;
+    Ok((spliced, entries))
+}
+
+/// Runs Steps 1-5 on a source file: splicing, partitioning, conditional resolution,
+/// lexing, and comment attaching.
+pub fn parse_lex_and_attach(path: &str) -> Result<(SplicedSource, CommentedStream), String> {
+    let (spliced, entries) = parse_and_lex(path)?;
+    Ok((spliced, attach_comments(entries)))
 }
