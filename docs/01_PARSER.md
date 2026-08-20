@@ -11,7 +11,9 @@ flowchart TD
     Raw[Raw C / H Files] --> S1[Step 1: Line Splicing]
     S1 --> S2[Step 2: High-Level Partitioning]
     S2 --> S3[Step 3: Preprocessor Resolution]
-    S3 --> S4[Step 4: C89 AST Grammar Parser]
+    S3 --> S4[Step 4: Lexing]
+    S4 --> S5[Step 5: Comment Attaching]
+    S5 --> S6[Step 6: AST Grammar Parser]
 ```
 
 ---
@@ -77,8 +79,35 @@ flowchart TD
 
 ---
 
-### Step 4: C89 AST Grammar Parser
-* **Objective**: Parse the remaining C code chunks into a typed Abstract Syntax Tree (AST).
+### Step 4: Lexing
+* **Objective**: Lex the active (Step 3-resolved) chunks into a flat, ordered stream of C89 tokens and comments.
+* **Key Considerations**:
+  - Tokenize `Code` chunks into keywords, identifiers, numeric/string/char literals, and punctuators, each carrying a source span.
+  - `Comment` chunks pass through as comment tokens, interleaved in original source order with the tokens around them (not yet attached to anything).
+  - String/char literal chunks from Step 2 become literal tokens directly; no re-lexing of their escape sequences beyond what Step 2 already delimited.
+* **Validation Criteria**: Lex every translation unit in `linuxdoom-1.10` into a token/comment stream with zero unrecognized characters.
+
+---
+
+### Step 5: Comment Attaching
+* **Objective**: Attach each comment to the single token it documents, collapsing the token/comment stream from Step 4 into a stream of tokens only.
+* **Attachment Rule**:
+  - Lex the code into tokens and comments (Step 4's output).
+  - If a token precedes a comment and both start on the same source line, attach the comment to that preceding token (trailing/inline comment).
+  - Otherwise — the comment has no token before it on its line (e.g. it starts the line, or the file) — attach it to the token that follows it (leading/doc comment).
+* **Target Representation**:
+  ```rust
+  pub struct Commented<T> {
+      pub t: T,
+      pub comments: Vec<Comment>,
+  }
+  ```
+* **Validation Criteria**: Every comment in `linuxdoom-1.10` is attached to exactly one token; zero comments dropped or duplicated.
+
+---
+
+### Step 6: AST Grammar Parser
+* **Objective**: Parse the `Vec<Commented<Token>>` stream into a typed Abstract Syntax Tree (AST).
 * **Key Considerations**:
   - **Lexer Feedback & Symbol Table**: Handle the typedef vs. identifier ambiguity (`typedef_name * x;` vs `ident * x;`).
   - **Declarations**:
@@ -92,4 +121,5 @@ flowchart TD
   - **Expressions**:
     - Unary & Binary operators with standard C operator precedence.
     - Function calls, array indexing, member access (`.` and `->`), explicit casts.
+  - Comments carried on each `Commented<Token>` should be preserved on (or reachable from) the AST node the token belongs to, so later stages can recover documentation.
 * **Validation Criteria**: Complete AST construction for every translation unit in `linuxdoom-1.10`.

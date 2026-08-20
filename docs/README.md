@@ -19,7 +19,9 @@ flowchart LR
    - Step 1: Line Splicing (Backslash Continuation)
    - Step 2: High-Level Partitioning (Comments, Strings, Preprocessor Directives, Code Chunks)
    - Step 3: Preprocessor Conditional Resolution (`#if` / `#ifdef` / `#ifndef` / `#elif` / `#else` / `#endif`)
-   - Step 4: C89/C90 AST Grammar Parser
+   - Step 4: Lexing (Tokens & Comments)
+   - Step 5: Comment Attaching (`Commented<T>`)
+   - Step 6: C89/C90 AST Grammar Parser
 
 2. **[02. Semantic Analysis & Typechecking](02_TYPECHECKER.md)**
    - Symbol Tables and Scope Management
