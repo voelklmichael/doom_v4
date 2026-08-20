@@ -4,7 +4,7 @@
 //! "Each instance of a backslash character (\) immediately followed by a new-line character
 //! is deleted, splicing physical source lines into logical source lines."
 
-/// Represents a location in the original, unspliced source file.
+/// A location in the original, unspliced source file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceLocation {
     /// 1-based line number in original source
@@ -15,18 +15,13 @@ pub struct SourceLocation {
     pub original_offset: usize,
 }
 
-/// Splicing mapping entry to translate a byte offset in `spliced_text`
-/// back to the original source location.
+/// Mapping entry to translate a byte offset in `spliced_text` back to the original source.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpliceMapping {
+struct SpliceMapping {
     /// Byte offset in spliced text
-    pub spliced_offset: usize,
+    spliced_offset: usize,
     /// Byte offset in original text
-    pub original_offset: usize,
-    /// 1-based line in original text
-    pub original_line: usize,
-    /// 1-based column in original text
-    pub original_col: usize,
+    original_offset: usize,
 }
 
 /// Result of splicing a source file.
@@ -34,137 +29,96 @@ pub struct SpliceMapping {
 pub struct SplicedSource {
     /// The processed source code with backslash-newline sequences removed.
     pub text: String,
-    /// Line index of the original file (byte offsets of each line start).
+    /// Byte offsets of each line start in the *original* file.
     original_line_starts: Vec<usize>,
-    /// Splicing mappings to translate offsets.
+    /// Splicing mappings to translate offsets, ordered by `spliced_offset`.
     mappings: Vec<SpliceMapping>,
-    /// Total count of spliced line continuations found and processed.
+    /// Total count of line continuations found and removed.
     pub spliced_continuations_count: usize,
 }
 
 impl SplicedSource {
-    /// Map a byte offset in `self.text` (spliced text) back to the original source location.
+    /// Map a byte offset in `self.text` (spliced text) back to a location in the original file.
     pub fn original_location(&self, spliced_offset: usize) -> SourceLocation {
-        if self.mappings.is_empty() {
-            let (line, col) = self.offset_to_line_col_original(spliced_offset);
-            return SourceLocation {
-                line,
-                column: col,
-                original_offset: spliced_offset,
-            };
-        }
-
-        // Binary search for the largest mapping with spliced_offset <= requested offset
-        let idx = match self.mappings.binary_search_by_key(&spliced_offset, |m| m.spliced_offset) {
-            Ok(i) => i,
+        let orig_offset = match self.mappings.binary_search_by_key(&spliced_offset, |m| m.spliced_offset) {
+            Ok(i) => self.mappings[i].original_offset,
+            Err(0) => spliced_offset,
             Err(i) => {
-                if i == 0 {
-                    0
-                } else {
-                    i - 1
-                }
+                let base = &self.mappings[i - 1];
+                base.original_offset + (spliced_offset - base.spliced_offset)
             }
         };
 
-        let base = &self.mappings[idx];
-        let delta = spliced_offset.saturating_sub(base.spliced_offset);
-        let orig_offset = base.original_offset + delta;
-        let (line, col) = self.offset_to_line_col_original(orig_offset);
-
+        let (line, column) = self.offset_to_line_col_original(orig_offset);
         SourceLocation {
             line,
-            column: col,
+            column,
             original_offset: orig_offset,
         }
     }
 
     fn offset_to_line_col_original(&self, orig_offset: usize) -> (usize, usize) {
-        if self.original_line_starts.is_empty() {
-            return (1, 1);
-        }
-
         let line_idx = match self.original_line_starts.binary_search(&orig_offset) {
             Ok(i) => i,
-            Err(i) => {
-                if i == 0 {
-                    0
-                } else {
-                    i - 1
-                }
-            }
+            Err(0) => 0,
+            Err(i) => i - 1,
         };
-
         let line_start = self.original_line_starts[line_idx];
-        let line_num = line_idx + 1;
-        let col_num = orig_offset.saturating_sub(line_start) + 1;
-        (line_num, col_num)
+        (line_idx + 1, orig_offset - line_start + 1)
     }
 }
 
-/// Splicer function to process source text and resolve all line continuations.
+/// Process source text, splicing away all backslash-newline line continuations.
 pub fn splice(source: &str) -> SplicedSource {
-    let mut original_line_starts = Vec::new();
-    original_line_starts.push(0);
-
     let bytes = source.as_bytes();
     let len = bytes.len();
 
-    // First pass: compute original line starts for fast line/col calculations
-    for i in 0..len {
-        if bytes[i] == b'\n' {
+    let mut original_line_starts = vec![0];
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
             original_line_starts.push(i + 1);
         }
     }
 
-    let mut output = String::with_capacity(len);
+    let mut output: Vec<u8> = Vec::with_capacity(len);
     let mut mappings = Vec::new();
     let mut spliced_continuations_count = 0;
 
     let mut i = 0;
     while i < len {
         if bytes[i] == b'\\' {
-            // Check if this backslash is followed by optional whitespace and then newline
+            // Allow trailing spaces/tabs between the backslash and the newline
+            // (common compiler extension for otherwise-clean source).
             let mut j = i + 1;
-            // Allow trailing spaces or tabs before newline (common GCC extension / dirty source cleanup)
             while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
             }
 
-            if j < len && bytes[j] == b'\n' {
-                // Spliced \ \n
-                spliced_continuations_count += 1;
-                i = j + 1; // skip \ ... \n
-
-                // Record mapping after splice
-                mappings.push(SpliceMapping {
-                    spliced_offset: output.len(),
-                    original_offset: i,
-                    original_line: 0, // computed lazily
-                    original_col: 0,
-                });
-                continue;
+            let continuation_end = if j < len && bytes[j] == b'\n' {
+                Some(j + 1)
             } else if j + 1 < len && bytes[j] == b'\r' && bytes[j + 1] == b'\n' {
-                // Spliced \ \r\n
-                spliced_continuations_count += 1;
-                i = j + 2; // skip \ ... \r\n
+                Some(j + 2)
+            } else {
+                None
+            };
 
+            if let Some(next) = continuation_end {
+                spliced_continuations_count += 1;
+                i = next;
                 mappings.push(SpliceMapping {
                     spliced_offset: output.len(),
                     original_offset: i,
-                    original_line: 0,
-                    original_col: 0,
                 });
                 continue;
             }
         }
 
-        // Regular character
-        output.push(bytes[i] as char);
+        output.push(bytes[i]);
         i += 1;
     }
 
     SplicedSource {
-        text: output,
+        text: String::from_utf8(output).expect("splicing only removes ASCII continuation sequences"),
         original_line_starts,
         mappings,
         spliced_continuations_count,
@@ -222,5 +176,70 @@ mod tests {
         let res = splice(input);
         assert_eq!(res.text, "char *str = \"hello \" \"world\";\n");
         assert_eq!(res.spliced_continuations_count, 2);
+    }
+
+    #[test]
+    fn test_trailing_backslash_without_newline_is_not_spliced() {
+        // A backslash at end-of-file with no following newline is left untouched.
+        let input = "int a = 1;\\";
+        let res = splice(input);
+        assert_eq!(res.text, input);
+        assert_eq!(res.spliced_continuations_count, 0);
+    }
+
+    #[test]
+    fn test_no_corruption_across_full_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../linuxdoom-1.10");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("linuxdoom-1.10 directory should exist") {
+            let path = entry.unwrap().path();
+            let is_source = matches!(path.extension().and_then(|e| e.to_str()), Some("c") | Some("h"));
+            if !path.is_file() || !is_source {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
+            let res = splice(&content);
+
+            // Every backslash-newline (or backslash-whitespace-newline) run in the
+            // original must have been removed, and nothing else may have moved.
+            let expected_len = content.len()
+                - count_spliced_bytes(&content);
+            assert_eq!(
+                res.text.len(),
+                expected_len,
+                "unexpected output length for {}",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(checked > 100, "expected to check the full Doom corpus, only checked {checked}");
+    }
+
+    /// Reference-counts the bytes that `splice` should remove, using a naive
+    /// re-scan independent of the main implementation, to cross-check byte accounting.
+    fn count_spliced_bytes(source: &str) -> usize {
+        let bytes = source.as_bytes();
+        let len = bytes.len();
+        let mut removed = 0;
+        let mut i = 0;
+        while i < len {
+            if bytes[i] == b'\\' {
+                let mut j = i + 1;
+                while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b'\n' {
+                    removed += j + 1 - i;
+                    i = j + 1;
+                    continue;
+                } else if j + 1 < len && bytes[j] == b'\r' && bytes[j + 1] == b'\n' {
+                    removed += j + 2 - i;
+                    i = j + 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        removed
     }
 }

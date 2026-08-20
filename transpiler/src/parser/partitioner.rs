@@ -1,26 +1,45 @@
-//! Step 1.2: High-Level Source Code Partitioning
+//! Step 2: High-Level Source Code Partitioning
 //!
 //! Partitions spliced C source into comments, string/char literals,
 //! preprocessor directives, and unparsed C code chunks.
 
-use crate::parser::splicer::{splice, SplicedSource};
-
-/// Represents the classification of a source code chunk.
+/// Classification of a chunk of (already line-spliced) source text.
+///
+/// Concatenating `raw_text()` of every chunk, in order, reproduces the
+/// spliced source exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceChunk {
     /// C/C++ style comments
     Comment(CommentChunk),
-    /// String literals, e.g. "hello world"
+    /// String literal, e.g. `"hello world"` (including the quotes)
     StringLiteral(String),
-    /// Character literals, e.g. 'a', '\n'
+    /// Character literal, e.g. `'a'`, `'\n'` (including the quotes)
     CharLiteral(String),
-    /// Preprocessor directive, e.g. #include <stdio.h>, #define FOO 1
-    Preprocessor(PreprocessorDirective),
+    /// Preprocessor directive, e.g. `#include <stdio.h>`, `#define FOO 1`.
+    /// `raw` retains the exact source text; `directive` is the parsed form.
+    Preprocessor {
+        raw: String,
+        directive: PreprocessorDirective,
+    },
     /// Unparsed plain C code chunk
     Code(String),
 }
 
-/// Comment variant: line (//) or block (/* ... */).
+impl SourceChunk {
+    /// The exact original source text this chunk was parsed from.
+    pub fn raw_text(&self) -> &str {
+        match self {
+            SourceChunk::Comment(CommentChunk::Line(s)) => s,
+            SourceChunk::Comment(CommentChunk::Block(s)) => s,
+            SourceChunk::StringLiteral(s) => s,
+            SourceChunk::CharLiteral(s) => s,
+            SourceChunk::Preprocessor { raw, .. } => raw,
+            SourceChunk::Code(s) => s,
+        }
+    }
+}
+
+/// Comment variant: line (`//`) or block (`/* ... */`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentChunk {
     Line(String),
@@ -32,11 +51,13 @@ pub enum CommentChunk {
 pub enum PreprocessorDirective {
     Include {
         path: String,
-        is_system: bool, // true if <...>, false if "..."
+        /// true for `<...>`, false for `"..."`
+        is_system: bool,
     },
     Define {
         name: String,
-        params: Option<Vec<String>>, // Some(...) if function-like macro e.g. #define FOO(a, b)
+        /// `Some(params)` for a function-like macro, e.g. `#define FOO(a, b)`
+        params: Option<Vec<String>>,
         body: String,
     },
     Undef(String),
@@ -48,144 +69,120 @@ pub enum PreprocessorDirective {
     Endif,
     Pragma(String),
     Error(String),
-    Other {
-        directive: String,
-        rest: String,
-    },
+    Other { directive: String, rest: String },
 }
 
-/// Partitions a spliced source string into high-level chunks.
+/// Partitions spliced source text into high-level chunks.
 pub fn partition_source(source: &str) -> Vec<SourceChunk> {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let mut chunks = Vec::new();
-    let mut current_code = String::new();
 
+    let mut code_start = 0;
     let mut i = 0;
     let mut at_line_start = true;
+
+    macro_rules! flush_code {
+        () => {
+            if code_start < i {
+                chunks.push(SourceChunk::Code(source[code_start..i].to_string()));
+            }
+        };
+    }
 
     while i < len {
         let b = bytes[i];
 
-        // Check for line start (ignoring leading horizontal whitespace)
+        // Leading horizontal whitespace doesn't end a line-start context.
         if at_line_start && (b == b' ' || b == b'\t') {
-            current_code.push(b as char);
             i += 1;
             continue;
         }
 
-        // 1. Check for Preprocessor Directives (must be at line start after optional whitespace)
+        // Preprocessor directives must start at the beginning of a line
+        // (line continuations were already resolved in Step 1).
         if at_line_start && b == b'#' {
-            if !current_code.is_empty() {
-                chunks.push(SourceChunk::Code(current_code.clone()));
-                current_code.clear();
-            }
-
+            flush_code!();
             let start = i;
-            // Read until end of line (since line continuations were already spliced in Step 1.1)
             while i < len && bytes[i] != b'\n' && bytes[i] != b'\r' {
                 i += 1;
             }
-            let directive_raw = &source[start..i];
-            let directive = parse_preprocessor_directive(directive_raw);
-            chunks.push(SourceChunk::Preprocessor(directive));
+            let raw = source[start..i].to_string();
+            let directive = parse_preprocessor_directive(&raw);
+            chunks.push(SourceChunk::Preprocessor { raw, directive });
+            code_start = i;
             at_line_start = false;
             continue;
         }
 
-        // 2. Check for Line Comment: //
+        // Line comment: //
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            if !current_code.is_empty() {
-                chunks.push(SourceChunk::Code(current_code.clone()));
-                current_code.clear();
-            }
-
+            flush_code!();
             let start = i;
             i += 2;
             while i < len && bytes[i] != b'\n' && bytes[i] != b'\r' {
                 i += 1;
             }
-            let comment_text = &source[start..i];
-            chunks.push(SourceChunk::Comment(CommentChunk::Line(comment_text.to_string())));
+            chunks.push(SourceChunk::Comment(CommentChunk::Line(
+                source[start..i].to_string(),
+            )));
+            code_start = i;
             at_line_start = false;
             continue;
         }
 
-        // 3. Check for Block Comment: /* ... */
+        // Block comment: /* ... */
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            if !current_code.is_empty() {
-                chunks.push(SourceChunk::Code(current_code.clone()));
-                current_code.clear();
-            }
-
+            flush_code!();
             let start = i;
             i += 2;
             while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
             }
-            if i + 1 < len {
-                i += 2; // include */
-            } else {
-                i = len;
-            }
-            let comment_text = &source[start..i];
-            chunks.push(SourceChunk::Comment(CommentChunk::Block(comment_text.to_string())));
+            i = if i + 1 < len { i + 2 } else { len };
+            chunks.push(SourceChunk::Comment(CommentChunk::Block(
+                source[start..i].to_string(),
+            )));
+            code_start = i;
             at_line_start = false;
             continue;
         }
 
-        // 4. Check for String Literal: "..."
+        // String literal: "..."
         if b == b'"' {
-            if !current_code.is_empty() {
-                chunks.push(SourceChunk::Code(current_code.clone()));
-                current_code.clear();
-            }
-
+            flush_code!();
             let start = i;
-            i += 1; // skip opening quote
+            i += 1;
             while i < len && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < len {
-                    i += 2; // skip escape sequence like \" or \\
-                } else {
-                    i += 1;
-                }
+                i += if bytes[i] == b'\\' && i + 1 < len { 2 } else { 1 };
             }
-            if i < len && bytes[i] == b'"' {
-                i += 1; // skip closing quote
+            if i < len {
+                i += 1; // closing quote
             }
-            let str_lit = &source[start..i];
-            chunks.push(SourceChunk::StringLiteral(str_lit.to_string()));
+            chunks.push(SourceChunk::StringLiteral(source[start..i].to_string()));
+            code_start = i;
             at_line_start = false;
             continue;
         }
 
-        // 5. Check for Character Literal: '...'
+        // Character literal: '...'
         if b == b'\'' {
-            if !current_code.is_empty() {
-                chunks.push(SourceChunk::Code(current_code.clone()));
-                current_code.clear();
-            }
-
+            flush_code!();
             let start = i;
-            i += 1; // skip opening quote
+            i += 1;
             while i < len && bytes[i] != b'\'' {
-                if bytes[i] == b'\\' && i + 1 < len {
-                    i += 2; // skip escape sequence like \' or \\
-                } else {
-                    i += 1;
-                }
+                i += if bytes[i] == b'\\' && i + 1 < len { 2 } else { 1 };
             }
-            if i < len && bytes[i] == b'\'' {
-                i += 1; // skip closing quote
+            if i < len {
+                i += 1; // closing quote
             }
-            let char_lit = &source[start..i];
-            chunks.push(SourceChunk::CharLiteral(char_lit.to_string()));
+            chunks.push(SourceChunk::CharLiteral(source[start..i].to_string()));
+            code_start = i;
             at_line_start = false;
             continue;
         }
 
-        // 6. Regular Code characters
-        current_code.push(b as char);
+        // Plain code byte.
         if b == b'\n' {
             at_line_start = true;
         } else if b != b' ' && b != b'\t' && b != b'\r' {
@@ -194,42 +191,27 @@ pub fn partition_source(source: &str) -> Vec<SourceChunk> {
         i += 1;
     }
 
-    if !current_code.is_empty() {
-        chunks.push(SourceChunk::Code(current_code));
-    }
-
+    flush_code!();
     chunks
 }
 
-/// Convenience function that splices lines first, then partitions the source.
-pub fn parse_chunks(source: &str) -> (SplicedSource, Vec<SourceChunk>) {
-    let spliced = splice(source);
-    let chunks = partition_source(&spliced.text);
-    (spliced, chunks)
-}
-
-/// Parse a raw preprocessor directive line (e.g. `#include "doomdef.h"`)
+/// Parses a raw preprocessor directive line (e.g. `#include "doomdef.h"`).
 pub fn parse_preprocessor_directive(line: &str) -> PreprocessorDirective {
     let trimmed = line.trim();
-    let without_hash = if let Some(stripped) = trimmed.strip_prefix('#') {
-        stripped.trim_start()
-    } else {
-        trimmed
-    };
+    let without_hash = trimmed.strip_prefix('#').unwrap_or(trimmed).trim_start();
 
-    // Extract directive name
     let mut parts = without_hash.splitn(2, |c: char| c.is_whitespace());
     let directive_name = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
 
     match directive_name {
         "include" => {
-            if rest.starts_with('<') && rest.ends_with('>') {
+            if rest.starts_with('<') && rest.ends_with('>') && rest.len() >= 2 {
                 PreprocessorDirective::Include {
                     path: rest[1..rest.len() - 1].to_string(),
                     is_system: true,
                 }
-            } else if rest.starts_with('"') && rest.ends_with('"') {
+            } else if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
                 PreprocessorDirective::Include {
                     path: rest[1..rest.len() - 1].to_string(),
                     is_system: false,
@@ -258,7 +240,7 @@ pub fn parse_preprocessor_directive(line: &str) -> PreprocessorDirective {
     }
 }
 
-/// Parse `#define FOO ...` or `#define FOO(x, y) ...`
+/// Parses `#define FOO ...` or `#define FOO(x, y) ...`.
 fn parse_define(rest: &str) -> PreprocessorDirective {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
@@ -269,25 +251,22 @@ fn parse_define(rest: &str) -> PreprocessorDirective {
         };
     }
 
-    // Check if function-like: NAME(...)
+    // Function-like macro: NAME(...), with no whitespace between name and '(' (ISO C).
     if let Some(open_paren) = trimmed.find('(') {
         let name_part = &trimmed[..open_paren];
-        // Ensure no whitespace between name and '(' for function-like macro (ISO C standard)
         if !name_part.is_empty() && name_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            if let Some(close_paren) = trimmed[open_paren..].find(')') {
-                let close_paren_idx = open_paren + close_paren;
-                let name = name_part.to_string();
+            if let Some(close_offset) = trimmed[open_paren..].find(')') {
+                let close_paren_idx = open_paren + close_offset;
                 let params_str = &trimmed[open_paren + 1..close_paren_idx];
                 let params = if params_str.trim().is_empty() {
                     Vec::new()
                 } else {
                     params_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
-                let body = trimmed[close_paren_idx + 1..].trim().to_string();
                 return PreprocessorDirective::Define {
-                    name,
+                    name: name_part.to_string(),
                     params: Some(params),
-                    body,
+                    body: trimmed[close_paren_idx + 1..].trim().to_string(),
                 };
             }
         }
@@ -297,7 +276,6 @@ fn parse_define(rest: &str) -> PreprocessorDirective {
     let mut parts = trimmed.splitn(2, |c: char| c.is_whitespace());
     let name = parts.next().unwrap_or("").to_string();
     let body = parts.next().unwrap_or("").trim().to_string();
-
     PreprocessorDirective::Define {
         name,
         params: None,
@@ -308,6 +286,7 @@ fn parse_define(rest: &str) -> PreprocessorDirective {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::splice;
 
     #[test]
     fn test_partition_includes_and_defines() {
@@ -339,7 +318,10 @@ int main(int argc, char **argv) {
 
         for chunk in &chunks {
             match chunk {
-                SourceChunk::Preprocessor(PreprocessorDirective::Include { is_system, path }) => {
+                SourceChunk::Preprocessor {
+                    directive: PreprocessorDirective::Include { is_system, path },
+                    ..
+                } => {
                     include_count += 1;
                     if *is_system {
                         assert_eq!(path, "stdio.h");
@@ -347,7 +329,10 @@ int main(int argc, char **argv) {
                         assert_eq!(path, "doomdef.h");
                     }
                 }
-                SourceChunk::Preprocessor(PreprocessorDirective::Define { name, params, body }) => {
+                SourceChunk::Preprocessor {
+                    directive: PreprocessorDirective::Define { name, params, body },
+                    ..
+                } => {
                     define_count += 1;
                     if name == "FIXEDMUL" {
                         assert_eq!(params.as_ref().unwrap(), &vec!["a".to_string(), "b".to_string()]);
@@ -373,5 +358,33 @@ int main(int argc, char **argv) {
         assert_eq!(comment_count, 2);
         assert_eq!(str_lit_count, 1);
         assert_eq!(char_lit_count, 1);
+    }
+
+    #[test]
+    fn test_round_trip_reconstructs_source() {
+        let code = "#include <a.h>\n// comment\nint x = 1; /* c */ char *s = \"a\\\"b\"; char c = '\\'';\n";
+        let chunks = partition_source(code);
+        let reconstructed: String = chunks.iter().map(SourceChunk::raw_text).collect();
+        assert_eq!(reconstructed, code);
+    }
+
+    #[test]
+    fn test_round_trip_across_full_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../linuxdoom-1.10");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("linuxdoom-1.10 directory should exist") {
+            let path = entry.unwrap().path();
+            let is_source = matches!(path.extension().and_then(|e| e.to_str()), Some("c") | Some("h"));
+            if !path.is_file() || !is_source {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
+            let spliced = splice(&content);
+            let chunks = partition_source(&spliced.text);
+            let reconstructed: String = chunks.iter().map(SourceChunk::raw_text).collect();
+            assert_eq!(reconstructed, spliced.text, "round-trip mismatch for {}", path.display());
+            checked += 1;
+        }
+        assert!(checked > 100, "expected to check the full Doom corpus, only checked {checked}");
     }
 }
