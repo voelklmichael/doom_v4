@@ -17,12 +17,12 @@ impl PreprocessorEnv {
         Self::default()
     }
 
-    /// A standard environment for compiling Linux Doom.
+    /// The environment implied by `linuxdoom-1.10/Makefile`'s `CFLAGS`
+    /// (`-DNORMALUNIX -DLINUX`; `-DUSEASM` is commented out).
     pub fn linux_doom_defaults() -> Self {
         let mut env = Self::new();
-        env.define("LINUX", None);
         env.define("NORMALUNIX", None);
-        env.define("__BYTEBOOL__", None);
+        env.define("LINUX", None);
         env
     }
 
