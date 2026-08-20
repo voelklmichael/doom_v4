@@ -32,3 +32,6 @@ flowchart LR
    - Rust Code Generation Strategy (Safety, Ownership, Idioms vs. 1:1 Mapping)
    - .NET / C# Code Generation Strategy
    - Doom Runtime Support & Platform Layer
+
+4. **[Known Limitations](KNOWN_LIMITATIONS.md)**
+   - Deviations from strict C89 semantics accepted for now because they don't affect `linuxdoom-1.10`'s actual build
