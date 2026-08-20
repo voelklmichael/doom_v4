@@ -1,7 +1,9 @@
+pub mod lexer;
 pub mod partitioner;
 pub mod preprocessor;
 pub mod splicer;
 
+pub use lexer::{lex_chunks, lex_code, Keyword, LexError, LexItem, Punct, Token, TokenKind};
 pub use partitioner::{
     parse_preprocessor_directive, partition_source, CommentChunk, PreprocessorDirective,
     SourceChunk,
@@ -24,4 +26,11 @@ pub fn parse(path: &str) -> Result<(SplicedSource, Vec<SourceChunk>), String> {
     let resolved = resolve_conditionals(&chunks, &mut env)
         .map_err(|e| format!("preprocessor error in {path}: {e}"))?;
     Ok((spliced, resolved))
+}
+
+/// Runs Steps 1-4 on a source file: splicing, partitioning, conditional resolution, and lexing.
+pub fn parse_and_lex(path: &str) -> Result<(SplicedSource, Vec<LexItem>), String> {
+    let (spliced, resolved) = parse(path)?;
+    let items = lex_chunks(&resolved).map_err(|e| format!("lex error in {path}: {e}"))?;
+    Ok((spliced, items))
 }
