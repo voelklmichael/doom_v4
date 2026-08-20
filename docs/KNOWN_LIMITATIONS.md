@@ -75,39 +75,41 @@ directive's raw text.
 
 ---
 
-## Step 6 can't resolve types from system headers not present in this corpus
+## Step 6 resolves system headers (`#include <...>`) from the build machine, with a hand-seeded fallback
 
 **Where**: Step 6b import resolution (`transpiler/src/parser/imports.rs`).
 
 Step 6 treats `#include` as an import: a file's typedef table is its own top-level
-typedefs unioned with everything transitively imported via local `#include "..."`s
-(see `docs/01_PARSER.md` Step 6). `#include <...>` (system headers) can't be resolved
-this way, since there's no local file to read.
+typedefs unioned with everything transitively imported via `#include` (see
+`docs/01_PARSER.md` Step 6). `#include "..."` (local) resolves relative to the
+including file's directory, same as always. `#include <...>` (system) is resolved the
+way a real preprocessor would: searched for across the build machine's actual system
+include directories (`SYSTEM_INCLUDE_DIRS`, matching `gcc -E -Wp,-v`'s own search
+order), and if found, processed through the same Steps 1-4 + Step 6a pipeline as any
+local header -- including recursively following *its* `#include`s, which is how
+`i_video.c`'s `Display`/`Window`/`GC`/... end up resolved via the real
+`/usr/include/X11/Xlib.h` pulling in `/usr/include/X11/X.h` for `Window`, etc.
 
-**Fixed for libc, via a small hand-seeded table**: `WELL_KNOWN_SYSTEM_TYPEDEFS` in
-`imports.rs` hardcodes `FILE` (`<stdio.h>`) and `va_list` (`<stdarg.h>`), the two
-libc typedefs this corpus actually references. This fully resolves `z_zone.c` and
-`i_system.c`, which use nothing else external.
+If a system header isn't present on the machine actually running this (or fails to
+process cleanly), its typedefs are just missing from the result -- fails soft, not
+hard. `WELL_KNOWN_SYSTEM_TYPEDEFS` (`FILE`, `va_list`) exists as a fallback for exactly
+that case, so `i_system.c`/`z_zone.c` still resolve even without libc headers present.
 
-**Not fixed for X11 -- `i_video.c`**: tried the same approach for X11's `<Xlib.h>`
-types, and it doesn't stay "small": `i_video.c` alone references `Display`, `Window`,
-`Colormap`, `GC`, `XEvent`, `XVisualInfo`, `XShmSegmentInfo`, `Pixmap`, `XGCValues`,
-`XColor`, `Cursor`, `XSetWindowAttributes`, `Visual`, and likely more beyond that --
-this is most of a window-management API's surface, not a handful of names. Hand-seeding
-it would mean hand-transcribing a meaningful chunk of Xlib.h's type declarations rather
-than genuinely resolving them, so `i_video.c` stays a known failure.
+**Environment-dependent**: whether `i_video.c` passes Step 6 now depends on whether X11
+dev headers are installed on the machine running the tests -- confirmed present and
+working on this dev machine (Xlib.h alone yields 89 typedefs; the transitive chain
+through X.h supplies the rest). The Step 6 corpus test
+(`transpiler/src/parser/mod.rs`) checks for `/usr/include/X11/Xlib.h` at test time and
+only expects `i_video.c` to fail when it's genuinely absent, so the test stays honest
+either way rather than assuming one environment.
 
 **`d_main.c`/`g_game.c`/`m_menu.c` are a different issue entirely, not typedefs**: see
 the macro-expansion entry below -- fixing `FILE` on `d_main.c` revealed its real
 remaining blocker is a `#define`d string constant, unrelated to system headers.
 
-**Impact today**: 4 of 62 `.c` translation units still fail Step 6: `i_video.c` (X11,
-above) and `d_main.c`/`g_game.c`/`m_menu.c` (macro expansion, below). See
-`transpiler/src/parser/mod.rs`'s `EXPECTED_FAILURES` list in the Step 6 corpus test,
-which tracks this explicitly rather than silently ignoring it.
-
-**If X11 starts mattering**: parse the actual `Xlib.h` on the build machine the way a
-real preprocessor would, rather than hand-seeding names one failure at a time.
+**Impact today**: 3 of 62 `.c` translation units still fail Step 6, all for the
+macro-expansion reason below (`d_main.c`/`g_game.c`/`m_menu.c`) -- 0 for missing system
+types, on a machine with X11 dev headers installed.
 
 ---
 
