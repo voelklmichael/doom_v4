@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use transpiler::parser::{parse_chunks, resolve_conditionals, PreprocessorEnv};
+use transpiler::parser::{lex_chunks, parse_chunks, resolve_conditionals, PreprocessorEnv};
 
 fn collect_c_source_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -30,7 +30,7 @@ fn main() {
     };
 
     println!("============================================================");
-    println!(" Doom C Transpiler: Steps 1-3 Pipeline Runner              ");
+    println!(" Doom C Transpiler: Steps 1-4 Pipeline Runner              ");
     println!(" Target directory: {:?}", target_dir);
     println!("============================================================");
 
@@ -45,6 +45,7 @@ fn main() {
     let mut total_splices = 0;
     let mut total_raw_chunks = 0;
     let mut total_resolved_chunks = 0;
+    let mut total_lex_items = 0;
     let mut files_with_errors = 0;
 
     let global_env = PreprocessorEnv::linux_doom_defaults();
@@ -65,10 +66,22 @@ fn main() {
         total_raw_chunks += raw_chunks.len();
 
         let mut file_env = global_env.clone();
-        match resolve_conditionals(&raw_chunks, &mut file_env) {
-            Ok(resolved) => total_resolved_chunks += resolved.len(),
+        let resolved = match resolve_conditionals(&raw_chunks, &mut file_env) {
+            Ok(resolved) => {
+                total_resolved_chunks += resolved.len();
+                resolved
+            }
             Err(err) => {
                 eprintln!("  Preprocessor error in {}: {}", file_path.display(), err);
+                files_with_errors += 1;
+                continue;
+            }
+        };
+
+        match lex_chunks(&resolved) {
+            Ok(items) => total_lex_items += items.len(),
+            Err(err) => {
+                eprintln!("  Lex error in {}: {}", file_path.display(), err);
                 files_with_errors += 1;
             }
         }
@@ -82,11 +95,12 @@ fn main() {
     println!("  Total Raw Chunks (Step 2):         {}", total_raw_chunks);
     println!("  Total Active Chunks (Step 3):      {}", total_resolved_chunks);
     println!("  Filtered Inactive Chunks:          {}", total_raw_chunks.saturating_sub(total_resolved_chunks));
+    println!("  Total Lex Items (Step 4):          {}", total_lex_items);
     println!("  Files with Errors:                 {}", files_with_errors);
     println!("  Total Time Elapsed:                {:.2?}", elapsed);
     println!("============================================================");
 
     if files_with_errors == 0 {
-        println!("All {} files passed Steps 1-3 with 100% success!", total_files);
+        println!("All {} files passed Steps 1-4 with 100% success!", total_files);
     }
 }
