@@ -1,10 +1,17 @@
+pub mod ast;
 pub mod comment_attach;
+pub mod grammar;
+pub mod imports;
 pub mod lexer;
 pub mod partitioner;
 pub mod preprocessor;
 pub mod splicer;
 
 pub use comment_attach::{Anchor, Commented, CommentedStream, attach_comments};
+pub use grammar::{
+    ParseError, extract_top_level_typedefs, parse_translation_unit, parse_translation_unit_seeded,
+};
+pub use imports::ImportResolver;
 pub use lexer::{
     Keyword, LexEntry, LexError, LexItem, Punct, Token, TokenKind, lex_chunks, lex_code,
 };
@@ -44,4 +51,78 @@ pub fn parse_and_lex(path: &str) -> Result<(SplicedSource, Vec<LexEntry>), Strin
 pub fn parse_lex_and_attach(path: &str) -> Result<(SplicedSource, CommentedStream), String> {
     let (spliced, entries) = parse_and_lex(path)?;
     Ok((spliced, attach_comments(entries)))
+}
+
+/// Runs the full Steps 1-6 pipeline on a source file, producing a `TranslationUnit`.
+/// Step 6's typedef table is seeded via Step 6b: `path`'s own top-level typedefs
+/// unioned with everything transitively imported via local `#include`s.
+pub fn parse_full(path: &str) -> Result<(SplicedSource, ast::TranslationUnit), String> {
+    let (spliced, stream) = parse_lex_and_attach(path)?;
+    let seed = ImportResolver::new().resolve(std::path::Path::new(path));
+    let unit = parse_translation_unit_seeded(&stream, seed)
+        .map_err(|e| format!("parse error in {path}: {e}"))?;
+    Ok((spliced, unit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Files that fail Step 6c for reasons outside the parser's control:
+    /// they reference types from system headers this corpus doesn't include
+    /// (`FILE`/`va_list` from libc, `Display` from X11) or need `#define`
+    /// macro *expansion* (not just conditional resolution, which is all
+    /// Step 3 does) to parse a string built from a macro constant. See
+    /// docs/KNOWN_LIMITATIONS.md.
+    const EXPECTED_FAILURES: &[&str] = &[
+        "d_main.c",
+        "g_game.c",
+        "i_system.c",
+        "i_video.c",
+        "m_menu.c",
+        "z_zone.c",
+    ];
+
+    #[test]
+    fn test_full_corpus_c_files_parse_except_known_limitations() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../linuxdoom-1.10");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("linuxdoom-1.10 directory should exist")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("c"))
+            .collect();
+        files.sort();
+
+        let mut unexpected_failures = Vec::new();
+        let mut unexpected_successes = Vec::new();
+        let mut ok_count = 0;
+
+        for path in &files {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let result = parse_full(path.to_str().unwrap());
+            let expected_to_fail = EXPECTED_FAILURES.contains(&name);
+            match (result, expected_to_fail) {
+                (Ok(_), false) => ok_count += 1,
+                (Ok(_), true) => unexpected_successes.push(name.to_string()),
+                (Err(_), true) => {}
+                (Err(e), false) => unexpected_failures.push(format!("{name}: {e}")),
+            }
+        }
+
+        assert!(
+            unexpected_failures.is_empty(),
+            "unexpected parse failures (not in the known-limitations list): {unexpected_failures:#?}"
+        );
+        assert!(
+            unexpected_successes.is_empty(),
+            "files expected to fail now parse successfully -- remove from EXPECTED_FAILURES: {unexpected_successes:#?}"
+        );
+        assert_eq!(ok_count, files.len() - EXPECTED_FAILURES.len());
+        assert!(
+            files.len() > 50,
+            "expected to check the full Doom .c corpus, only found {}",
+            files.len()
+        );
+    }
 }

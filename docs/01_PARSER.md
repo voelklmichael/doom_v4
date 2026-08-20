@@ -107,9 +107,13 @@ flowchart TD
 ---
 
 ### Step 6: AST Grammar Parser
-* **Objective**: Parse the `Vec<Commented<Token>>` stream into a typed Abstract Syntax Tree (AST).
-* **Key Considerations**:
-  - **Lexer Feedback & Symbol Table**: Handle the typedef vs. identifier ambiguity (`typedef_name * x;` vs `ident * x;`).
+
+`#include` is treated as an **import** (bringing type *names* into scope, like a module system), not textual inlining. This is the key design choice behind splitting Step 6 into three sub-steps, because it directly determines how the classic typedef-vs-identifier ambiguity (`typedef_name * x;` vs `ident * x;`) gets resolved: a bare leading identifier in a declaration-specifier position is *never* actually ambiguous at file scope, in a struct field, or in a parameter list (there's no other valid C89 production it could be there) -- it's only genuinely ambiguous **inside function bodies**, once you don't yet know whether that identifier names a type.
+
+* **Step 6a -- Rough Parsing**: Scans each file's top level only, skipping over every `{ ... }` function body (brace-balanced, not parsed -- that's exactly where the real ambiguity lives, and bodies don't affect what a header exports anyway). Records every name introduced by a top-level `typedef`. Needs no typedef table at all, since top-level declaration-specifier positions are structurally unambiguous.
+* **Step 6b -- Exported Types**: For a file, recursively unions its own Step 6a typedef names with the Step 6a names of every local `#include "..."` it pulls in (memoized, cycle-guarded). System includes (`#include <...>`) can't be resolved locally and are left out of the set.
+* **Step 6c -- Actual AST**: Parses the `Vec<Commented<Token>>` stream into a typed Abstract Syntax Tree, with its typedef table seeded from Step 6b's resolved set instead of starting empty -- by the time it reaches a function body, the real typedef set is already known, so the ambiguity resolves correctly.
+* **Key Considerations** (Step 6c):
   - **Declarations**:
     - Primitives, structs, unions, enums, typedefs.
     - Function prototypes, forward declarations, variable declarations with initializers.
@@ -121,5 +125,4 @@ flowchart TD
   - **Expressions**:
     - Unary & Binary operators with standard C operator precedence.
     - Function calls, array indexing, member access (`.` and `->`), explicit casts.
-  - Comments carried on each `Commented<Token>` should be preserved on (or reachable from) the AST node the token belongs to, so later stages can recover documentation.
-* **Validation Criteria**: Complete AST construction for every translation unit in `linuxdoom-1.10`.
+* **Validation Criteria**: Complete AST construction for every translation unit in `linuxdoom-1.10`. Only `.c` files are real translation units in C -- `.h` files are never compiled standalone, so this is checked over the 62 `.c` files, not all 124 `.c`/`.h` files. See `docs/KNOWN_LIMITATIONS.md` for the small number of expected failures (types from system headers this corpus doesn't include, and one use of `#define` macro expansion, which Step 6 doesn't attempt).
