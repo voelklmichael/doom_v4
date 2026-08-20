@@ -27,7 +27,8 @@ impl PreprocessorEnv {
     }
 
     pub fn define(&mut self, name: &str, value: Option<&str>) {
-        self.macros.insert(name.to_string(), value.map(|s| s.to_string()));
+        self.macros
+            .insert(name.to_string(), value.map(|s| s.to_string()));
     }
 
     pub fn undef(&mut self, name: &str) {
@@ -56,11 +57,21 @@ pub enum PreprocessorError {
 impl std::fmt::Display for PreprocessorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PreprocessorError::UnmatchedEndif => write!(f, "unmatched #endif without a corresponding #if/#ifdef"),
-            PreprocessorError::UnmatchedElse => write!(f, "unmatched #else without a corresponding #if/#ifdef"),
-            PreprocessorError::UnmatchedElif => write!(f, "unmatched #elif without a corresponding #if/#ifdef"),
-            PreprocessorError::UnterminatedIf => write!(f, "unterminated #if/#ifdef block at end of file"),
-            PreprocessorError::ExpressionError(msg) => write!(f, "invalid preprocessor expression: {msg}"),
+            PreprocessorError::UnmatchedEndif => {
+                write!(f, "unmatched #endif without a corresponding #if/#ifdef")
+            }
+            PreprocessorError::UnmatchedElse => {
+                write!(f, "unmatched #else without a corresponding #if/#ifdef")
+            }
+            PreprocessorError::UnmatchedElif => {
+                write!(f, "unmatched #elif without a corresponding #if/#ifdef")
+            }
+            PreprocessorError::UnterminatedIf => {
+                write!(f, "unterminated #if/#ifdef block at end of file")
+            }
+            PreprocessorError::ExpressionError(msg) => {
+                write!(f, "invalid preprocessor expression: {msg}")
+            }
         }
     }
 }
@@ -86,7 +97,8 @@ pub fn resolve_conditionals(
     let mut resolved = Vec::new();
     let mut cond_stack: Vec<CondFrame> = Vec::new();
 
-    let is_currently_active = |stack: &[CondFrame]| stack.last().map(|f| f.is_active).unwrap_or(true);
+    let is_currently_active =
+        |stack: &[CondFrame]| stack.last().map(|f| f.is_active).unwrap_or(true);
 
     for chunk in chunks {
         let directive = match chunk {
@@ -125,7 +137,9 @@ pub fn resolve_conditionals(
                 });
             }
             Some(PreprocessorDirective::Elif(expr)) => {
-                let frame = cond_stack.last_mut().ok_or(PreprocessorError::UnmatchedElif)?;
+                let frame = cond_stack
+                    .last_mut()
+                    .ok_or(PreprocessorError::UnmatchedElif)?;
                 if frame.parent_active && !frame.branch_taken {
                     let cond_true = evaluate_expr(expr, env)? != 0;
                     frame.is_active = cond_true;
@@ -135,7 +149,9 @@ pub fn resolve_conditionals(
                 }
             }
             Some(PreprocessorDirective::Else) => {
-                let frame = cond_stack.last_mut().ok_or(PreprocessorError::UnmatchedElse)?;
+                let frame = cond_stack
+                    .last_mut()
+                    .ok_or(PreprocessorError::UnmatchedElse)?;
                 if frame.parent_active && !frame.branch_taken {
                     frame.is_active = true;
                     frame.branch_taken = true;
@@ -198,7 +214,11 @@ fn strip_trailing_comments(s: &str) -> &str {
 /// Evaluates a preprocessor integer constant expression (e.g. `1`, `defined(LINUX)`, `FOO && BAR`).
 pub fn evaluate_expr(expr: &str, env: &PreprocessorEnv) -> Result<i64, PreprocessorError> {
     let tokens = tokenize_expr(strip_trailing_comments(expr), env)?;
-    ExprParser { tokens: &tokens, pos: 0 }.parse_or()
+    ExprParser {
+        tokens: &tokens,
+        pos: 0,
+    }
+    .parse_or()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -346,7 +366,11 @@ fn tokenize_expr(s: &str, env: &PreprocessorEnv) -> Result<Vec<ExprTok>, Preproc
             '&' => ExprTok::BitAnd,
             '^' => ExprTok::BitXor,
             '|' => ExprTok::BitOr,
-            _ => return Err(PreprocessorError::ExpressionError(format!("unexpected character: {c}"))),
+            _ => {
+                return Err(PreprocessorError::ExpressionError(format!(
+                    "unexpected character: {c}"
+                )));
+            }
         };
         tokens.push(tok);
         i += 1;
@@ -512,7 +536,9 @@ impl ExprParser<'_> {
                     self.advance();
                     let right = self.parse_unary()?;
                     if right == 0 {
-                        return Err(PreprocessorError::ExpressionError("division by zero".into()));
+                        return Err(PreprocessorError::ExpressionError(
+                            "division by zero".into(),
+                        ));
                     }
                     left /= right;
                 }
@@ -559,11 +585,17 @@ impl ExprParser<'_> {
                 let val = self.parse_or()?;
                 match self.advance() {
                     Some(ExprTok::CloseParen) => Ok(val),
-                    _ => Err(PreprocessorError::ExpressionError("unclosed parenthesis".into())),
+                    _ => Err(PreprocessorError::ExpressionError(
+                        "unclosed parenthesis".into(),
+                    )),
                 }
             }
-            Some(tok) => Err(PreprocessorError::ExpressionError(format!("unexpected token: {tok:?}"))),
-            None => Err(PreprocessorError::ExpressionError("unexpected end of expression".into())),
+            Some(tok) => Err(PreprocessorError::ExpressionError(format!(
+                "unexpected token: {tok:?}"
+            ))),
+            None => Err(PreprocessorError::ExpressionError(
+                "unexpected end of expression".into(),
+            )),
         }
     }
 }
@@ -664,14 +696,20 @@ int b = 2;
     fn test_unmatched_endif_errors() {
         let chunks = crate::parser::partitioner::partition_source("#endif\n");
         let mut env = PreprocessorEnv::new();
-        assert_eq!(resolve_conditionals(&chunks, &mut env), Err(PreprocessorError::UnmatchedEndif));
+        assert_eq!(
+            resolve_conditionals(&chunks, &mut env),
+            Err(PreprocessorError::UnmatchedEndif)
+        );
     }
 
     #[test]
     fn test_unterminated_if_errors() {
         let chunks = crate::parser::partitioner::partition_source("#if 1\nint a;\n");
         let mut env = PreprocessorEnv::new();
-        assert_eq!(resolve_conditionals(&chunks, &mut env), Err(PreprocessorError::UnterminatedIf));
+        assert_eq!(
+            resolve_conditionals(&chunks, &mut env),
+            Err(PreprocessorError::UnterminatedIf)
+        );
     }
 
     #[test]
@@ -691,18 +729,25 @@ int b = 2;
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("linuxdoom-1.10 directory should exist") {
             let path = entry.unwrap().path();
-            let is_source = matches!(path.extension().and_then(|e| e.to_str()), Some("c") | Some("h"));
+            let is_source = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("c") | Some("h")
+            );
             if !path.is_file() || !is_source {
                 continue;
             }
-            let content = std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
+            let content =
+                std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
             let (_, chunks) = parse_chunks(&content);
             let mut env = PreprocessorEnv::linux_doom_defaults();
             resolve_conditionals(&chunks, &mut env)
                 .unwrap_or_else(|e| panic!("preprocessor error in {}: {e}", path.display()));
             checked += 1;
         }
-        assert!(checked > 100, "expected to check the full Doom corpus, only checked {checked}");
+        assert!(
+            checked > 100,
+            "expected to check the full Doom corpus, only checked {checked}"
+        );
     }
 
     #[test]

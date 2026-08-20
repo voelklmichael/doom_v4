@@ -1,19 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use transpiler::parser::{lex_chunks, parse_chunks, resolve_conditionals, PreprocessorEnv};
+use transpiler::parser::{PreprocessorEnv, lex_chunks, parse_chunks, resolve_conditionals};
 
 fn collect_c_source_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "c" || ext == "h" {
-                        files.push(path);
-                    }
-                }
+            if path.is_file()
+                && let Some(ext) = path.extension()
+                && (ext == "c" || ext == "h")
+            {
+                files.push(path);
             }
         }
     }
@@ -90,17 +89,29 @@ fn main() {
     let elapsed = start_time.elapsed();
 
     println!("------------------------------------------------------------");
-    println!("Execution Summary across {} Doom source files:", total_files);
+    println!(
+        "Execution Summary across {} Doom source files:",
+        total_files
+    );
     println!("  Total Line Continuations Spliced:  {}", total_splices);
     println!("  Total Raw Chunks (Step 2):         {}", total_raw_chunks);
-    println!("  Total Active Chunks (Step 3):      {}", total_resolved_chunks);
-    println!("  Filtered Inactive Chunks:          {}", total_raw_chunks.saturating_sub(total_resolved_chunks));
+    println!(
+        "  Total Active Chunks (Step 3):      {}",
+        total_resolved_chunks
+    );
+    println!(
+        "  Filtered Inactive Chunks:          {}",
+        total_raw_chunks.saturating_sub(total_resolved_chunks)
+    );
     println!("  Total Lex Items (Step 4):          {}", total_lex_items);
     println!("  Files with Errors:                 {}", files_with_errors);
     println!("  Total Time Elapsed:                {:.2?}", elapsed);
     println!("============================================================");
 
     if files_with_errors == 0 {
-        println!("All {} files passed Steps 1-4 with 100% success!", total_files);
+        println!(
+            "All {} files passed Steps 1-4 with 100% success!",
+            total_files
+        );
     }
 }

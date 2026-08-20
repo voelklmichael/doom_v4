@@ -69,7 +69,10 @@ pub enum PreprocessorDirective {
     Endif,
     Pragma(String),
     Error(String),
-    Other { directive: String, rest: String },
+    Other {
+        directive: String,
+        rest: String,
+    },
 }
 
 /// Partitions spliced source text into high-level chunks.
@@ -154,7 +157,11 @@ pub fn partition_source(source: &str) -> Vec<SourceChunk> {
             let start = i;
             i += 1;
             while i < len && bytes[i] != b'"' {
-                i += if bytes[i] == b'\\' && i + 1 < len { 2 } else { 1 };
+                i += if bytes[i] == b'\\' && i + 1 < len {
+                    2
+                } else {
+                    1
+                };
             }
             if i < len {
                 i += 1; // closing quote
@@ -171,7 +178,11 @@ pub fn partition_source(source: &str) -> Vec<SourceChunk> {
             let start = i;
             i += 1;
             while i < len && bytes[i] != b'\'' {
-                i += if bytes[i] == b'\\' && i + 1 < len { 2 } else { 1 };
+                i += if bytes[i] == b'\\' && i + 1 < len {
+                    2
+                } else {
+                    1
+                };
             }
             if i < len {
                 i += 1; // closing quote
@@ -254,21 +265,25 @@ fn parse_define(rest: &str) -> PreprocessorDirective {
     // Function-like macro: NAME(...), with no whitespace between name and '(' (ISO C).
     if let Some(open_paren) = trimmed.find('(') {
         let name_part = &trimmed[..open_paren];
-        if !name_part.is_empty() && name_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            if let Some(close_offset) = trimmed[open_paren..].find(')') {
-                let close_paren_idx = open_paren + close_offset;
-                let params_str = &trimmed[open_paren + 1..close_paren_idx];
-                let params = if params_str.trim().is_empty() {
-                    Vec::new()
-                } else {
-                    params_str.split(',').map(|s| s.trim().to_string()).collect()
-                };
-                return PreprocessorDirective::Define {
-                    name: name_part.to_string(),
-                    params: Some(params),
-                    body: trimmed[close_paren_idx + 1..].trim().to_string(),
-                };
-            }
+        if !name_part.is_empty()
+            && name_part.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && let Some(close_offset) = trimmed[open_paren..].find(')')
+        {
+            let close_paren_idx = open_paren + close_offset;
+            let params_str = &trimmed[open_paren + 1..close_paren_idx];
+            let params = if params_str.trim().is_empty() {
+                Vec::new()
+            } else {
+                params_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            };
+            return PreprocessorDirective::Define {
+                name: name_part.to_string(),
+                params: Some(params),
+                body: trimmed[close_paren_idx + 1..].trim().to_string(),
+            };
         }
     }
 
@@ -335,7 +350,10 @@ int main(int argc, char **argv) {
                 } => {
                     define_count += 1;
                     if name == "FIXEDMUL" {
-                        assert_eq!(params.as_ref().unwrap(), &vec!["a".to_string(), "b".to_string()]);
+                        assert_eq!(
+                            params.as_ref().unwrap(),
+                            &vec!["a".to_string(), "b".to_string()]
+                        );
                         assert_eq!(body, "(((a)*(b))>>FRACBITS)");
                     }
                 }
@@ -374,17 +392,29 @@ int main(int argc, char **argv) {
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("linuxdoom-1.10 directory should exist") {
             let path = entry.unwrap().path();
-            let is_source = matches!(path.extension().and_then(|e| e.to_str()), Some("c") | Some("h"));
+            let is_source = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("c") | Some("h")
+            );
             if !path.is_file() || !is_source {
                 continue;
             }
-            let content = std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
+            let content =
+                std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
             let spliced = splice(&content);
             let chunks = partition_source(&spliced.text);
             let reconstructed: String = chunks.iter().map(SourceChunk::raw_text).collect();
-            assert_eq!(reconstructed, spliced.text, "round-trip mismatch for {}", path.display());
+            assert_eq!(
+                reconstructed,
+                spliced.text,
+                "round-trip mismatch for {}",
+                path.display()
+            );
             checked += 1;
         }
-        assert!(checked > 100, "expected to check the full Doom corpus, only checked {checked}");
+        assert!(
+            checked > 100,
+            "expected to check the full Doom corpus, only checked {checked}"
+        );
     }
 }

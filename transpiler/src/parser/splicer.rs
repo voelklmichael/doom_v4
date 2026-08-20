@@ -40,7 +40,10 @@ pub struct SplicedSource {
 impl SplicedSource {
     /// Map a byte offset in `self.text` (spliced text) back to a location in the original file.
     pub fn original_location(&self, spliced_offset: usize) -> SourceLocation {
-        let orig_offset = match self.mappings.binary_search_by_key(&spliced_offset, |m| m.spliced_offset) {
+        let orig_offset = match self
+            .mappings
+            .binary_search_by_key(&spliced_offset, |m| m.spliced_offset)
+        {
             Ok(i) => self.mappings[i].original_offset,
             Err(0) => spliced_offset,
             Err(i) => {
@@ -118,7 +121,8 @@ pub fn splice(source: &str) -> SplicedSource {
     }
 
     SplicedSource {
-        text: String::from_utf8(output).expect("splicing only removes ASCII continuation sequences"),
+        text: String::from_utf8(output)
+            .expect("splicing only removes ASCII continuation sequences"),
         original_line_starts,
         mappings,
         spliced_continuations_count,
@@ -193,17 +197,20 @@ mod tests {
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("linuxdoom-1.10 directory should exist") {
             let path = entry.unwrap().path();
-            let is_source = matches!(path.extension().and_then(|e| e.to_str()), Some("c") | Some("h"));
+            let is_source = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("c") | Some("h")
+            );
             if !path.is_file() || !is_source {
                 continue;
             }
-            let content = std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
+            let content =
+                std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
             let res = splice(&content);
 
             // Every backslash-newline (or backslash-whitespace-newline) run in the
             // original must have been removed, and nothing else may have moved.
-            let expected_len = content.len()
-                - count_spliced_bytes(&content);
+            let expected_len = content.len() - count_spliced_bytes(&content);
             assert_eq!(
                 res.text.len(),
                 expected_len,
@@ -212,7 +219,10 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked > 100, "expected to check the full Doom corpus, only checked {checked}");
+        assert!(
+            checked > 100,
+            "expected to check the full Doom corpus, only checked {checked}"
+        );
     }
 
     /// Reference-counts the bytes that `splice` should remove, using a naive

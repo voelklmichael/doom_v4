@@ -3,13 +3,13 @@ pub mod partitioner;
 pub mod preprocessor;
 pub mod splicer;
 
-pub use lexer::{lex_chunks, lex_code, Keyword, LexError, LexItem, Punct, Token, TokenKind};
+pub use lexer::{Keyword, LexError, LexItem, Punct, Token, TokenKind, lex_chunks, lex_code};
 pub use partitioner::{
-    parse_preprocessor_directive, partition_source, CommentChunk, PreprocessorDirective,
-    SourceChunk,
+    CommentChunk, PreprocessorDirective, SourceChunk, parse_preprocessor_directive,
+    partition_source,
 };
-pub use preprocessor::{evaluate_expr, resolve_conditionals, PreprocessorEnv, PreprocessorError};
-pub use splicer::{splice, SourceLocation, SplicedSource};
+pub use preprocessor::{PreprocessorEnv, PreprocessorError, evaluate_expr, resolve_conditionals};
+pub use splicer::{SourceLocation, SplicedSource, splice};
 
 /// Runs Step 1 (line splicing) followed by Step 2 (partitioning) on raw source text.
 pub fn parse_chunks(source: &str) -> (SplicedSource, Vec<SourceChunk>) {
