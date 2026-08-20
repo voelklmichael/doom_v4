@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use transpiler::parser::splice;
+use transpiler::parser::parse_chunks;
 
 fn collect_c_source_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -30,7 +30,7 @@ fn main() {
     };
 
     println!("============================================================");
-    println!(" Doom C Transpiler: Step 1 (Line Splicing) Pipeline Runner ");
+    println!(" Doom C Transpiler: Steps 1-2 Pipeline Runner              ");
     println!(" Target directory: {:?}", target_dir);
     println!("============================================================");
 
@@ -43,6 +43,7 @@ fn main() {
     let start_time = Instant::now();
     let mut total_files = 0;
     let mut total_splices = 0;
+    let mut total_chunks = 0;
     let mut files_with_errors = 0;
 
     for file_path in &files {
@@ -55,9 +56,10 @@ fn main() {
             }
         };
 
-        let spliced = splice(&content);
+        let (spliced, chunks) = parse_chunks(&content);
         total_files += 1;
         total_splices += spliced.spliced_continuations_count;
+        total_chunks += chunks.len();
     }
 
     let elapsed = start_time.elapsed();
@@ -65,11 +67,12 @@ fn main() {
     println!("------------------------------------------------------------");
     println!("Execution Summary across {} Doom source files:", total_files);
     println!("  Total Line Continuations Spliced:  {}", total_splices);
+    println!("  Total Chunks (Step 2):              {}", total_chunks);
     println!("  Files with Errors:                 {}", files_with_errors);
     println!("  Total Time Elapsed:                {:.2?}", elapsed);
     println!("============================================================");
 
     if files_with_errors == 0 {
-        println!("All {} files passed Step 1 (Line Splicing) with 100% success!", total_files);
+        println!("All {} files passed Steps 1-2 with 100% success!", total_files);
     }
 }
