@@ -3,9 +3,13 @@ pub mod comment_attach;
 pub mod grammar;
 pub mod imports;
 pub mod lexer;
+pub mod macro_literal_subst;
+pub mod macro_literals;
 pub mod partitioner;
 pub mod preprocessor;
 pub mod splicer;
+pub(crate) mod system_headers;
+pub mod xlib_typedefs;
 
 pub use comment_attach::{Anchor, Commented, CommentedStream, attach_comments};
 pub use grammar::{
@@ -15,6 +19,8 @@ pub use imports::ImportResolver;
 pub use lexer::{
     Keyword, LexEntry, LexError, LexItem, Punct, Token, TokenKind, lex_chunks, lex_code,
 };
+pub use macro_literal_subst::substitute_adjacent_literal_macros;
+pub use macro_literals::LiteralMacroResolver;
 pub use partitioner::{
     CommentChunk, PreprocessorDirective, SourceChunk, parse_preprocessor_directive,
     partition_source,
@@ -46,10 +52,24 @@ pub fn parse_and_lex(path: &str) -> Result<(SplicedSource, Vec<LexEntry>), Strin
     Ok((spliced, entries))
 }
 
-/// Runs Steps 1-5 on a source file: splicing, partitioning, conditional resolution,
-/// lexing, and comment attaching.
-pub fn parse_lex_and_attach(path: &str) -> Result<(SplicedSource, CommentedStream), String> {
+/// Runs Steps 1-4 plus literal-macro substitution: resolves every literal-
+/// bodied `#define` visible to `path` (its own, plus everything transitively
+/// `#include`d) and substitutes it wherever it sits immediately next to a
+/// real string/char literal token -- see `macro_literals.rs` /
+/// `macro_literal_subst.rs`.
+pub fn parse_lex_and_substitute(path: &str) -> Result<(SplicedSource, Vec<LexEntry>), String> {
     let (spliced, entries) = parse_and_lex(path)?;
+    let macros = LiteralMacroResolver::new().resolve(std::path::Path::new(path));
+    Ok((
+        spliced,
+        substitute_adjacent_literal_macros(entries, &macros),
+    ))
+}
+
+/// Runs Steps 1-5 on a source file: splicing, partitioning, conditional resolution,
+/// lexing (with literal-macro substitution), and comment attaching.
+pub fn parse_lex_and_attach(path: &str) -> Result<(SplicedSource, CommentedStream), String> {
+    let (spliced, entries) = parse_lex_and_substitute(path)?;
     Ok((spliced, attach_comments(entries)))
 }
 
@@ -68,23 +88,8 @@ pub fn parse_full(path: &str) -> Result<(SplicedSource, ast::TranslationUnit), S
 mod tests {
     use super::*;
 
-    /// Files that fail Step 6c for reasons outside the parser's control:
-    /// they reference types from system headers this corpus doesn't include
-    /// (`FILE`/`va_list` from libc, `Display` from X11) or need `#define`
-    /// macro *expansion* (not just conditional resolution, which is all
-    /// Step 3 does) to parse a string built from a macro constant. See
-    /// docs/KNOWN_LIMITATIONS.md.
-    const EXPECTED_FAILURES: &[&str] = &[
-        "d_main.c",
-        "g_game.c",
-        "i_system.c",
-        "i_video.c",
-        "m_menu.c",
-        "z_zone.c",
-    ];
-
     #[test]
-    fn test_full_corpus_c_files_parse_except_known_limitations() {
+    fn test_full_corpus_c_files_parse() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../linuxdoom-1.10");
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .expect("linuxdoom-1.10 directory should exist")
@@ -95,30 +100,21 @@ mod tests {
         files.sort();
 
         let mut unexpected_failures = Vec::new();
-        let mut unexpected_successes = Vec::new();
         let mut ok_count = 0;
 
         for path in &files {
             let name = path.file_name().unwrap().to_str().unwrap();
-            let result = parse_full(path.to_str().unwrap());
-            let expected_to_fail = EXPECTED_FAILURES.contains(&name);
-            match (result, expected_to_fail) {
-                (Ok(_), false) => ok_count += 1,
-                (Ok(_), true) => unexpected_successes.push(name.to_string()),
-                (Err(_), true) => {}
-                (Err(e), false) => unexpected_failures.push(format!("{name}: {e}")),
+            match parse_full(path.to_str().unwrap()) {
+                Ok(_) => ok_count += 1,
+                Err(e) => unexpected_failures.push(format!("{name}: {e}")),
             }
         }
 
         assert!(
             unexpected_failures.is_empty(),
-            "unexpected parse failures (not in the known-limitations list): {unexpected_failures:#?}"
+            "unexpected parse failures: {unexpected_failures:#?}"
         );
-        assert!(
-            unexpected_successes.is_empty(),
-            "files expected to fail now parse successfully -- remove from EXPECTED_FAILURES: {unexpected_successes:#?}"
-        );
-        assert_eq!(ok_count, files.len() - EXPECTED_FAILURES.len());
+        assert_eq!(ok_count, files.len());
         assert!(
             files.len() > 50,
             "expected to check the full Doom .c corpus, only found {}",

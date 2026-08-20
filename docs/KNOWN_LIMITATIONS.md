@@ -75,31 +75,50 @@ directive's raw text.
 
 ---
 
-## Step 6 can't resolve types from system headers not present in this corpus
+## Step 6 resolves system headers (`#include <...>`) from the build machine, with a hand-seeded fallback
 
 **Where**: Step 6b import resolution (`transpiler/src/parser/imports.rs`).
 
 Step 6 treats `#include` as an import: a file's typedef table is its own top-level
-typedefs unioned with everything transitively imported via local `#include "..."`s
-(see `docs/01_PARSER.md` Step 6). `#include <...>` (system headers) can't be resolved
-this way, since there's no local file to read.
+typedefs unioned with everything transitively imported via `#include` (see
+`docs/01_PARSER.md` Step 6). `#include "..."` (local) resolves relative to the
+including file's directory, same as always. `#include <...>` (system) is resolved the
+way a real preprocessor would: searched for across the build machine's actual system
+include directories (`SYSTEM_INCLUDE_DIRS`, matching `gcc -E -Wp,-v`'s own search
+order), and if found, processed through the same Steps 1-4 + Step 6a pipeline as any
+local header -- including recursively following *its* `#include`s, which is how
+`i_video.c`'s `Display`/`Window`/`GC`/... end up resolved via the real
+`/usr/include/X11/Xlib.h` pulling in `/usr/include/X11/X.h` for `Window`, etc.
 
-**Impact today**: 3 of 62 `.c` translation units fail to parse for this reason --
-`d_main.c` and `z_zone.c` use `FILE` (`<stdio.h>`), `i_video.c` uses `Display`
-(`<X11/Xlib.h>`), and `i_system.c` uses `va_list` (`<stdarg.h>`). All three are
-genuinely external: this repo doesn't (and can't sensibly) contain libc's or X11's
-headers, so there's no source to import types from. See `transpiler/src/parser/mod.rs`'s
-`EXPECTED_FAILURES` list in the Step 6 corpus test, which tracks this explicitly rather
-than silently ignoring it.
+If a system header isn't present on the machine actually running this (or fails to
+process cleanly), its typedefs are just missing from the result -- fails soft, not
+hard. Two hardcoded fallback tables cover this so the result no longer depends on what
+happens to be installed:
 
-**If it starts mattering**: either hand-seed a small table of well-known system
-typedefs (`FILE`, `va_list`, common X11 types, ...) for the handful of files that need
-them, or (more generally, much larger scope) parse the actual system headers on the
-build machine the way a real preprocessor would.
+- `WELL_KNOWN_SYSTEM_TYPEDEFS` (`imports.rs`): `FILE`, `va_list` -- hand-picked, the two
+  libc typedefs this corpus actually references.
+- `xlib_typedefs::XLIB_TYPEDEFS` (`transpiler/src/parser/xlib_typedefs.rs`, **generated**):
+  every one of the 108 typedef names transitively exported by this dev machine's real
+  `/usr/include/X11/Xlib.h` (`Display`, `Window`, `GC`, `Visual`, `XEvent`, ...),
+  captured by actually resolving it once and hardcoding the result. Regenerate with
+  `cargo run --example update_xlib_typedefs` on a machine with X11 dev headers
+  installed (e.g. after a distro upgrade changes Xlib.h) -- the example re-resolves
+  Xlib.h via `ImportResolver` and overwrites the file. Never hand-edit it.
+
+Both apply unconditionally (unioned in on every `resolve()` call, real headers or not),
+so `i_video.c`/`i_system.c`/`z_zone.c` all resolve the same way regardless of what's
+installed on the machine running the pipeline -- no longer environment-dependent.
+
+**`d_main.c`/`g_game.c`/`m_menu.c` were a different issue entirely, not typedefs**: see
+the macro-substitution entry below -- fixing `FILE` on `d_main.c` revealed its real
+remaining blocker was a `#define`d string constant, unrelated to system headers. Now
+fixed there too (Step 4b), so all 62 `.c` translation units pass Step 6.
+
+**Impact today**: 0 of 62 `.c` translation units fail Step 6 for missing system types.
 
 ---
 
-## Step 6 doesn't perform `#define` macro expansion
+## Step 6 doesn't perform general `#define` macro expansion (fixed narrowly, for the one case that mattered)
 
 **Where**: Step 3 (`transpiler/src/parser/preprocessor.rs`) only ever resolves
 conditional compilation (`#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif`); it never
@@ -107,18 +126,37 @@ substitutes an object-like or function-like macro's body into the token stream w
 the macro is *used* in code (only into `#if`/`#elif` *expressions*, where
 `evaluate_expr` needs the value).
 
-**Impact today**: 2 of 62 `.c` translation units fail to parse for this reason --
-`g_game.c` and `m_menu.c` both write `sprintf(name, "..." SAVEGAMENAME "...", ...)`,
-relying on `SAVEGAMENAME` (an object-like `#define`d string constant) being substituted
-with its literal text *before* parsing, so the result is three adjacent string-literal
-tokens that concatenate per C89 translation phase 6. Since we never substitute the
-macro, the parser sees `StringLiteral Identifier StringLiteral` -- an identifier
-sitting where an expression can't have one -- and fails. This is a narrow case (found
-via exactly these 2 files across the whole corpus), not a systemic problem with the
-adjacent-string-literal handling itself (which is otherwise exercised constantly and
-works, e.g. `d_main.c:820-830`).
+**Root cause found via corpus analysis, not guesswork**: rather than assume this was a
+big open-ended problem, the actual scope was measured by scanning the real lexed token
+stream of every `.c` file for "an identifier sitting immediately next to a string/char
+literal, where that identifier is genuinely `#define`d somewhere in the corpus" (814
+macro names total). Result: exactly **4 distinct macros**, all in **3 files**:
+`SAVEGAMENAME` (`d_main.c`, `g_game.c`, `m_menu.c`; defined in `dstrings.h`), `DEVDATA`
+and `DEVMAPS` (`d_main.c`, defined in `d_main.c` itself), and `DOSY` (`m_menu.c`;
+defined in `d_englsh.h`/`d_french.h`). All four are object-like macros whose body is
+*just* a single string literal.
 
-**If it starts mattering**: implement macro expansion as a pass between Steps 3 and 4
-(object-like macros are a straightforward token-substitution; function-like macros
-additionally need argument matching/substitution and are common enough elsewhere in
-the corpus that a real transpiler would eventually need this anyway).
+**Fixed**: added Step 4b (`docs/01_PARSER.md`), a narrow substitution pass rather than a
+general macro expander:
+
+- `transpiler/src/parser/macro_literals.rs` (`LiteralMacroResolver`) resolves every
+  literal-bodied object-like `#define` visible to a file (its own, plus everything
+  transitively `#include`d -- mirroring Step 6b's import treatment, reusing the same
+  `system_headers.rs` include resolution).
+- `transpiler/src/parser/macro_literal_subst.rs` walks the Step 4 token stream and
+  substitutes each such macro's identifier with its literal token, but *only* where a
+  string/char literal token sits immediately before or after it. Once substituted, it's
+  a literal like any other, so Step 6c's existing adjacent-string-literal-concatenation
+  handling (already exercised constantly, e.g. `d_main.c:820-830`) picks up the rest --
+  no separate concatenation logic needed.
+- A macro used anywhere *other* than directly touching a literal (assigned to a
+  variable, passed as a lone argument, referenced inside another macro's body) is left
+  as a plain, unexpanded identifier -- deliberately, this is not a general preprocessor.
+
+**Impact today**: 0 of 62 `.c` translation units fail for this reason anymore -- all 62
+now parse (see `transpiler/src/parser/mod.rs`'s corpus test).
+
+**If general macro expansion starts mattering** (e.g. function-like macros used as
+actual expressions, not just adjacent to literals): implement full expansion as a pass
+between Steps 3 and 4 (object-like macros are a straightforward token-substitution;
+function-like macros additionally need argument matching/substitution).
