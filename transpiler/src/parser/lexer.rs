@@ -27,9 +27,38 @@ pub enum TokenKind {
 /// The 32 C89 reserved keywords.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
-    Auto, Break, Case, Char, Const, Continue, Default, Do, Double, Else, Enum,
-    Extern, Float, For, Goto, If, Int, Long, Register, Return, Short, Signed,
-    Sizeof, Static, Struct, Switch, Typedef, Union, Unsigned, Void, Volatile, While,
+    Auto,
+    Break,
+    Case,
+    Char,
+    Const,
+    Continue,
+    Default,
+    Do,
+    Double,
+    Else,
+    Enum,
+    Extern,
+    Float,
+    For,
+    Goto,
+    If,
+    Int,
+    Long,
+    Register,
+    Return,
+    Short,
+    Signed,
+    Sizeof,
+    Static,
+    Struct,
+    Switch,
+    Typedef,
+    Union,
+    Unsigned,
+    Void,
+    Volatile,
+    While,
 }
 
 impl Keyword {
@@ -75,12 +104,54 @@ impl Keyword {
 /// C89 punctuators and operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Punct {
-    LBracket, RBracket, LParen, RParen, LBrace, RBrace,
-    Dot, Arrow, PlusPlus, MinusMinus, Amp, Star, Plus, Minus, Tilde, Bang,
-    Slash, Percent, ShiftLeft, ShiftRight, Lt, Gt, Le, Ge, EqEq, NotEq,
-    Caret, Pipe, AmpAmp, PipePipe, Question, Colon, Semicolon, Ellipsis,
-    Eq, StarEq, SlashEq, PercentEq, PlusEq, MinusEq, ShiftLeftEq, ShiftRightEq,
-    AmpEq, CaretEq, PipeEq, Comma, Hash, HashHash,
+    LBracket,
+    RBracket,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    Dot,
+    Arrow,
+    PlusPlus,
+    MinusMinus,
+    Amp,
+    Star,
+    Plus,
+    Minus,
+    Tilde,
+    Bang,
+    Slash,
+    Percent,
+    ShiftLeft,
+    ShiftRight,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    EqEq,
+    NotEq,
+    Caret,
+    Pipe,
+    AmpAmp,
+    PipePipe,
+    Question,
+    Colon,
+    Semicolon,
+    Ellipsis,
+    Eq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    PlusEq,
+    MinusEq,
+    ShiftLeftEq,
+    ShiftRightEq,
+    AmpEq,
+    CaretEq,
+    PipeEq,
+    Comma,
+    Hash,
+    HashHash,
 }
 
 const PUNCTS_3: &[(&str, Punct)] = &[
@@ -271,7 +342,11 @@ pub fn lex_code(text: &str) -> Result<Vec<Token>, LexError> {
             }
 
             let word: String = chars[start..i].iter().collect();
-            let kind = if is_float { TokenKind::FloatConstant } else { TokenKind::IntegerConstant };
+            let kind = if is_float {
+                TokenKind::FloatConstant
+            } else {
+                TokenKind::IntegerConstant
+            };
             tokens.push(Token { kind, text: word });
             continue;
         }
@@ -279,22 +354,33 @@ pub fn lex_code(text: &str) -> Result<Vec<Token>, LexError> {
         // Punctuators: maximal munch, longest match first.
         let remaining: String = chars[i..(i + 3).min(len)].iter().collect();
         if let Some(&(s, p)) = PUNCTS_3.iter().find(|(s, _)| remaining.starts_with(s)) {
-            tokens.push(Token { kind: TokenKind::Punct(p), text: s.to_string() });
+            tokens.push(Token {
+                kind: TokenKind::Punct(p),
+                text: s.to_string(),
+            });
             i += s.chars().count();
             continue;
         }
         if let Some(&(s, p)) = PUNCTS_2.iter().find(|(s, _)| remaining.starts_with(s)) {
-            tokens.push(Token { kind: TokenKind::Punct(p), text: s.to_string() });
+            tokens.push(Token {
+                kind: TokenKind::Punct(p),
+                text: s.to_string(),
+            });
             i += s.chars().count();
             continue;
         }
         if let Some(p) = punct_1(c) {
-            tokens.push(Token { kind: TokenKind::Punct(p), text: c.to_string() });
+            tokens.push(Token {
+                kind: TokenKind::Punct(p),
+                text: c.to_string(),
+            });
             i += 1;
             continue;
         }
 
-        let context: String = chars[i.saturating_sub(10)..(i + 10).min(len)].iter().collect();
+        let context: String = chars[i.saturating_sub(10)..(i + 10).min(len)]
+            .iter()
+            .collect();
         return Err(LexError::UnrecognizedChar { ch: c, context });
     }
 
@@ -304,7 +390,7 @@ pub fn lex_code(text: &str) -> Result<Vec<Token>, LexError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{parse_chunks, resolve_conditionals, PreprocessorEnv};
+    use crate::parser::{PreprocessorEnv, parse_chunks, resolve_conditionals};
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         lex_code(src).unwrap().into_iter().map(|t| t.kind).collect()
@@ -376,8 +462,16 @@ mod tests {
         let items = lex_chunks(&chunks).unwrap();
 
         assert!(items.iter().any(|i| matches!(i, LexItem::Directive(PreprocessorDirective::Define { name, .. }) if name == "FOO")));
-        assert!(items.iter().any(|i| matches!(i, LexItem::Comment(CommentChunk::Line(s)) if s == "// hi")));
-        assert!(items.iter().any(|i| matches!(i, LexItem::Comment(CommentChunk::Block(s)) if s == "/* c */")));
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, LexItem::Comment(CommentChunk::Line(s)) if s == "// hi"))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, LexItem::Comment(CommentChunk::Block(s)) if s == "/* c */"))
+        );
         assert!(items.iter().any(|i| matches!(i, LexItem::Token(t) if t.kind == TokenKind::StringLiteral && t.text == "\"hello\"")));
     }
 
@@ -387,18 +481,26 @@ mod tests {
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("linuxdoom-1.10 directory should exist") {
             let path = entry.unwrap().path();
-            let is_source = matches!(path.extension().and_then(|e| e.to_str()), Some("c") | Some("h"));
+            let is_source = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("c") | Some("h")
+            );
             if !path.is_file() || !is_source {
                 continue;
             }
-            let content = std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
+            let content =
+                std::fs::read_to_string(&path).expect("source file should be valid UTF-8");
             let (_, chunks) = parse_chunks(&content);
             let mut env = PreprocessorEnv::linux_doom_defaults();
             let resolved = resolve_conditionals(&chunks, &mut env)
                 .unwrap_or_else(|e| panic!("preprocessor error in {}: {e}", path.display()));
-            lex_chunks(&resolved).unwrap_or_else(|e| panic!("lex error in {}: {e}", path.display()));
+            lex_chunks(&resolved)
+                .unwrap_or_else(|e| panic!("lex error in {}: {e}", path.display()));
             checked += 1;
         }
-        assert!(checked > 100, "expected to check the full Doom corpus, only checked {checked}");
+        assert!(
+            checked > 100,
+            "expected to check the full Doom corpus, only checked {checked}"
+        );
     }
 }
