@@ -415,6 +415,99 @@ impl Parser {
         }
     }
 
+    /// Consumes a `(` and everything up to and including its matching `)`.
+    fn skip_balanced_parens(&mut self) {
+        debug_assert!(self.is_punct(Punct::LParen));
+        let mut depth = 0i32;
+        loop {
+            match self.advance() {
+                Some(t) if t.kind == TokenKind::Punct(Punct::LParen) => depth += 1,
+                Some(t) if t.kind == TokenKind::Punct(Punct::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    }
+
+    /// Rough-scan only (Step 6a/Step 0): skips a run of trailing GNU
+    /// declaration decorations real system headers rely on pervasively
+    /// (`__THROW`, `__THROWNL`, `__nonnull ((1))`, `__wur`,
+    /// `__attribute__((...))`, ...) between a declarator and its
+    /// terminating `;`/`{`/`,`. Our C89 grammar has no model for these, and
+    /// the rough scan only needs a declaration's name and shape, not these
+    /// attributes' actual meaning -- so any bare identifier (optionally
+    /// followed by a parenthesized argument list) found in a position
+    /// where only `;`/`{`/`,` would otherwise be valid is, by definition,
+    /// one of these, not a real declaration. Gated behind `skip_bodies` so
+    /// Step 6c's strict, already-100%-passing corpus parse is untouched --
+    /// `linuxdoom-1.10` never uses any of this.
+    fn skip_gnu_decorations(&mut self) {
+        if !self.skip_bodies {
+            return;
+        }
+        while matches!(self.peek().map(|t| t.kind), Some(TokenKind::Identifier)) {
+            self.advance();
+            if self.is_punct(Punct::LParen) {
+                self.skip_balanced_parens();
+            }
+        }
+    }
+
+    /// Rough-scan error recovery (Step 6a/Step 0 only, `skip_bodies` mode):
+    /// a real system header uses GNU/C99 syntax our grammar doesn't cover
+    /// (`__restrict`, `__attribute__((...))`, `__THROW`, ...), so one
+    /// top-level construct failing to parse is expected, not exceptional.
+    /// Rather than lose every declaration already collected from the same
+    /// file (the caller would otherwise have to discard the whole
+    /// `TranslationUnit` on any single `Err`), skip forward from wherever
+    /// parsing broke down to the next top-level boundary: the next `;` seen
+    /// at bracket/paren/brace depth 0 (consumed, e.g. a broken prototype),
+    /// or the next `}` that closes back to depth 0 (consumed, e.g. a broken
+    /// `static inline` function's body -- no trailing `;` to look for
+    /// there). Leaves the parser positioned to resume with the next
+    /// external declaration, same as `skip_balanced_braces` does for a
+    /// body it never tries to parse in the first place.
+    fn recover_to_next_top_level_boundary(&mut self) {
+        let mut depth = 0i32;
+        loop {
+            match self.peek().map(|t| t.kind) {
+                Some(TokenKind::Punct(Punct::LParen | Punct::LBrace | Punct::LBracket)) => {
+                    depth += 1;
+                    self.advance();
+                }
+                Some(TokenKind::Punct(Punct::RBrace)) if depth > 0 => {
+                    depth -= 1;
+                    self.advance();
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                Some(TokenKind::Punct(Punct::RParen | Punct::RBracket)) if depth > 0 => {
+                    depth -= 1;
+                    self.advance();
+                }
+                Some(TokenKind::Punct(Punct::RParen | Punct::RBrace | Punct::RBracket)) => {
+                    // An unmatched closer at depth 0 belongs to whatever
+                    // scope called us -- stop without consuming it.
+                    return;
+                }
+                Some(TokenKind::Punct(Punct::Semicolon)) if depth == 0 => {
+                    self.advance();
+                    return;
+                }
+                Some(_) => {
+                    self.advance();
+                }
+                None => return,
+            }
+        }
+    }
+
     fn expect_punct(&mut self, p: Punct) -> Result<(), ParseError> {
         if self.eat_punct(p) {
             Ok(())
@@ -493,7 +586,27 @@ impl Parser {
             if self.eat_punct(Punct::Semicolon) {
                 continue;
             }
-            items.push(self.parse_external_decl()?);
+            match self.parse_external_decl() {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    // Rough-scan mode (Step 6a/Step 0): a real system
+                    // header's GNU/C99 syntax our grammar doesn't cover is
+                    // expected, not exceptional -- recover instead of
+                    // discarding every declaration already collected.
+                    // Step 6c's real, final parse (`skip_bodies == false`)
+                    // stays strict; it should never hit this.
+                    if !self.skip_bodies {
+                        return Err(e);
+                    }
+                    let before = self.pos;
+                    self.recover_to_next_top_level_boundary();
+                    if self.pos == before {
+                        // Guarantee forward progress even if recovery
+                        // couldn't consume anything on its own.
+                        self.advance();
+                    }
+                }
+            }
         }
         Ok(TranslationUnit { items })
     }
@@ -723,6 +836,22 @@ impl Parser {
                         quals.push(TypeQualifier::Volatile);
                         self.advance();
                     }
+                    // `restrict` (C99) / `__restrict` / `__restrict__` (GNU,
+                    // usable even in C89 mode) -- real system headers use
+                    // these pervasively (glibc's stdio.h/string.h alone:
+                    // hundreds of occurrences). Not in our `Keyword` enum
+                    // (C89-only lexer), so these lex as plain identifiers;
+                    // recognized here by spelling and discarded, since
+                    // restrict-ness isn't part of `TypeQualifier` and isn't
+                    // needed for anything this pipeline currently does.
+                    Some(TokenKind::Identifier)
+                        if matches!(
+                            self.peek().map(|t| t.text.as_str()),
+                            Some("restrict" | "__restrict" | "__restrict__")
+                        ) =>
+                    {
+                        self.advance();
+                    }
                     _ => break,
                 }
             }
@@ -886,6 +1015,13 @@ impl Parser {
     }
 
     fn parse_external_decl(&mut self) -> Result<ExternalDecl, ParseError> {
+        // Rough-scan only: glibc headers occasionally prefix a declaration
+        // with `__extension__` (GNU: "don't warn this is an extension"),
+        // e.g. stdlib.h's `__extension__ extern long long int atoll (...)`.
+        if self.skip_bodies && matches!(self.peek().map(|t| t.text.as_str()), Some("__extension__"))
+        {
+            self.advance();
+        }
         let specifiers = self.parse_decl_specifiers()?;
         if self.eat_punct(Punct::Semicolon) {
             return Ok(ExternalDecl::Declaration(Declaration {
@@ -894,6 +1030,7 @@ impl Parser {
             }));
         }
         let declarator = self.parse_declarator()?;
+        self.skip_gnu_decorations();
         if self.is_punct(Punct::LBrace) {
             let body = self.parse_compound_stmt()?;
             return Ok(ExternalDecl::FunctionDef(FunctionDef {
@@ -1389,6 +1526,13 @@ mod tests {
         parse_translation_unit(&stream).unwrap_or_else(|e| panic!("parse error: {e}\nin: {code}"))
     }
 
+    fn rough_decls(code: &str) -> Vec<ExternalDecl> {
+        let chunks = partition_source(code);
+        let entries = lex_chunks(&chunks).unwrap();
+        let stream = attach_comments(entries);
+        extract_top_level_decls(&stream)
+    }
+
     fn parse_err(code: &str) -> ParseError {
         let chunks = partition_source(code);
         let entries = lex_chunks(&chunks).unwrap();
@@ -1631,5 +1775,66 @@ done:
             extract_top_level_typedefs(&stream),
             vec!["flag_t".to_string()]
         );
+    }
+
+    fn decl_name(item: &ExternalDecl) -> Option<String> {
+        match item {
+            ExternalDecl::FunctionDef(f) => declarator_name(&f.declarator),
+            ExternalDecl::Declaration(d) => d
+                .declarators
+                .first()
+                .and_then(|id| declarator_name(&id.declarator)),
+        }
+    }
+
+    #[test]
+    fn test_restrict_qualifier_is_ignored_in_strict_mode() {
+        // Real system headers (glibc's stdio.h/string.h) use this
+        // pervasively; must parse (and still just be a plain pointer) in
+        // Step 6c's strict mode too, not just the rough scan.
+        let unit = parse("void f(char *__restrict a, const char *restrict b);\n");
+        assert_eq!(unit.items.len(), 1);
+    }
+
+    #[test]
+    fn test_gnu_trailing_decorations_skipped_in_rough_mode() {
+        // Mirrors glibc string.h's real strcpy/strlen declarations.
+        let code = "extern char *strcpy (char *__restrict d, const char *__restrict s) __THROW __nonnull ((1, 2));\nextern size_t strlen (const char *s) __THROW __attribute_pure__ __nonnull ((1));\n";
+        let items = rough_decls(code);
+        let names: Vec<_> = items.iter().filter_map(decl_name).collect();
+        assert_eq!(names, vec!["strcpy".to_string(), "strlen".to_string()]);
+    }
+
+    #[test]
+    fn test_extension_prefix_skipped_in_rough_mode() {
+        let code = "__extension__ extern long long int atoll (const char *s);\n";
+        let items = rough_decls(code);
+        let names: Vec<_> = items.iter().filter_map(decl_name).collect();
+        assert_eq!(names, vec!["atoll".to_string()]);
+    }
+
+    #[test]
+    fn test_rough_scan_recovers_after_unparseable_top_level_construct() {
+        // A construct our grammar has no model for at all (inline asm)
+        // must not wipe out declarations before *and* after it.
+        let code = "extern int before (void);\n__asm__(\".text\");\nextern int after (void);\n";
+        let items = rough_decls(code);
+        let names: Vec<_> = items.iter().filter_map(decl_name).collect();
+        assert!(
+            names.contains(&"before".to_string()),
+            "expected 'before' to survive recovery, got {names:?}"
+        );
+        assert!(
+            names.contains(&"after".to_string()),
+            "expected 'after' to survive recovery, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_still_fails_on_unparseable_construct() {
+        // Recovery is rough-scan only -- Step 6c's real, final parse must
+        // still surface a genuine error rather than silently skip it.
+        let err = parse_err("__asm__(\".text\");\n");
+        assert!(!err.message.is_empty());
     }
 }
