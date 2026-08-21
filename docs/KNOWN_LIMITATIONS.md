@@ -163,32 +163,38 @@ function-like macros additionally need argument matching/substitution).
 
 ---
 
-## Typechecker Step 1 (symbol resolution) only sees a file's own declarations, not function/variable declarations imported from `#include`d headers
+## Typechecker Step 1 (symbol resolution) still doesn't resolve every cross-header reference (partially fixed by Step 0)
 
-**Where**: `transpiler/src/typecheck/resolve.rs`.
+**Where**: `transpiler/src/typecheck/exports.rs`, `transpiler/src/typecheck/resolve.rs`.
 
-Step 1 builds its `SymbolTable` from a single translation unit's own top-level and
-block-scoped declarations only. Step 6b's `ImportResolver` (`transpiler/src/parser/
-imports.rs`) resolves *typedef names* transitively through `#include`s, and Step 1
-benefits from that indirectly (Step 6c already resolved the typedef-vs-identifier
-ambiguity by the time the AST exists) -- but it never resolves *function or variable*
-declarations from headers, so a call to a libc function or a reference to a global
-declared in another header shows up as an unresolved identifier here even though it's
-perfectly valid C.
+Step 1 originally built its `SymbolTable` from a single translation unit's own
+top-level and block-scoped declarations only -- Step 6b's `ImportResolver`
+(`transpiler/src/parser/imports.rs`) resolved *typedef names* transitively through
+`#include`s, but nothing resolved *function or variable* declarations from headers,
+so a call to a function declared in another header showed up as unresolved even
+though it's perfectly valid C. Only 3 of 62 `.c` files fully resolved.
 
-**Impact today**: real, not cosmetic -- only 3 of 62 `.c` translation units resolve
-with zero unresolved identifiers (see `transpiler/src/typecheck/resolve.rs`'s corpus
-test); the other 59 reference at least one externally-declared function or variable
-(most commonly libc calls like `printf`/`memcpy`, and cross-header globals declared
-`extern` in a project header). Doesn't block Step 1 itself (its own validation
-criterion is "every identifier resolves to a declaration *or* is reported", not "zero
-unresolved" -- matching the "measure actual scope, don't assume" methodology used for
-Step 4b/Step 7), but any step downstream that wants full name resolution can't just
-build on this table as-is yet.
+**Fixed (mostly)**: added Step 0 (`docs/02_TYPECHECKER.md`), generalizing Step 6b's
+`#include`-as-import treatment beyond typedef names -- `ExportResolver`
+(`transpiler/src/typecheck/exports.rs`) recursively collects a file's own top-level
+function prototypes/definitions, `extern`/global variables, struct/union/enum tags,
+and enum constants, unioned with everything transitively `#include`d (respecting
+`static` linkage, unlike typedef export -- see the module's own docs), reusing Step
+6a's rough top-level scan (`grammar::extract_top_level_decls`). `SymbolTable`'s global
+scope is now seeded from this before Step 1 walks the file's own declarations
+(`resolve_translation_unit_seeded`).
 
-**If it starts mattering**: extend `ImportResolver` (or add a sibling resolver
-alongside it, mirroring Step 7's `MacroBodyResolver` split between structural
-collection and per-file interpretation) to also collect top-level function
-prototypes/definitions and `extern`/global variable declarations from `#include`d
-headers, the same way it already collects typedef names -- then seed `SymbolTable`'s
-global scope from that set before walking the file's own declarations.
+**Impact today**: 7 of 62 `.c` translation units now fully resolve (up from 3); total
+unresolved identifier references dropped from 13735 to 4143 (see
+`transpiler/src/typecheck/exports.rs`'s corpus test). The remaining gap is a mix of
+real, separate wrinkles rather than one more missing resolver: implicit-`int`/K&R-style
+calls to functions never actually declared anywhere in the corpus, libc functions
+outside what Step 6b's system-header resolution reaches (a header not installed, or
+one whose declarations Step 6a's rough scanner doesn't recognize as a plain top-level
+declaration), and macro-generated identifiers Step 1 doesn't yet expand before
+resolving. Still doesn't block Step 1 itself, same "measure, don't assume"
+methodology as before.
+
+**If it starts mattering further**: measure the actual remaining-unresolved set the
+same way Step 4b/7 measured their own scope (corpus scan of *which* names are
+unresolved, not just the count) before deciding what the next fix should target.

@@ -15,6 +15,7 @@
 //! statement-level expressions.
 
 use crate::parser::ast::*;
+use crate::typecheck::exports::ExportedDecls;
 use crate::typecheck::scope::{Symbol, SymbolKind, SymbolTable, Tag, TagKind};
 
 /// An identifier reference that didn't resolve to any declaration visible
@@ -30,11 +31,35 @@ pub struct ResolveResult {
     pub unresolved: Vec<UnresolvedIdent>,
 }
 
+/// Resolves `unit` with no cross-header seed -- only useful for snippets
+/// that don't reference anything declared outside themselves. Prefer
+/// `resolve_translation_unit_seeded` with Step 0's exported-declaration set
+/// for real source files.
 pub fn resolve_translation_unit(unit: &TranslationUnit) -> ResolveResult {
+    resolve_translation_unit_seeded(unit, ExportedDecls::default())
+}
+
+/// Resolves `unit`, with its global scope pre-seeded from Step 0's
+/// exported-declaration set (this file's own top-level exports, unioned
+/// with everything transitively `#include`d -- see `typecheck::exports`)
+/// before walking the file's own declarations. A name the file declares
+/// itself simply overwrites its seeded entry (`SymbolTable::declare`'s
+/// existing redeclaration behavior), so the file's own, more complete
+/// declaration always wins.
+pub fn resolve_translation_unit_seeded(
+    unit: &TranslationUnit,
+    seed: ExportedDecls,
+) -> ResolveResult {
     let mut r = Resolver {
         table: SymbolTable::new(),
         unresolved: Vec::new(),
     };
+    for symbol in seed.symbols.into_values() {
+        r.table.declare(symbol);
+    }
+    for tag in seed.tags.into_values() {
+        r.table.declare_tag(tag);
+    }
     for item in &unit.items {
         r.external_decl(item);
     }
