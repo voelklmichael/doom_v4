@@ -3,6 +3,7 @@ pub mod comment_attach;
 pub mod grammar;
 pub mod imports;
 pub mod lexer;
+pub mod macro_body;
 pub mod macro_literal_subst;
 pub mod macro_literals;
 pub mod partitioner;
@@ -13,12 +14,14 @@ pub mod xlib_typedefs;
 
 pub use comment_attach::{Anchor, Commented, CommentedStream, attach_comments};
 pub use grammar::{
-    ParseError, extract_top_level_typedefs, parse_translation_unit, parse_translation_unit_seeded,
+    ParseError, extract_top_level_typedefs, parse_expr_from_tokens, parse_translation_unit,
+    parse_translation_unit_seeded,
 };
 pub use imports::ImportResolver;
 pub use lexer::{
     Keyword, LexEntry, LexError, LexItem, Punct, Token, TokenKind, lex_chunks, lex_code,
 };
+pub use macro_body::{MacroBody, MacroBodyResolver};
 pub use macro_literal_subst::substitute_adjacent_literal_macros;
 pub use macro_literals::LiteralMacroResolver;
 pub use partitioner::{

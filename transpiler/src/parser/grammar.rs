@@ -69,6 +69,38 @@ pub fn extract_top_level_typedefs(stream: &CommentedStream) -> Vec<String> {
     parser.discovered_typedefs
 }
 
+/// Step 7: parses a raw token stream (already lexed, no comments/directives)
+/// as a single expression -- reusing this module's own expression grammar,
+/// seeded with `typedefs` for cast-vs-call disambiguation (e.g. `(fixed_t)(x)`).
+/// Fails if the tokens are empty or don't reduce to exactly one expression
+/// with nothing left over; see `docs/01_PARSER.md` Step 7.
+pub fn parse_expr_from_tokens(
+    tokens: Vec<Token>,
+    typedefs: HashSet<String>,
+) -> Result<Expr, ParseError> {
+    if tokens.is_empty() {
+        return Err(ParseError {
+            message: "empty token stream".to_string(),
+            near: String::new(),
+        });
+    }
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        typedef_check: TypedefCheck::Lookup(typedefs),
+        discovered_typedefs: Vec::new(),
+        skip_bodies: false,
+    };
+    let expr = parser.parse_expr()?;
+    if let Some(tok) = parser.peek() {
+        return Err(ParseError {
+            message: "unexpected trailing tokens after expression".to_string(),
+            near: tok.text.clone(),
+        });
+    }
+    Ok(expr)
+}
+
 /// How the parser decides whether a bare identifier at a declaration-
 /// specifier position is a type name.
 enum TypedefCheck {
