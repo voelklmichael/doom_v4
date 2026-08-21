@@ -46,6 +46,35 @@ fn as_single_literal(body: &str) -> Option<Token> {
     .then_some(first)
 }
 
+/// Compiler-predefined magic constants this corpus references but never
+/// `#define`s itself -- they come from the compiler's own preprocessor, not
+/// user code, so no `#define` directive for them exists anywhere to scan
+/// (see `docs/KNOWN_LIMITATIONS.md`). A static analysis pass with no real
+/// build invocation behind it has no actual file name or line number to
+/// substitute, so these are placeholder literals of the right *kind* (a
+/// string, an integer) -- enough for adjacent-literal substitution and the
+/// expression grammar to treat them as literals, which is all their real
+/// use in this corpus (`z_zone.h`'s `Z_ChangeTag` macro, the only place
+/// either appears) actually needs.
+fn predefined_literal_macros() -> HashMap<String, Token> {
+    HashMap::from([
+        (
+            "__FILE__".to_string(),
+            Token {
+                kind: TokenKind::StringLiteral,
+                text: "\"<unknown-file>\"".to_string(),
+            },
+        ),
+        (
+            "__LINE__".to_string(),
+            Token {
+                kind: TokenKind::IntegerConstant,
+                text: "0".to_string(),
+            },
+        ),
+    ])
+}
+
 /// Resolves and caches each file's transitively-imported literal-macro map,
 /// so a header `#include`d from many places is only scanned once.
 #[derive(Default)]
@@ -60,10 +89,16 @@ impl LiteralMacroResolver {
 
     /// Every literal-bodied object-like macro visible to `path`: its own
     /// top-level `#define`s of this shape, unioned with everything
-    /// transitively imported via local and system `#include`s.
+    /// transitively imported via local and system `#include`s, plus the
+    /// compiler-predefined magic constants above (a real `#define` of the
+    /// same name, however unlikely, still wins).
     pub fn resolve(&mut self, path: &Path) -> HashMap<String, Token> {
         let mut visiting = HashSet::new();
-        self.resolve_inner(path, &mut visiting)
+        let mut result = self.resolve_inner(path, &mut visiting);
+        for (name, tok) in predefined_literal_macros() {
+            result.entry(name).or_insert(tok);
+        }
+        result
     }
 
     fn resolve_inner(
@@ -156,5 +191,22 @@ mod tests {
         let mut resolver = LiteralMacroResolver::new();
         let macros = resolver.resolve(&corpus_dir().join("m_fixed.c"));
         assert!(!macros.contains_key("FRACUNIT"));
+    }
+
+    #[test]
+    fn test_resolve_includes_predefined_file_and_line() {
+        // __FILE__/__LINE__ are compiler-predefined, never #define'd in the
+        // corpus itself -- must still resolve via the hardcoded fallback,
+        // regardless of which file is asked.
+        let mut resolver = LiteralMacroResolver::new();
+        let macros = resolver.resolve(&corpus_dir().join("z_zone.c"));
+        assert_eq!(
+            macros.get("__FILE__").map(|t| t.kind),
+            Some(TokenKind::StringLiteral)
+        );
+        assert_eq!(
+            macros.get("__LINE__").map(|t| t.kind),
+            Some(TokenKind::IntegerConstant)
+        );
     }
 }

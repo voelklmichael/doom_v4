@@ -426,6 +426,25 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_z_changetag_with_predefined_file_and_line() {
+        // z_zone.h's Z_ChangeTag(p,t) is a braced-block macro whose body
+        // includes "Z_CT at "__FILE__":%i" -- a string literal directly
+        // followed by __FILE__ directly followed by another string
+        // literal. Without treating __FILE__/__LINE__ as predefined
+        // literals, this is unparseable (a bare, unresolvable identifier
+        // wedged between two literals with no operator).
+        let mut resolver = MacroBodyResolver::new();
+        let macros = resolver.resolve(&corpus_dir().join("z_zone.c"));
+        let body = macros
+            .get("Z_ChangeTag")
+            .expect("expected Z_ChangeTag to resolve via imports");
+        assert!(
+            matches!(body, MacroBody::Statements { .. }),
+            "expected Z_ChangeTag to parse as a statement sequence, got {body:?}"
+        );
+    }
+
+    #[test]
     fn test_resolve_across_full_corpus_reports_coverage() {
         // Not a pass/fail assertion (matching Step 4b's "measure actual
         // scope before deciding it needs more" methodology) -- just proves
