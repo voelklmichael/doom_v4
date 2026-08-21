@@ -160,3 +160,35 @@ now parse (see `transpiler/src/parser/mod.rs`'s corpus test).
 actual expressions, not just adjacent to literals): implement full expansion as a pass
 between Steps 3 and 4 (object-like macros are a straightforward token-substitution;
 function-like macros additionally need argument matching/substitution).
+
+---
+
+## Typechecker Step 1 (symbol resolution) only sees a file's own declarations, not function/variable declarations imported from `#include`d headers
+
+**Where**: `transpiler/src/typecheck/resolve.rs`.
+
+Step 1 builds its `SymbolTable` from a single translation unit's own top-level and
+block-scoped declarations only. Step 6b's `ImportResolver` (`transpiler/src/parser/
+imports.rs`) resolves *typedef names* transitively through `#include`s, and Step 1
+benefits from that indirectly (Step 6c already resolved the typedef-vs-identifier
+ambiguity by the time the AST exists) -- but it never resolves *function or variable*
+declarations from headers, so a call to a libc function or a reference to a global
+declared in another header shows up as an unresolved identifier here even though it's
+perfectly valid C.
+
+**Impact today**: real, not cosmetic -- only 3 of 62 `.c` translation units resolve
+with zero unresolved identifiers (see `transpiler/src/typecheck/resolve.rs`'s corpus
+test); the other 59 reference at least one externally-declared function or variable
+(most commonly libc calls like `printf`/`memcpy`, and cross-header globals declared
+`extern` in a project header). Doesn't block Step 1 itself (its own validation
+criterion is "every identifier resolves to a declaration *or* is reported", not "zero
+unresolved" -- matching the "measure actual scope, don't assume" methodology used for
+Step 4b/Step 7), but any step downstream that wants full name resolution can't just
+build on this table as-is yet.
+
+**If it starts mattering**: extend `ImportResolver` (or add a sibling resolver
+alongside it, mirroring Step 7's `MacroBodyResolver` split between structural
+collection and per-file interpretation) to also collect top-level function
+prototypes/definitions and `extern`/global variable declarations from `#include`d
+headers, the same way it already collects typedef names -- then seed `SymbolTable`'s
+global scope from that set before walking the file's own declarations.
