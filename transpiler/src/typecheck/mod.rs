@@ -1,15 +1,19 @@
 //! Phase 2: Semantic Analysis & Typechecking (docs/02_TYPECHECKER.md)
 
+pub mod check;
+pub mod declared_types;
 pub mod exports;
 pub mod macro_types;
 pub mod resolve;
 pub mod scope;
 pub mod types;
 
+pub use check::{DiagnosticKind, TypeCheckResult, TypeDiagnostic, check_translation_unit};
+pub use declared_types::{DeclaredTypes, DeclaredTypesResolver};
 pub use exports::{ExportResolver, ExportedDecls};
 pub use macro_types::{MacroTyper, MacroUse, collect_macro_uses, substitute};
 pub use resolve::{
     ResolveResult, UnresolvedIdent, resolve_translation_unit, resolve_translation_unit_seeded,
 };
 pub use scope::{Symbol, SymbolKind, SymbolTable, Tag, TagKind};
-pub use types::Type;
+pub use types::{FunctionSignature, Type};
