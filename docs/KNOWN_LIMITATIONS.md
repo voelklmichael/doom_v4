@@ -358,6 +358,60 @@ argument" list, so deliberately out of scope, not an oversight.
 
 ---
 
+## Typechecker Step 4 (pointer-to-array parameter inference): 27% of pointer parameters got direct evidence; most of the rest trace to Doom's function-pointer call idiom, not a modeling gap
+
+**Where**: `transpiler/src/typecheck/array_shape.rs`.
+
+Step 4 infers, per pointer-typed function parameter, whether the source treats it as
+"pointer to one object" or "pointer to the first element of an array" -- from two
+independent evidence sources (`collect_body_evidence`: does the function's own body
+index the parameter or do pointer arithmetic on it; `collect_call_evidence`: across
+*every* file in the corpus, what shape is the actual argument at each call site -- an
+array name, `&array[i]`, a string literal, or `&x`), plus a bounded fixpoint
+(`analyze`) that follows *forwarding* chains: when a call site's argument is itself the
+calling function's own parameter (`void A(int *p) { B(p); }`), `A`'s parameter has no
+direct evidence, but once `B`'s corresponding parameter's shape is known it becomes
+real evidence for `A`'s too, arbitrarily deep. Conflicting evidence (array from one
+source, single-object from another) is reported as `Ambiguous`, not silently resolved.
+
+**Measured**: across the 62-file corpus, 419 pointer-typed parameters (of
+corpus-defined functions only -- a libc function's parameters aren't this project's to
+classify) were analyzed: 48 array-shaped, 51 single-object, 14 ambiguous, and 306 (73%)
+with no evidence found at all.
+
+**The 73% isn't one gap, it's mostly a known, documented scope boundary**: broken down
+by cause (`examples/array_shape_gap_breakdown.rs`), 127 of the 306 belong to a function
+that is *never the callee of a direct `Ident(name)(args)` call site anywhere in the
+corpus* -- consistent with `docs/02_TYPECHECKER.md`'s own "Doom Idioms" section calling
+out state action pointers as a dominant pattern: many corpus functions (action
+functions matching `void A_Explode(mobj_t *thing)` and friends) are invoked exclusively
+through function-pointer tables (`state_t.action`), never by name. `collect_call_evidence`
+only recognizes a direct, syntactically-named call, matching Step 4's own stated scope
+(call-site *argument shape* and parameter *forwarding*, not general points-to/call-graph
+analysis for indirect calls) -- Step 5/6's own docs already flag "the target of a call
+is itself unknown statically" as a real wrinkle their forwarding logic has to fall back
+conservatively on, not something Step 4 was ever meant to solve. The remaining 179 are
+functions that *are* called directly, but a specific parameter still got no evidence --
+overwhelmingly a single, plain `*p` dereference (which the spec itself says implies
+nothing either way) with no other call sites, or call sites that only ever pass an
+already-pointer-typed local variable (general local-variable data-flow, not parameter
+forwarding, is explicitly out of Step 4's stated scope too).
+
+**Impact today**: none of Step 4's own validation criteria require finding evidence
+everywhere -- "gets one of {array-shaped, single-object, ambiguous}, backed by
+evidence" is satisfied for the 27% with real evidence; "no evidence" is itself a
+measured, honestly-reported outcome for the rest, not a silently-dropped case.
+
+**If it starts mattering further**: closing the 127 (indirect-call) side needs a
+points-to-style resolution of function-pointer tables (`state_t.action` and friends) to
+the concrete functions they can hold -- a substantially bigger undertaking than this
+step's stated scope, likely its own future step once Phase 3 codegen needs it. The 179
+(direct-call, still-no-evidence) side would mostly need general local-variable
+data-flow (does `p`'s own *value* ever come from something array-shaped upstream),
+also out of Step 4's stated scope as written.
+
+---
+
 ## Step 3's `#if` expression evaluator can't handle function-macro invocations, so some real system headers never resolve at all
 
 **Where**: `transpiler/src/parser/preprocessor.rs` (`evaluate_expr`).
