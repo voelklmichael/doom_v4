@@ -555,3 +555,55 @@ to drive it, or a narrower purpose-built substitution just for `#if` context), a
 evaluate the substituted expression -- plus seeding `PreprocessorEnv::linux_doom_defaults`
 with compiler-identity macros (`__GNUC__`, `__GNUC_MINOR__`, ...) that
 `__GNUC_PREREQ` and similar version-guard macros depend on.
+
+---
+
+## Phase 3's `.c`/`.h` module-merge heuristic: "declared in the matching header ⇒ `pub`" is wrong more often than it's right
+
+**Where**: `docs/03_TRANSPILER.md`'s Target 1 module-structure section flagged this as
+an open, undesigned question before committing to the merge rule. Investigated with
+`transpiler/examples/extern_linkage_survey.rs`, reusing Step 0's `ExportResolver`
+(which already follows the real `#include` graph) rather than building new
+infrastructure.
+
+**Method**: for every non-`static` (externally-linked) function/variable actually
+*defined* at a `.c` file's own top level (a function with a body, or a variable
+declaration that isn't itself an `extern` re-declaration), check whether its name
+appears in its own matching header (`foo.c` <-> `foo.h`, scanned directly, not
+transitively -- the same rough top-level-only scan `ExportResolver` itself uses, since
+a real grammar parse of a header in isolation routinely fails: headers like `am_map.h`
+reference typedefs like `boolean` they never `#include` themselves, relying on
+whatever `.c` file includes them to have pulled those in first). If not declared
+there, check whether any *other* `.c` file's own `ExportResolver`-resolved symbol set
+(i.e. what it can actually see today, via whichever header really declares the name)
+contains it anyway -- a "yes" there is a real, working cross-module reference the
+naive heuristic would silently break by making the symbol private.
+
+**Measured**: 1360 externally-linked definitions across the 62-file corpus. Only 344
+(25%) are both declared in their own matching header *and* that's genuinely how other
+files see them. 215 (16%) are declared in some *other* header instead -- most visibly
+`doomstat.h`, which centralizes `extern` declarations for globals defined across many
+unrelated `.c` files (`devparm`, `gamestate`, `automapactive`, ...) rather than each
+`.c` owning its own header for them -- spanning 25 of the 62 `.c` files (40% of the
+corpus), not a handful of outliers. A further 215 (16%) are defined in one of the 13
+`.c` files with no matching header at all (`p_map.c`, `p_enemy.c`, `p_maputl.c`, ...);
+134 of those 215 are still genuinely used elsewhere, overwhelmingly via the shared
+`p_local.h` these files were always meant to be declared through instead of an
+individual header. The remaining 586 (43%) are externally linked but never actually
+referenced outside their own defining file -- real per C's rules, but harmless for the
+heuristic, since "private" happens to be the right call for those anyway.
+
+**Conclusion**: "declared in the matching header ⇒ `pub`" alone is right for barely a
+quarter of the corpus's real definitions, and silently wrong (would make a
+still-needed symbol private) for at least 16% of them outright (the `doomstat.h`-style
+cases; the no-matching-header cases need a module-structure answer regardless of this
+heuristic). The merge rule needs to resolve a symbol's visibility from *every* header
+that declares it -- not just the one with the matching name -- unioning across
+whatever `#include`s a `.c` file actually has, the same graph `ExportResolver` already
+walks. The 13 no-matching-header `.c` files need their own answer: their externally-
+linked symbols should attach to whichever shared header (if any) actually declares
+them (`p_local.h` for most of the `p_*.c` cases measured here), not silently drop `pub`
+entirely for lack of an individually-named header.
+
+**Impact today**: none yet -- Phase 3 codegen hasn't started. This is the input the
+open issue asked for; the module-merge implementation itself is still unwritten.
