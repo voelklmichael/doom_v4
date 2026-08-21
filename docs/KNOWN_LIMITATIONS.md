@@ -220,6 +220,64 @@ don't assume" methodology as before.
 measured breakdown, that would close far more of the remaining gap than any further
 work on declaration parsing would.
 
+**Update**: Step 2 is now implemented -- see the next entry. It doesn't feed back into
+`SymbolTable`/`resolve_translation_unit_seeded` itself (macro names still aren't
+declarations, so they still show up as `UnresolvedIdent`s here) -- it's a parallel
+semantic layer, not a fix to this step. See `docs/02_TYPECHECKER.md` Step 2.
+
+---
+
+## Typechecker Step 2 (macro typing): ~91% of real-code macro references get a type; the rest wait on Step 3's declaration/struct types
+
+**Where**: `transpiler/src/typecheck/types.rs`, `transpiler/src/typecheck/macro_types.rs`.
+
+Step 2 introduces a `Type` representation (Goal 2 of `docs/02_TYPECHECKER.md`, deferred
+until Step 2 actually needed one) and types every `#define`: an object-like macro's
+`Expr` directly (memoized, cycle-guarded against a macro that references itself,
+directly or through others); a function-like macro's body once per real call site, by
+structurally substituting the actual argument expressions for its parameters and
+typing the substituted tree (`MacroTyper::type_of_macro_call`/`substitute`) -- it has
+no single fixed signature, so it isn't typed once in isolation. `collect_macro_uses`
+finds every real-code reference to a known macro by walking the same
+expression-bearing AST shapes Step 1's `Resolver` does (function bodies, initializers,
+array-size/bit-field-width/enum-value expressions), without any scope bookkeeping --
+unlike an ordinary identifier, a macro name is authoritative wherever it textually
+appears, matching real preprocessor semantics.
+
+**Measured**: across the 62-file corpus, 3587 real-code macro references were found;
+3258 (91%) resolved to a concrete type, 329 (9%) came back `Type::Unknown` (logged,
+not a hard error, matching this project's "measure, don't assume" policy). Breakdown
+of the 329: 177 function-like-macro call sites where the substituted body's type
+depended on an argument this step can't type (see below); 102 object-like macros whose
+body itself contains such a dependency; 44 references to a macro whose body is a
+statement sequence, not an expression (`MacroBody::Statements`, e.g. `m_swap.h`'s
+`Z_ChangeTag`, 40 of the 44 alone); 6 references to an `Unparseable` body. No bare
+(uncalled) function-like-macro references were found in the corpus.
+
+**Root cause of the 329, confirmed by name (`SHORT`/`LONG` from `m_swap.h`, `FTOM`/
+`MTOF`/`CXMTOF`/`CYMTOF` from `am_map.c`, and others dominate)**: these macros'
+arguments are overwhelmingly struct-member accesses (`mobj->x`, `ld->dx`, ...) or plain
+variable references -- and Step 2 deliberately doesn't model struct field layouts
+(`Expr::Member` always types `Unknown`, since Step 0 only ever collected coarse tag
+*kinds*, not member lists -- see `exports.rs`) or a plain variable/parameter's
+declared type (that needs full declaration type-checking, Step 3 -- Step 2 only knows
+enum-constant identifiers, via the seeded `SymbolTable`). `Type::Unknown` propagates
+through every operator (a cast is the one exception: its result is the cast's own
+target type regardless of its operand), so one `Unknown` argument taints everything
+built from it -- confirmed concretely: `m_swap.h`'s active (little-endian) `SHORT(x)`
+is just `(x)`, so `SHORT(mobj->x)`'s `Unknown` result is entirely inherited from the
+untyped `Member` access, not a bug in the substitution/typing logic itself.
+
+**Impact today**: none of Step 2's own validation criteria require 100% -- explicitly
+scoped as "resolves to a type, or is explicitly logged for follow-up." The 9% gap is
+real but expected, and traces to a single root cause (no struct-member/variable
+declaration types yet) rather than many unrelated ones.
+
+**If it starts mattering further**: implement Step 3 (type checking) -- once ordinary
+declarations and struct members have real `Type`s, `Expr::Member` and plain
+`Expr::Ident` variable/parameter lookups can return them instead of `Unknown`, closing
+most of this gap without any further change to Step 2's own logic.
+
 ---
 
 ## Step 3's `#if` expression evaluator can't handle function-macro invocations, so some real system headers never resolve at all
