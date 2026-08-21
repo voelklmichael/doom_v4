@@ -163,32 +163,94 @@ function-like macros additionally need argument matching/substitution).
 
 ---
 
-## Typechecker Step 1 (symbol resolution) only sees a file's own declarations, not function/variable declarations imported from `#include`d headers
+## Typechecker Step 1 (symbol resolution) still doesn't resolve every cross-header reference (partially fixed by Step 0)
 
-**Where**: `transpiler/src/typecheck/resolve.rs`.
+**Where**: `transpiler/src/typecheck/exports.rs`, `transpiler/src/typecheck/resolve.rs`.
 
-Step 1 builds its `SymbolTable` from a single translation unit's own top-level and
-block-scoped declarations only. Step 6b's `ImportResolver` (`transpiler/src/parser/
-imports.rs`) resolves *typedef names* transitively through `#include`s, and Step 1
-benefits from that indirectly (Step 6c already resolved the typedef-vs-identifier
-ambiguity by the time the AST exists) -- but it never resolves *function or variable*
-declarations from headers, so a call to a libc function or a reference to a global
-declared in another header shows up as an unresolved identifier here even though it's
-perfectly valid C.
+Step 1 originally built its `SymbolTable` from a single translation unit's own
+top-level and block-scoped declarations only -- Step 6b's `ImportResolver`
+(`transpiler/src/parser/imports.rs`) resolved *typedef names* transitively through
+`#include`s, but nothing resolved *function or variable* declarations from headers,
+so a call to a function declared in another header showed up as unresolved even
+though it's perfectly valid C. Only 3 of 62 `.c` files fully resolved.
 
-**Impact today**: real, not cosmetic -- only 3 of 62 `.c` translation units resolve
-with zero unresolved identifiers (see `transpiler/src/typecheck/resolve.rs`'s corpus
-test); the other 59 reference at least one externally-declared function or variable
-(most commonly libc calls like `printf`/`memcpy`, and cross-header globals declared
-`extern` in a project header). Doesn't block Step 1 itself (its own validation
-criterion is "every identifier resolves to a declaration *or* is reported", not "zero
-unresolved" -- matching the "measure actual scope, don't assume" methodology used for
-Step 4b/Step 7), but any step downstream that wants full name resolution can't just
-build on this table as-is yet.
+**Fixed (mostly)**: added Step 0 (`docs/02_TYPECHECKER.md`), generalizing Step 6b's
+`#include`-as-import treatment beyond typedef names -- `ExportResolver`
+(`transpiler/src/typecheck/exports.rs`) recursively collects a file's own top-level
+function prototypes/definitions, `extern`/global variables, struct/union/enum tags,
+and enum constants, unioned with everything transitively `#include`d (respecting
+`static` linkage, unlike typedef export -- see the module's own docs), reusing Step
+6a's rough top-level scan (`grammar::extract_top_level_decls`). `SymbolTable`'s global
+scope is now seeded from this before Step 1 walks the file's own declarations
+(`resolve_translation_unit_seeded`).
 
-**If it starts mattering**: extend `ImportResolver` (or add a sibling resolver
-alongside it, mirroring Step 7's `MacroBodyResolver` split between structural
-collection and per-file interpretation) to also collect top-level function
-prototypes/definitions and `extern`/global variable declarations from `#include`d
-headers, the same way it already collects typedef names -- then seed `SymbolTable`'s
-global scope from that set before walking the file's own declarations.
+**Measured, not guessed**: a corpus-wide breakdown of the 4143 remaining unresolved
+names (not just the count) showed the "libc functions Step 6a's rough scanner doesn't
+recognize" guess above was only part of the picture -- the *dominant* contributor was
+actually macro references (`NULL`, `FRACUNIT`, `SCREENWIDTH`, `PU_CACHE`, ...), which
+were never in scope for Step 1 at all (macro name resolution is Step 2's job, not
+declared-symbol resolution -- see `docs/02_TYPECHECKER.md` Step 2, not yet
+implemented). The libc-function gap was real too, though: `printf`, `memcpy`, `strcpy`,
+etc. showed up unresolved because real glibc header declarations use GNU/C99 syntax
+our C89-only grammar had no model for (`__restrict`, trailing `__THROW`/`__nonnull
+((1))`/`__attribute__((...))` decorations, a leading `__extension__` prefix) --
+Step 6a's rough scan (`skip_bodies` mode) failed to parse the declaration containing
+them, and on error discarded *every* declaration already collected from that file
+(one bad declaration losing a whole header's worth of good ones).
+
+**Fixed further**: `grammar.rs`'s rough-scan mode now (a) recognizes and discards
+`restrict`/`__restrict`/`__restrict__` as a pointer qualifier
+(`parse_pointer_quals`), (b) skips a leading `__extension__` prefix and any run of
+trailing decoration identifiers (each with an optional parenthesized argument list)
+between a declarator and its terminating `;`/`{` (`skip_gnu_decorations`), and (c)
+recovers from a top-level construct it still can't parse at all (e.g. inline `__asm__`)
+by skipping to the next top-level boundary instead of discarding the whole file's scan
+(`recover_to_next_top_level_boundary`) -- all three gated behind `skip_bodies` so Step
+6c's strict, already-100%-passing corpus parse is untouched.
+
+**Impact today**: 7 of 62 `.c` translation units fully resolve (up from 3 before Step
+0); total unresolved identifier references 13735 -> 4143 (Step 0) -> 3771 (this fix)
+(see `transpiler/src/typecheck/exports.rs`'s corpus test). `printf`/`sprintf`/
+`fprintf`/`memcpy`/`memset`/`malloc`/`abs`/`toupper`/`atoi`/`access` and similar now
+resolve. `string.h` itself still doesn't contribute anything -- see the next entry,
+a different root cause entirely. Still doesn't block Step 1 itself, same "measure,
+don't assume" methodology as before.
+
+**If it starts mattering further**: implement Step 2 (macro typing) -- given the
+measured breakdown, that would close far more of the remaining gap than any further
+work on declaration parsing would.
+
+---
+
+## Step 3's `#if` expression evaluator can't handle function-macro invocations, so some real system headers never resolve at all
+
+**Where**: `transpiler/src/parser/preprocessor.rs` (`evaluate_expr`).
+
+Found while investigating why `string.h`'s declarations (`strcpy`, `strlen`, `strcmp`,
+...) still didn't resolve even after fixing Step 6a's rough-scan GNU-syntax handling
+(previous entry): `ExportResolver::resolve_inner` calls
+`system_headers::read_resolved_chunks_and_includes`, which runs Steps 1-3 on the
+header -- and for `/usr/include/string.h` directly, Step 3 fails outright (returns
+`None`, silently, same fail-soft policy as a header not being found at all). The real
+cause: `string.h` contains `#if __GNUC_PREREQ (3,4)` -- `__GNUC_PREREQ(maj, min)` is
+itself a `#define`d function-like macro (from `<features.h>`,
+`((__GNUC__ << 16) + __GNUC_MINOR__ >= ((maj) << 16) + (min))`), and Step 3 never
+expands macros used *within* a `#if`/`#elif` expression (only `defined()` is special-
+cased) -- `evaluate_expr` sees a bare identifier followed by a parenthesized,
+comma-separated argument list where its grammar only expects a value, and errors.
+
+**Impact today**: any header (or transitively-included header) containing a
+function-like macro invocation in a `#if`/`#elif` condition fails Step 3 entirely,
+contributing nothing to `ImportResolver`/`ExportResolver`/`LiteralMacroResolver`'s
+results -- not just the declarations near the failing `#if`, the *whole file*. Real,
+not hypothetical: this is why `string.h` contributes zero symbols to Step 0's export
+set right now, despite being found and despite its declarations otherwise being
+parseable after the previous entry's fix.
+
+**If it starts mattering**: `evaluate_expr` would need to recognize a call-shaped
+identifier in a `#if` expression, look it up as a function-like macro (reusing Step
+7's `MacroBody::Function` parsing/argument-substitution machinery once Step 2 exists
+to drive it, or a narrower purpose-built substitution just for `#if` context), and
+evaluate the substituted expression -- plus seeding `PreprocessorEnv::linux_doom_defaults`
+with compiler-identity macros (`__GNUC__`, `__GNUC_MINOR__`, ...) that
+`__GNUC_PREREQ` and similar version-guard macros depend on.
