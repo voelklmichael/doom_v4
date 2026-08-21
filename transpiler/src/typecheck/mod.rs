@@ -6,6 +6,7 @@ pub mod declared_types;
 pub mod exports;
 pub mod macro_types;
 pub mod mutability;
+pub mod nullability;
 pub mod resolve;
 pub mod scope;
 pub mod types;
@@ -24,6 +25,7 @@ pub use resolve::{
 pub use scope::{Symbol, SymbolKind, SymbolTable, Tag, TagKind};
 pub use types::{FunctionSignature, Type};
 
-// `mutability`'s own Evidence/analyze/collect_*_evidence intentionally
-// aren't re-exported flat here -- they'd collide with `array_shape`'s
-// same-named counterparts above. Reach them via `typecheck::mutability::`.
+// `mutability`'s and `nullability`'s own Evidence/analyze/
+// collect_*_evidence intentionally aren't re-exported flat here -- they'd
+// collide with `array_shape`'s same-named counterparts above. Reach them
+// via `typecheck::mutability::`/`typecheck::nullability::`.

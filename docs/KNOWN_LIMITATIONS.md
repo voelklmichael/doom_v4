@@ -462,6 +462,67 @@ either, for the same reason Step 4 didn't track it.
 
 ---
 
+## Typechecker Step 6 (pointer nullability analysis): a real forwarding-direction bug, and a genuine corpus finding that Doom rarely null-checks parameters by name
+
+**Where**: `transpiler/src/typecheck/nullability.rs`.
+
+Step 6 infers, per pointer-typed parameter, whether it can actually be null --
+`&T` vs. `Option<&T>` in Rust terms -- from two sources kept *separate* through to the
+final result (per the spec's own "classification... from each evidence source
+independently, plus a combined verdict"): call-site evidence (`collect_call_evidence`:
+a literal `0`/`NULL`, an uninitialized local, `&x`/an array/a string literal, or the
+calling function's own parameter passed unchanged) and body evidence
+(`collect_body_evidence`: a null-check on the parameter anywhere in the body vs. a
+dereference/index/member access not protected by one -- "protected" covering one
+specific, dominant idiom: a guard clause that diverges, or a positive check's
+`then`-branch). Disagreement between the two sources is reported as `Verdict::Conflict`
+rather than resolved silently, matching the spec's own explicit example.
+
+**A real bug, not just a documented gap**: the forwarding fixpoint was copy-adapted
+from Step 4/5's `analyze`, which propagates a *callee's* resolved behavior back to the
+*caller* (correct there: whatever the callee does with the pointer, the caller's copy
+must support it). Nullability's forwarding evidence works the opposite way -- "another
+parameter/variable **already classified as nullable**" passed to a callee is evidence
+about the *callee's* parameter, so the direction has to be caller-resolved →
+callee-informed, not callee-resolved → caller-informed. The first version kept Step
+4/5's direction unchanged; a unit test asserting the correct (spec-matching) direction
+failed immediately, before any corpus number was trusted, and the fix was a one-line
+swap of which side of the edge gets checked vs. updated in `analyze`'s loop (now
+commented explaining why the direction differs from its siblings).
+
+**A second real fix, corpus-motivated**: `diverges` (what makes a guard clause "count")
+only recognized `return`/`goto`/`break`/`continue`. `linuxdoom-1.10` uses `I_Error(...)`
+(print-and-exit) as its fatal-error idiom just as often as an early return -- 84
+`if (...) ... I_Error(...)` sites in the corpus, dwarfing the handful of bare-identifier
+`NULL` checks the codebase otherwise uses. Added as a recognized diverging shape.
+
+**Measured**: across the 62-file corpus, 419 pointer parameters were classified.
+Combined: 328 non-nullable, 81 no-evidence, 6 conflict, 4 nullable. Call-site: 88
+non-nullable, 6 nullable, 3 conflict, 322 no-evidence. Body: 297 non-nullable, 2
+nullable, 1 conflict, 119 no-evidence.
+
+**The low "nullable" counts are a genuine corpus finding, verified independently, not
+a detection gap**: grepping the corpus directly (not through this analysis) for the
+patterns Step 6 looks for turns up almost nothing to find -- zero bare-identifier
+checks matching `if (!name)`/`if (name)` outside a `->`/`.` member access anywhere in
+the 62 files, and only 6 total `== NULL`/`!= NULL` comparisons corpus-wide, none of
+them against a bare pointer parameter (they're array elements, struct fields, or a
+dereferenced pointer). `linuxdoom-1.10`'s actual style almost never defensively
+null-checks a pointer *parameter* directly by name -- it either trusts callers
+entirely or checks a *field reached through* the pointer (`if (!mobj->target)`), which
+is explicitly out of this step's scope (Step 6 is about the parameter itself, not
+values reached through it). The `I_Error` fix (previous paragraph) confirmed this
+rather than changing it: applying it barely moved the numbers, because the guard
+clauses it was meant to make visible mostly aren't guarding bare parameter identifiers
+in the first place.
+
+**Impact today**: none of Step 6's own validation criteria require finding evidence
+everywhere -- every parameter gets a classification from each source independently (a
+`NoEvidence` verdict is a classification, not a gap), plus a combined verdict, exactly
+as specified.
+
+---
+
 ## Step 3's `#if` expression evaluator can't handle function-macro invocations, so some real system headers never resolve at all
 
 **Where**: `transpiler/src/parser/preprocessor.rs` (`evaluate_expr`).
