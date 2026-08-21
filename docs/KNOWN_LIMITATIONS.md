@@ -358,6 +358,110 @@ argument" list, so deliberately out of scope, not an oversight.
 
 ---
 
+## Typechecker Step 4 (pointer-to-array parameter inference): 27% of pointer parameters got direct evidence; most of the rest trace to Doom's function-pointer call idiom, not a modeling gap
+
+**Where**: `transpiler/src/typecheck/array_shape.rs`.
+
+Step 4 infers, per pointer-typed function parameter, whether the source treats it as
+"pointer to one object" or "pointer to the first element of an array" -- from two
+independent evidence sources (`collect_body_evidence`: does the function's own body
+index the parameter or do pointer arithmetic on it; `collect_call_evidence`: across
+*every* file in the corpus, what shape is the actual argument at each call site -- an
+array name, `&array[i]`, a string literal, or `&x`), plus a bounded fixpoint
+(`analyze`) that follows *forwarding* chains: when a call site's argument is itself the
+calling function's own parameter (`void A(int *p) { B(p); }`), `A`'s parameter has no
+direct evidence, but once `B`'s corresponding parameter's shape is known it becomes
+real evidence for `A`'s too, arbitrarily deep. Conflicting evidence (array from one
+source, single-object from another) is reported as `Ambiguous`, not silently resolved.
+
+**Measured**: across the 62-file corpus, 419 pointer-typed parameters (of
+corpus-defined functions only -- a libc function's parameters aren't this project's to
+classify) were analyzed: 48 array-shaped, 51 single-object, 14 ambiguous, and 306 (73%)
+with no evidence found at all.
+
+**The 73% isn't one gap, it's mostly a known, documented scope boundary**: broken down
+by cause (`examples/array_shape_gap_breakdown.rs`), 127 of the 306 belong to a function
+that is *never the callee of a direct `Ident(name)(args)` call site anywhere in the
+corpus* -- consistent with `docs/02_TYPECHECKER.md`'s own "Doom Idioms" section calling
+out state action pointers as a dominant pattern: many corpus functions (action
+functions matching `void A_Explode(mobj_t *thing)` and friends) are invoked exclusively
+through function-pointer tables (`state_t.action`), never by name. `collect_call_evidence`
+only recognizes a direct, syntactically-named call, matching Step 4's own stated scope
+(call-site *argument shape* and parameter *forwarding*, not general points-to/call-graph
+analysis for indirect calls) -- Step 5/6's own docs already flag "the target of a call
+is itself unknown statically" as a real wrinkle their forwarding logic has to fall back
+conservatively on, not something Step 4 was ever meant to solve. The remaining 179 are
+functions that *are* called directly, but a specific parameter still got no evidence --
+overwhelmingly a single, plain `*p` dereference (which the spec itself says implies
+nothing either way) with no other call sites, or call sites that only ever pass an
+already-pointer-typed local variable (general local-variable data-flow, not parameter
+forwarding, is explicitly out of Step 4's stated scope too).
+
+**Impact today**: none of Step 4's own validation criteria require finding evidence
+everywhere -- "gets one of {array-shaped, single-object, ambiguous}, backed by
+evidence" is satisfied for the 27% with real evidence; "no evidence" is itself a
+measured, honestly-reported outcome for the rest, not a silently-dropped case.
+
+**If it starts mattering further**: closing the 127 (indirect-call) side needs a
+points-to-style resolution of function-pointer tables (`state_t.action` and friends) to
+the concrete functions they can hold -- a substantially bigger undertaking than this
+step's stated scope, likely its own future step once Phase 3 codegen needs it. The 179
+(direct-call, still-no-evidence) side would mostly need general local-variable
+data-flow (does `p`'s own *value* ever come from something array-shaped upstream),
+also out of Step 4's stated scope as written.
+
+---
+
+## Typechecker Step 5 (pointer mutability analysis): 215/419 pointer parameters classified mutable, only 15% of those from the conservative fallback rather than real evidence
+
+**Where**: `transpiler/src/typecheck/mutability.rs`.
+
+Step 5 infers, per pointer-typed parameter of a corpus-defined function, whether it's
+ever mutated *through* -- `&T` vs. `&mut T` in Rust terms. Two evidence sources, both
+keyed the same `(function, parameter index)` way Step 4's are: `collect_body_evidence`
+finds a direct write (an assignment or `++`/`--` whose lvalue is reached from the
+parameter by dereference/index/member access -- reassigning the pointer variable
+itself doesn't count); `collect_call_evidence` finds a call argument reached from the
+parameter the same way (`f(p)`, `f(&p->field)`, `f(pp->next)`) and either records a
+forwarding edge (resolved by the same bounded fixpoint as Step 4's `analyze`, if the
+callee is a known corpus function) or, per the spec's own "fall back to the
+conservative answer (mutable) rather than under-report" policy, immediate `Mutable`
+evidence when the callee's behavior can't be verified (an indirect call through a
+function pointer, or a call to something outside the corpus). Unlike Step 4, there's
+no `Ambiguous`/"no evidence" outcome -- absence of evidence means `Immutable`, matching
+"a pointer only ever read through is classified immutable."
+
+**A real bug caught before trusting the first number**: the initial `type_along_chain`
+check only tested whether a call argument's chain was *well-typed* (`Some(_)`), not
+whether the resulting type was actually a pointer -- so `g(*p)` (dereferencing an
+`int *p`, passing the `int` *value*, not a pointer) was being treated as forwarding-
+relevant and inflating the mutable count. Caught by a unit test written specifically
+for this case (`test_dereferencing_a_value_argument_is_not_forwarding`) before the
+corpus run was ever trusted; fixed by checking `matches!(normalize(result),
+Type::Pointer(_))` instead of `is_none()`.
+
+**Measured**: across the 62-file corpus, 419 pointer-typed parameters were classified
+(the same denominator as Step 4, since both operate over the same set): 215 (51%)
+mutable, 204 (49%) immutable. Breaking the 215 down by evidence kind
+(`examples/mutability_breakdown.rs`): 130 (60%) from a direct write alone, 50 (23%)
+from a resolved forwarding chain alone, 33 (15%) from the conservative fallback alone,
+2 mixed. The conservative-fallback callers sampled (`W_AddFile`, `Z_FileDumpHeap`,
+`M_ReadFile`, `createnullcursor`, `I_Error`, ...) are exactly what the policy is meant
+to catch: file I/O, X11 calls, varargs error reporting -- genuinely unverifiable from
+inside this corpus, not an over-eager trigger.
+
+**Impact today**: the conservative fallback is a real, working safety net, not the
+dominant source of "mutable" -- 85% of mutable classifications trace to actual write or
+forwarding evidence, so the fallback isn't drowning out the signal.
+
+**Scope note**: same boundary as Step 4 -- only syntactic derivation chains within a
+single expression are tracked (dereference, index, member access, address-of, cast).
+An intermediate local variable that copies the pointer first (`int *q = *pp; *q = 5;`)
+is general local-variable data-flow, not a derivation chain, and isn't tracked here
+either, for the same reason Step 4 didn't track it.
+
+---
+
 ## Step 3's `#if` expression evaluator can't handle function-macro invocations, so some real system headers never resolve at all
 
 **Where**: `transpiler/src/parser/preprocessor.rs` (`evaluate_expr`).
