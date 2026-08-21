@@ -14,8 +14,8 @@ pub mod xlib_typedefs;
 
 pub use comment_attach::{Anchor, Commented, CommentedStream, attach_comments};
 pub use grammar::{
-    ParseError, extract_top_level_typedefs, parse_expr_from_tokens, parse_translation_unit,
-    parse_translation_unit_seeded,
+    ParseError, extract_top_level_typedefs, parse_block_items_from_tokens, parse_expr_from_tokens,
+    parse_translation_unit, parse_translation_unit_seeded,
 };
 pub use imports::ImportResolver;
 pub use lexer::{

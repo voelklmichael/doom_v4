@@ -31,8 +31,8 @@
 //! needed here either.
 
 use crate::parser::SourceChunk;
-use crate::parser::ast::Expr;
-use crate::parser::grammar::parse_expr_from_tokens;
+use crate::parser::ast::{BlockItem, Expr};
+use crate::parser::grammar::{parse_block_items_from_tokens, parse_expr_from_tokens};
 use crate::parser::imports::ImportResolver;
 use crate::parser::lexer::{LexItem, Token, lex_chunks};
 use crate::parser::macro_literal_subst::substitute_adjacent_literal_macros;
@@ -57,9 +57,19 @@ pub enum MacroBody {
     Empty {
         params: Option<Vec<String>>,
     },
-    /// Had replacement text, but it didn't reduce to a single expression
-    /// (leftover tokens, or a non-expression fragment like a statement or a
-    /// bare type name) -- kept for provenance/diagnostics, not a hard
+    /// Not a single expression, but a real sequence of declarations and/or
+    /// statements -- what you'd get if the body were pasted directly into a
+    /// function body (e.g. `Z_ChangeTag`'s `{ if (...) I_Error(...);
+    /// Z_ChangeTag2(p,t); };`, or a flat `(oc) = 0; if (...) ...;` with no
+    /// enclosing braces at all). `params: None` for an object-like macro,
+    /// `Some(params)` for a function-like one.
+    Statements {
+        params: Option<Vec<String>>,
+        body: Vec<BlockItem>,
+    },
+    /// Had replacement text, but it didn't reduce to a single expression or
+    /// a parseable statement sequence (a bare type name, a lone storage
+    /// class keyword, ...) -- kept for provenance/diagnostics, not a hard
     /// error. See `docs/KNOWN_LIMITATIONS.md`.
     Unparseable(String),
 }
@@ -161,29 +171,31 @@ fn parse_macro_body(
     let Some(tokens) = lex_body_tokens(body_text, literal_macros).filter(|t| !t.is_empty()) else {
         return MacroBody::Unparseable(body_text.to_string());
     };
-    match params {
-        None => match parse_expr_from_tokens(tokens, typedefs.clone()) {
-            Ok(expr) => MacroBody::Object(expr),
-            Err(_) => MacroBody::Unparseable(body_text.to_string()),
-        },
-        Some(params) => {
-            // A macro parameter is just a plain identifier within the body
-            // -- if its name happens to collide with a typedef name (e.g. a
-            // parameter called `boolean`), it must not be misread as a type
-            // in a cast position.
-            let mut scoped_typedefs = typedefs.clone();
-            for p in params {
-                scoped_typedefs.remove(p);
-            }
-            match parse_expr_from_tokens(tokens, scoped_typedefs) {
-                Ok(expr) => MacroBody::Function {
-                    params: params.clone(),
-                    body: expr,
-                },
-                Err(_) => MacroBody::Unparseable(body_text.to_string()),
-            }
-        }
+    // A macro parameter is just a plain identifier within the body -- if
+    // its name happens to collide with a typedef name (e.g. a parameter
+    // called `boolean`), it must not be misread as a type in a cast/decl
+    // position, for either attempt below.
+    let mut scoped_typedefs = typedefs.clone();
+    for p in params.iter().flatten() {
+        scoped_typedefs.remove(p);
     }
+
+    if let Ok(expr) = parse_expr_from_tokens(tokens.clone(), scoped_typedefs.clone()) {
+        return match params {
+            None => MacroBody::Object(expr),
+            Some(params) => MacroBody::Function {
+                params: params.clone(),
+                body: expr,
+            },
+        };
+    }
+    if let Ok(items) = parse_block_items_from_tokens(tokens, scoped_typedefs) {
+        return MacroBody::Statements {
+            params: params.clone(),
+            body: items,
+        };
+    }
+    MacroBody::Unparseable(body_text.to_string())
 }
 
 /// Resolves every `#define` visible to a file into a parsed `MacroBody`,
@@ -226,7 +238,7 @@ impl MacroBodyResolver {
 mod tests {
     use super::*;
     use crate::parser::TokenKind;
-    use crate::parser::ast::{BinaryOp, Expr};
+    use crate::parser::ast::{BinaryOp, Expr, Stmt};
 
     fn corpus_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../linuxdoom-1.10")
@@ -294,13 +306,74 @@ mod tests {
     }
 
     #[test]
-    fn test_trailing_tokens_are_unparseable() {
-        // Not a single expression -- two statements' worth of tokens.
+    fn test_dangling_trailing_tokens_are_unparseable() {
+        // Not a single expression, and not a valid statement sequence
+        // either -- `2` has no terminating `;`, so it can't close out as a
+        // statement.
         let typedefs = HashSet::new();
         assert!(matches!(
             parse_macro_body(&None, "1; 2", &typedefs, &HashMap::new()),
             MacroBody::Unparseable(_)
         ));
+    }
+
+    #[test]
+    fn test_multi_statement_body_parses_as_statements() {
+        // Mirrors am_map.c's DOOUTCODE(oc,mx,my): not a single expression,
+        // but a valid sequence of statements.
+        let typedefs = HashSet::new();
+        let params = Some(vec!["oc".to_string()]);
+        let body = parse_macro_body(
+            &params,
+            "(oc) = 0; if ((oc) < 0) (oc) = 1;",
+            &typedefs,
+            &HashMap::new(),
+        );
+        match body {
+            MacroBody::Statements { params, body } => {
+                assert_eq!(params, Some(vec!["oc".to_string()]));
+                assert_eq!(body.len(), 2);
+                assert!(matches!(body[0], BlockItem::Stmt(Stmt::Expr(Some(_)))));
+                assert!(matches!(body[1], BlockItem::Stmt(Stmt::If { .. })));
+            }
+            other => panic!("expected a parsed statement sequence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_braced_compound_body_parses_as_statements() {
+        // Mirrors z_zone.h's Z_ChangeTag(p,t): a single `{ ... }` block,
+        // plus the macro author's own trailing `;` outside it.
+        let typedefs = HashSet::new();
+        let params = Some(vec!["p".to_string(), "t".to_string()]);
+        let body = parse_macro_body(&params, "{ f(p,t); };", &typedefs, &HashMap::new());
+        match body {
+            MacroBody::Statements { body, .. } => {
+                assert!(matches!(body[0], BlockItem::Stmt(Stmt::Compound(_))));
+            }
+            other => panic!("expected a parsed statement sequence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_declaration_body_parses_as_statements() {
+        // Mirrors i_sound.h's SEQ_DEFINEBUF(len): declarations, not
+        // expressions or "plain" statements.
+        let typedefs = HashSet::new();
+        let body = parse_macro_body(
+            &None,
+            "unsigned char buf[4]; int n = 0;",
+            &typedefs,
+            &HashMap::new(),
+        );
+        match body {
+            MacroBody::Statements { body, .. } => {
+                assert_eq!(body.len(), 2);
+                assert!(matches!(body[0], BlockItem::Decl(_)));
+                assert!(matches!(body[1], BlockItem::Decl(_)));
+            }
+            other => panic!("expected a parsed statement sequence, got {other:?}"),
+        }
     }
 
     #[test]
@@ -369,20 +442,22 @@ mod tests {
         assert!(files.len() > 50, "expected the full Doom .c corpus");
 
         let mut resolver = MacroBodyResolver::new();
-        let (mut objects, mut functions, mut empty, mut unparseable) = (0, 0, 0, 0);
+        let (mut objects, mut functions, mut empty, mut statements, mut unparseable) =
+            (0, 0, 0, 0, 0);
         for path in &files {
             for body in resolver.resolve(path).values() {
                 match body {
                     MacroBody::Object(_) => objects += 1,
                     MacroBody::Function { .. } => functions += 1,
                     MacroBody::Empty { .. } => empty += 1,
+                    MacroBody::Statements { .. } => statements += 1,
                     MacroBody::Unparseable(_) => unparseable += 1,
                 }
             }
         }
         eprintln!(
             "macro body parsing over {} files: {objects} object, {functions} function, \
-             {empty} empty, {unparseable} unparseable",
+             {empty} empty, {statements} statements, {unparseable} unparseable",
             files.len()
         );
         assert!(
