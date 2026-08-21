@@ -68,36 +68,36 @@ flowchart TD
 ---
 
 ### Step 2: Macro Typing
-* **Objective**: Phase 1 deliberately does *not* expand general `#define` macros (see
-  `docs/KNOWN_LIMITATIONS.md`) — Step 4b's literal substitution is narrowly scoped to
-  parsing, and object-like macro constants (`#define FRACUNIT (1<<FRACBITS)`) and
-  function-like macros (`#define FixedMul(a,b) ...`) still sit in the AST as
-  unexpanded identifiers/call-shaped expressions. The typechecker is the first phase
-  that actually needs their types, so this step gives every macro that's referenced
-  from a typed context (an expression, a declaration) a resolved type.
+* **Objective**: Parser Step 7 (`docs/01_PARSER.md`) already turns each `#define`'s
+  replacement text into a structured `MacroBody` (an `Object(Expr)`, a
+  `Function { params, body }`, or `Unparseable` if it isn't expression-shaped) — that
+  step is purely syntactic and assigns no type. This step is the first consumer that
+  actually needs a *type*: it gives every macro referenced from a typed context (an
+  expression, a declaration) a resolved type, building directly on Step 7's `Expr`
+  rather than re-parsing any replacement text.
 * **Approach**:
-  - For an object-like macro, parse its replacement text as a C89 constant expression
-    (reusing Step 6c's expression grammar) and typecheck that expression to get its
-    type — e.g. `FRACBITS` → `16` → `int`; `FRACUNIT` → `(1<<FRACBITS)` → `int` (after
-    `FRACBITS` itself resolves).
-  - For a function-like macro, parse its replacement text as a C89 expression with its
-    parameter names in scope as placeholders, substitute the actual argument
-    expressions' types at each use site (each call site can, in principle, get a
-    different instantiation, the same way a C++ template would — a function-like
-    macro has no single fixed signature), and typecheck the substituted expression.
-  - Resolution mirrors Step 6b/4b's existing pattern: recursively union a file's own
-    macros with everything transitively `#include`d, memoized and cycle-guarded,
-    reusing `system_headers.rs`'s include resolution rather than reimplementing it.
-* **Deliberately scoped, not a general preprocessor**: this is still not full
-  macro-expansion of the token stream (Step 6's AST keeps macro call sites as-is,
-  annotated with a resolved type, rather than inlining the macro body into the AST
-  everywhere it's used). Macros whose body doesn't parse as a C89 expression (e.g. a
-  multi-statement body, or one that expands to a partial/non-expression fragment) are
-  left untyped and flagged, not hard errors — measure actual corpus impact the same
-  way Step 4b did before deciding whether they need special handling.
+  - `MacroBody::Object(expr)`: typecheck `expr` directly (reusing Step 3's expression
+    typechecking) to get the macro's type — e.g. `FRACBITS` → `16` → `int`; `FRACUNIT`
+    → `(1<<FRACBITS)` → `int` (after `FRACBITS` itself resolves, since one macro's
+    body can reference another).
+  - `MacroBody::Function { params, body }`: a function-like macro has no single fixed
+    signature — like a C++ template, each call site can in principle instantiate it
+    differently. At each use site, substitute the actual argument expressions for
+    `params` inside `body` and typecheck the substituted expression, rather than
+    typechecking the macro once in isolation.
+  - Resolution (which macros are visible to a file at all) mirrors Step 6b/4b's
+    existing pattern: recursively union a file's own macros with everything
+    transitively `#include`d, memoized and cycle-guarded, reusing
+    `system_headers.rs`'s include resolution rather than reimplementing it.
+* **Deliberately scoped, not a general preprocessor**: this still doesn't inline macro
+  bodies into the AST at every use site (a call site keeps referencing the macro,
+  annotated with a resolved type, rather than being rewritten to the expanded
+  expression). A macro whose body came back `MacroBody::Unparseable` from Step 7 is
+  left untyped and flagged, not a hard error — measure actual corpus impact the same
+  way Step 4b did before deciding whether it needs special handling.
 * **Validation Criteria**: Corpus scan for every macro identifier referenced from an
   expression/declaration context across the 62 `.c` translation units; every one of
-  them resolves to a type, or is explicitly logged as an untypeable macro body for
+  them resolves to a type, or is explicitly logged (with its `Unparseable` body) for
   follow-up (matching Step 4b's "measure first" methodology).
 
 ---
