@@ -605,5 +605,45 @@ linked symbols should attach to whichever shared header (if any) actually declar
 them (`p_local.h` for most of the `p_*.c` cases measured here), not silently drop `pub`
 entirely for lack of an individually-named header.
 
-**Impact today**: none yet -- Phase 3 codegen hasn't started. This is the input the
-open issue asked for; the module-merge implementation itself is still unwritten.
+**Impact today**: none at the time this was written -- implemented since, see the
+following entry.
+
+---
+
+## Phase 3's module-visibility resolver: implemented, closing the gap from 32% wrong to 2 residual symbols out of 1360
+
+**Where**: `transpiler/src/codegen/visibility.rs` (`resolve_module_visibility`),
+implementing the direction the previous entry's investigation called for.
+
+**Two more patterns turned up while cross-checking the new resolver's own corpus
+numbers against `extern_linkage_survey.rs`'s independent "used elsewhere" ground
+truth** -- beyond the `doomstat.h`/`p_local.h` cases the investigation already found:
+- Some globals skip headers on **both** ends: `m_misc.c` itself declares
+  `extern int key_right;` at its own top level, sourced from `g_game.c`, with no
+  header involved anywhere. `RawDeclarationIndex` covers this separately -- a
+  corpus-wide index of which `.c` files redeclare which names at their own top level.
+- Several `.c` files never `#include` their own matching header at all --
+  `f_finale.c` even has it commented out (`//#include "f_finale.h"`); `r_bsp.c`,
+  `m_random.c`, `p_saveg.c`, `p_tick.c`, `i_video.c`, `m_argv.c` do the same. The
+  header is still that file's real public API; `resolve_via_includes` alone can't see
+  it since it only walks the defining file's actual `#include`s, so
+  `own_matching_header_names` checks the matching header directly regardless of
+  whether the file includes it.
+
+**Combining all four signals** (header-graph, own-matching-header,
+cross-`.c`-file-raw-redeclaration, plus the original "defined here") and
+cross-checking against the survey's ground truth leaves only **2 of 1360** externally-
+linked definitions wrongly private: `rndindex` (`m_random.c`) and `skyflatnum`
+(`r_sky.c`), both declared only in `doomstat.h`, which neither defining file
+`#include`s, and neither name appears in that file's own matching header either (
+`m_random.h` only declares the three `M_Random`/`P_Random`/`M_ClearRandom` functions,
+not `rndindex`). Finding these would need a fifth, much weaker signal ("declared in
+*any* header anywhere in the corpus, regardless of the defining file's relationship to
+it") -- not implemented, matching this project's "measure, document, don't chase to
+100%" approach throughout.
+
+**Impact today**: `resolve_module_visibility` is available for Phase 3 codegen to
+call per `.c` file; the corpus-wide public/private split (691 public, 669 private) is
+reported by `codegen::visibility`'s own corpus test. Module *file* structure itself
+(how a `.c`/`.h` pair's items actually get emitted as Rust) is still unwritten -- this
+step only answers the `pub`-vs-private question per symbol.
