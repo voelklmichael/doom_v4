@@ -18,12 +18,25 @@
 //! typedef dependency) is cached across files the same way Step 6b/4b's
 //! import resolvers are; parsing each one into an `Expr` (which does depend
 //! on the caller's typedef set) is done fresh per top-level file.
+//!
+//! Before parsing, a body's tokens also go through Step 4b's literal-macro
+//! substitution (`macro_literal_subst::substitute_adjacent_literal_macros`)
+//! -- the exact same "a macro identifier sits immediately next to a
+//! string/char literal" case Step 4b already handles for code, just applied
+//! to a `#define` body's own tokens instead. This is what turns e.g.
+//! `#define NETEND "...\n\n"PRESSKEY` (a string literal directly followed
+//! by another macro that itself expands to one) into two adjacent string
+//! literal tokens, which `grammar.rs`'s primary-expression parser already
+//! merges into one `Expr::StringLiteral` -- no separate concatenation logic
+//! needed here either.
 
 use crate::parser::SourceChunk;
 use crate::parser::ast::Expr;
 use crate::parser::grammar::parse_expr_from_tokens;
 use crate::parser::imports::ImportResolver;
 use crate::parser::lexer::{LexItem, Token, lex_chunks};
+use crate::parser::macro_literal_subst::substitute_adjacent_literal_macros;
+use crate::parser::macro_literals::LiteralMacroResolver;
 use crate::parser::partitioner::{PreprocessorDirective, partition_source};
 use crate::parser::system_headers::{read_resolved_chunks_and_includes, resolve_include_path};
 use std::collections::{HashMap, HashSet};
@@ -113,10 +126,14 @@ impl RawMacroCollector {
 
 /// Lexes a `#define` body's raw text into tokens, going through Step 2
 /// partitioning first (same as `macro_literals.rs`'s `as_single_literal`)
-/// since raw quote characters only mean anything to the partitioner.
-fn lex_body_tokens(body: &str) -> Option<Vec<Token>> {
+/// since raw quote characters only mean anything to the partitioner, then
+/// applying Step 4b's adjacent-literal-macro substitution so a body like
+/// `"..."PRESSKEY` comes out as two literal tokens instead of a literal
+/// followed by a bare, unresolvable identifier.
+fn lex_body_tokens(body: &str, literal_macros: &HashMap<String, Token>) -> Option<Vec<Token>> {
     let chunks = partition_source(body);
     let entries = lex_chunks(&chunks).ok()?;
+    let entries = substitute_adjacent_literal_macros(entries, literal_macros);
     Some(
         entries
             .into_iter()
@@ -129,18 +146,19 @@ fn lex_body_tokens(body: &str) -> Option<Vec<Token>> {
 }
 
 /// Parses one macro's `(params, body text)` into a `MacroBody`, given the
-/// typedef set visible at its home translation unit.
+/// typedef set and literal-macro map visible at its home translation unit.
 fn parse_macro_body(
     params: &Option<Vec<String>>,
     body_text: &str,
     typedefs: &HashSet<String>,
+    literal_macros: &HashMap<String, Token>,
 ) -> MacroBody {
     if body_text.trim().is_empty() {
         return MacroBody::Empty {
             params: params.clone(),
         };
     }
-    let Some(tokens) = lex_body_tokens(body_text).filter(|t| !t.is_empty()) else {
+    let Some(tokens) = lex_body_tokens(body_text, literal_macros).filter(|t| !t.is_empty()) else {
         return MacroBody::Unparseable(body_text.to_string());
     };
     match params {
@@ -175,6 +193,7 @@ fn parse_macro_body(
 pub struct MacroBodyResolver {
     raw: RawMacroCollector,
     imports: ImportResolver,
+    literals: LiteralMacroResolver,
 }
 
 impl MacroBodyResolver {
@@ -185,12 +204,20 @@ impl MacroBodyResolver {
     /// Every macro visible to `path` (its own `#define`s plus everything
     /// transitively `#include`d), each parsed into a `MacroBody` using
     /// `path`'s own Step 6b import-resolved typedef set -- matching Step
-    /// 6c's single flat per-translation-unit typedef namespace.
+    /// 6c's single flat per-translation-unit typedef namespace -- and Step
+    /// 4b's import-resolved literal-macro map, for adjacent-literal
+    /// substitution within the body itself.
     pub fn resolve(&mut self, path: &Path) -> HashMap<String, MacroBody> {
         let raw = self.raw.collect(path);
         let typedefs = self.imports.resolve(path);
+        let literal_macros = self.literals.resolve(path);
         raw.into_iter()
-            .map(|(name, (params, body))| (name, parse_macro_body(&params, &body, &typedefs)))
+            .map(|(name, (params, body))| {
+                (
+                    name,
+                    parse_macro_body(&params, &body, &typedefs, &literal_macros),
+                )
+            })
             .collect()
     }
 }
@@ -198,6 +225,7 @@ impl MacroBodyResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::TokenKind;
     use crate::parser::ast::{BinaryOp, Expr};
 
     fn corpus_dir() -> PathBuf {
@@ -207,7 +235,7 @@ mod tests {
     #[test]
     fn test_object_like_macro_parses_to_single_expr() {
         let typedefs = HashSet::new();
-        let body = parse_macro_body(&None, "(1<<16)", &typedefs);
+        let body = parse_macro_body(&None, "(1<<16)", &typedefs, &HashMap::new());
         match body {
             MacroBody::Object(Expr::Binary {
                 op: BinaryOp::Shl, ..
@@ -223,6 +251,7 @@ mod tests {
             &Some(vec!["a".to_string(), "b".to_string()]),
             "((a) + (b))",
             &typedefs,
+            &HashMap::new(),
         );
         match body {
             MacroBody::Function { params, body } => {
@@ -243,11 +272,11 @@ mod tests {
     fn test_empty_body_is_empty_not_unparseable() {
         let typedefs = HashSet::new();
         assert_eq!(
-            parse_macro_body(&None, "", &typedefs),
+            parse_macro_body(&None, "", &typedefs, &HashMap::new()),
             MacroBody::Empty { params: None }
         );
         assert_eq!(
-            parse_macro_body(&None, "   ", &typedefs),
+            parse_macro_body(&None, "   ", &typedefs, &HashMap::new()),
             MacroBody::Empty { params: None }
         );
     }
@@ -257,7 +286,7 @@ mod tests {
         let typedefs = HashSet::new();
         let params = Some(vec!["x".to_string()]);
         assert_eq!(
-            parse_macro_body(&params, "", &typedefs),
+            parse_macro_body(&params, "", &typedefs, &HashMap::new()),
             MacroBody::Empty {
                 params: Some(vec!["x".to_string()])
             }
@@ -269,9 +298,43 @@ mod tests {
         // Not a single expression -- two statements' worth of tokens.
         let typedefs = HashSet::new();
         assert!(matches!(
-            parse_macro_body(&None, "1; 2", &typedefs),
+            parse_macro_body(&None, "1; 2", &typedefs, &HashMap::new()),
             MacroBody::Unparseable(_)
         ));
+    }
+
+    #[test]
+    fn test_string_literal_adjacent_to_another_literal_macro_concatenates() {
+        // Mirrors d_englsh.h: #define NETEND "...\n\n"PRESSKEY, where
+        // PRESSKEY is itself a plain literal-bodied macro (#define PRESSKEY
+        // "press a key."). Without Step 4b's substitution this is a string
+        // literal directly followed by a bare, unresolvable identifier --
+        // not a single expression. With it, both become literal tokens and
+        // grammar.rs's own adjacent-string-literal handling merges them.
+        let typedefs = HashSet::new();
+        let mut literal_macros = HashMap::new();
+        literal_macros.insert(
+            "PRESSKEY".to_string(),
+            Token {
+                kind: TokenKind::StringLiteral,
+                text: "\"press a key.\"".to_string(),
+            },
+        );
+        let body = parse_macro_body(
+            &None,
+            "\"you can't end a netgame!\\n\\n\"PRESSKEY",
+            &typedefs,
+            &literal_macros,
+        );
+        match body {
+            MacroBody::Object(Expr::StringLiteral(s)) => {
+                // Raw token text concatenation (quotes and all), matching
+                // grammar.rs's existing adjacent-string-literal handling --
+                // not decoded/re-quoted.
+                assert_eq!(s, "\"you can't end a netgame!\\n\\n\"\"press a key.\"");
+            }
+            other => panic!("expected a merged string literal, got {other:?}"),
+        }
     }
 
     #[test]
