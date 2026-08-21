@@ -25,8 +25,9 @@ flowchart LR
 
 2. **[02. Semantic Analysis & Typechecking](02_TYPECHECKER.md)**
    - Symbol Tables and Scope Management
-   - Type Representation & Checking
-   - C Casts, Type Promotions, and Conversions
+   - Macro Typing (object-like constants & function-like macros)
+   - Type Representation & Checking, C Casts, Type Promotions, and Conversions
+   - Pointer Usage Analysis: Array Inference, Mutability, and Nullability
 
 3. **[03. Transpilation & Code Generation](03_TRANSPILER.md)**
    - Rust Code Generation Strategy (Safety, Ownership, Idioms vs. 1:1 Mapping)

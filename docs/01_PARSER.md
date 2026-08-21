@@ -15,6 +15,7 @@ flowchart TD
     S4 --> S4b[Step 4b: Literal Macro Substitution]
     S4b --> S5[Step 5: Comment Attaching]
     S5 --> S6[Step 6: AST Grammar Parser]
+    S6 --> S7[Step 7: Macro Body Parsing]
 ```
 
 ---
@@ -135,3 +136,22 @@ flowchart TD
     - Unary & Binary operators with standard C operator precedence.
     - Function calls, array indexing, member access (`.` and `->`), explicit casts.
 * **Validation Criteria**: Complete AST construction for every translation unit in `linuxdoom-1.10`. Only `.c` files are real translation units in C -- `.h` files are never compiled standalone, so this is checked over the 62 `.c` files, not all 124 `.c`/`.h` files. All 62 pass, deterministically (independent of what's installed on the machine running it), with Step 4b's narrow literal-macro substitution handling the last remaining gap (see `docs/KNOWN_LIMITATIONS.md`).
+
+---
+
+### Step 7: Macro Body Parsing
+* **Objective**: Steps 1-6 deliberately never expand general `#define` macros (see `docs/KNOWN_LIMITATIONS.md`) -- a macro's replacement text sits in `PreprocessorDirective::Define { name, params, replacement }` as a raw, unparsed `String`, and a macro identifier used in code stays an unexpanded `Expr::Ident`/`Expr::Call` in the AST. This step turns that raw replacement text into a real `Expr`, using the same expression grammar Step 6c already parses code with -- so downstream consumers (starting with the typechecker's macro typing, `docs/02_TYPECHECKER.md`) work with structured expressions instead of strings. This is still purely syntactic: it produces an `Expr`, not a type -- assigning it a type is the typechecker's job, not the parser's.
+* **Why after Step 6, not alongside Step 4b**: parsing a macro body as an expression needs the same typedef-vs-identifier disambiguation Step 6c's expression grammar already handles (e.g. `(fixed_t)(x)` parses differently as a cast depending on whether `fixed_t` is a known typedef name) -- so this step reuses Step 6c's expression parser directly, seeded with the same Step 6b typedef set as the file it belongs to, rather than duplicating that logic ahead of Step 6.
+* **Object-like macros** (`#define FRACUNIT (1<<FRACBITS)`): lex the replacement text (Step 4) and parse it as a single expression. A macro is only ever used in code standing in for one syntactic expression, so the whole token stream must reduce to exactly one `Expr` with no leftover tokens -- if it doesn't (extra tokens after a complete expression, an empty body, or a body that isn't expression-shaped at all, e.g. a type name or a statement), the macro is left unparsed rather than forced into a guess.
+* **Function-like macros** (`#define FixedMul(a,b) ...`): parse the parameter list (already captured as plain names in `params: Vec<String>`) alongside the body, with those parameter names in scope as ordinary identifiers while parsing the body expression -- they don't need to resolve to anything at this stage (no argument substitution happens here; that's per-call-site work the typechecker does once it knows each call site's actual argument expressions). Same single-expression requirement as the object-like case.
+* **Target Representation**:
+  ```rust
+  pub enum MacroBody {
+      Object(Expr),
+      Function { params: Vec<String>, body: Expr },
+      /// Didn't reduce to a single expression -- kept for provenance/diagnostics,
+      /// not a hard error (see `docs/KNOWN_LIMITATIONS.md`).
+      Unparseable(String),
+  }
+  ```
+* **Validation Criteria**: Every `#define` visible to (i.e. transitively reachable from) each of the 62 `.c` translation units gets parsed into a `MacroBody`; corpus scan reports how many resolve to `Object`/`Function` vs. fall back to `Unparseable`, matching Step 4b's "measure actual scope before deciding it needs more" methodology.
