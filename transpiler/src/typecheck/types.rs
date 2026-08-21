@@ -20,7 +20,8 @@
 //! this specific binary's actual semantics" stance elsewhere.
 
 use crate::parser::ast::{
-    AbstractDeclarator, BinaryOp, DeclSpecifiers, DirectAbstractDeclarator, TypeName, TypeSpecifier,
+    AbstractDeclarator, BinaryOp, DeclSpecifiers, Declarator, DirectAbstractDeclarator,
+    DirectDeclarator, ParamDecl, ParamDeclarator, TypeName, TypeSpecifier,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +326,70 @@ fn type_from_direct_abstract(d: &DirectAbstractDeclarator, base: Type) -> Type {
     }
 }
 
+/// A named declarator's counterpart to `type_from_abstract_declarator` --
+/// same threading algorithm, `DirectDeclarator::Ident` playing the role of
+/// the abstract path's `None` terminal. Used for real declarations
+/// (variables, parameters, typedefs), not just cast/`sizeof` type names.
+pub fn type_from_declarator(base: Type, d: &Declarator) -> Type {
+    let base = apply_pointers(base, &d.pointer_quals);
+    type_from_direct_declarator(&d.direct, base)
+}
+
+fn type_from_direct_declarator(d: &DirectDeclarator, base: Type) -> Type {
+    match d {
+        DirectDeclarator::Ident(_) => base,
+        DirectDeclarator::Paren(inner) => type_from_declarator(base, inner),
+        DirectDeclarator::Array(sub, _size) => {
+            type_from_direct_declarator(sub, Type::Array(Box::new(base)))
+        }
+        // Ignores the parameter list -- see `Type::Function`'s docs. A
+        // named function declaration's *own* parameter types are captured
+        // separately, by `function_signature` below, for call-argument
+        // checking -- this arm only matters for a function-pointer-shaped
+        // declarator nested inside something else (`Paren`/`Array`).
+        DirectDeclarator::Function(sub, _params) => {
+            type_from_direct_declarator(sub, Type::Function(Box::new(base)))
+        }
+    }
+}
+
+/// A function's declared signature: return type, parameter types, and
+/// whether it's variadic (`...`). `None` if `d` isn't a plain named
+/// function declarator (`name(...)`, as opposed to a variable of some
+/// other shape, including a function *pointer* like `(*fp)(...)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionSignature {
+    pub ret: Type,
+    pub params: Vec<Type>,
+    pub variadic: bool,
+}
+
+pub fn function_signature(base: Type, d: &Declarator) -> Option<FunctionSignature> {
+    let ret = apply_pointers(base, &d.pointer_quals);
+    match &d.direct {
+        DirectDeclarator::Function(inner, params)
+            if matches!(**inner, DirectDeclarator::Ident(_)) =>
+        {
+            Some(FunctionSignature {
+                ret,
+                params: params.params.iter().map(param_type).collect(),
+                variadic: params.variadic,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A parameter declaration's `Type`, whether named, abstract, or bare.
+pub fn param_type(p: &ParamDecl) -> Type {
+    let base = type_from_specifiers(&p.specifiers);
+    match &p.declarator {
+        ParamDeclarator::Named(d) => type_from_declarator(base, d),
+        ParamDeclarator::Abstract(ad) => type_from_abstract_declarator(base, ad),
+        ParamDeclarator::Bare => base,
+    }
+}
+
 pub fn unary_arith_result(t: &Type) -> Type {
     if t.is_float() {
         t.clone()
@@ -356,10 +421,73 @@ pub fn type_of_additive(op: BinaryOp, lt: &Type, rt: &Type) -> Type {
     }
 }
 
+/// True when `t` is `Unknown`, or a pointer/array/function wrapping
+/// something that's `Unknown` at any depth -- e.g. `Pointer(Unknown)`, from
+/// taking the address of a struct member this project couldn't type. Used
+/// by `is_assignment_compatible` to withhold judgment rather than flag a
+/// structural mismatch against a type we don't actually know: "possibly
+/// incompatible because we lack information" isn't the same finding as
+/// "confirmed incompatible", and only the latter is worth reporting.
+fn contains_unknown(t: &Type) -> bool {
+    match t {
+        Type::Unknown => true,
+        Type::Pointer(inner) | Type::Array(inner) | Type::Function(inner) => {
+            contains_unknown(inner)
+        }
+        _ => false,
+    }
+}
+
+/// C89 6.3.16's assignment-compatibility rules (also used for cast and
+/// call-argument sites), approximated: any two arithmetic types are always
+/// "compatible" here (C89 allows the implicit conversion regardless of
+/// narrowing -- that's a *warning* in a real compiler, not a constraint
+/// this project models); pointer/integer mixes are allowed too, since
+/// without constant-value tracking a `0`/`NULL` assignment (extremely
+/// common and entirely valid) would otherwise be indistinguishable from a
+/// genuine mismatch. A bare function value decays to a pointer to itself
+/// wherever a pointer is expected, the same way an array decays to a
+/// pointer to its element type -- both directions are allowed against
+/// `void*`, matching Doom's own heavy use of loosely-typed action-pointer
+/// tables (see `docs/02_TYPECHECKER.md`'s Doom Idioms section). `Unknown`
+/// anywhere in either type (`contains_unknown`) is never flagged -- there's
+/// nothing to check without a real type. Everything else this returns
+/// `false` for is a real, reportable deviation (matching this project's
+/// "document, don't silently accept" policy -- see
+/// `docs/KNOWN_LIMITATIONS.md`), not necessarily a bug: `linuxdoom-1.10`
+/// itself relies on some of it.
+pub fn is_assignment_compatible(target: &Type, value: &Type) -> bool {
+    if contains_unknown(target) || contains_unknown(value) {
+        return true;
+    }
+    if target == value {
+        return true;
+    }
+    if target.is_arithmetic() && value.is_arithmetic() {
+        return true;
+    }
+    match (target, value) {
+        (Type::Pointer(a), Type::Pointer(b)) => {
+            matches!(**a, Type::Void) || matches!(**b, Type::Void) || a == b
+        }
+        (Type::Array(a), Type::Pointer(b)) | (Type::Pointer(a), Type::Array(b)) => {
+            matches!(**a, Type::Void) || matches!(**b, Type::Void) || a == b
+        }
+        (Type::Pointer(inner), Type::Function(_)) => {
+            matches!(**inner, Type::Void | Type::Function(_))
+        }
+        (Type::Pointer(_), other) | (other, Type::Pointer(_)) => other.is_integer(),
+        (Type::Struct(a), Type::Struct(b)) | (Type::Union(a), Type::Union(b)) => a == b,
+        (Type::Enum(_), other) | (other, Type::Enum(_)) => other.is_integer(),
+        (Type::Function(a), Type::Function(b)) => a == b,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ast::{DeclSpecifiers, TypeQualifier};
+    use crate::parser::ast::{DeclSpecifiers, ParamList, TypeQualifier};
 
     #[test]
     fn test_decimal_int_literal_defaults_to_int() {
@@ -538,5 +666,94 @@ mod tests {
             type_from_type_name(&tn),
             Type::Pointer(Box::new(Type::Char))
         );
+    }
+
+    fn declarator(pointer_quals: Vec<Vec<TypeQualifier>>, direct: DirectDeclarator) -> Declarator {
+        Declarator {
+            pointer_quals,
+            direct,
+        }
+    }
+
+    #[test]
+    fn test_type_from_declarator_plain_variable() {
+        // `int x;`
+        let d = declarator(vec![], DirectDeclarator::Ident("x".to_string()));
+        assert_eq!(type_from_declarator(Type::Int, &d), Type::Int);
+    }
+
+    #[test]
+    fn test_type_from_declarator_pointer_variable() {
+        // `char *p;`
+        let d = declarator(vec![vec![]], DirectDeclarator::Ident("p".to_string()));
+        assert_eq!(
+            type_from_declarator(Type::Char, &d),
+            Type::Pointer(Box::new(Type::Char))
+        );
+    }
+
+    #[test]
+    fn test_function_signature_plain_function() {
+        // `int f(int a, char b);`
+        let params = ParamList {
+            params: vec![
+                ParamDecl {
+                    specifiers: specs(vec![TypeSpecifier::Int]),
+                    declarator: ParamDeclarator::Named(declarator(
+                        vec![],
+                        DirectDeclarator::Ident("a".to_string()),
+                    )),
+                },
+                ParamDecl {
+                    specifiers: specs(vec![TypeSpecifier::Char]),
+                    declarator: ParamDeclarator::Named(declarator(
+                        vec![],
+                        DirectDeclarator::Ident("b".to_string()),
+                    )),
+                },
+            ],
+            variadic: false,
+        };
+        let d = declarator(
+            vec![],
+            DirectDeclarator::Function(Box::new(DirectDeclarator::Ident("f".to_string())), params),
+        );
+        let sig = function_signature(Type::Int, &d).expect("expected a function signature");
+        assert_eq!(sig.ret, Type::Int);
+        assert_eq!(sig.params, vec![Type::Int, Type::Char]);
+        assert!(!sig.variadic);
+    }
+
+    #[test]
+    fn test_function_signature_returning_pointer() {
+        // `char *f(void);` -- the outer `*` belongs to the return type.
+        let d = declarator(
+            vec![vec![]],
+            DirectDeclarator::Function(
+                Box::new(DirectDeclarator::Ident("f".to_string())),
+                ParamList::default(),
+            ),
+        );
+        let sig = function_signature(Type::Char, &d).expect("expected a function signature");
+        assert_eq!(sig.ret, Type::Pointer(Box::new(Type::Char)));
+        assert!(sig.params.is_empty());
+    }
+
+    #[test]
+    fn test_function_signature_rejects_function_pointer_variable() {
+        // `void (*fp)(int);` -- not a plain named function declarator.
+        let inner = declarator(vec![vec![]], DirectDeclarator::Ident("fp".to_string()));
+        let params = ParamList {
+            params: vec![ParamDecl {
+                specifiers: specs(vec![TypeSpecifier::Int]),
+                declarator: ParamDeclarator::Bare,
+            }],
+            variadic: false,
+        };
+        let d = declarator(
+            vec![],
+            DirectDeclarator::Function(Box::new(DirectDeclarator::Paren(Box::new(inner))), params),
+        );
+        assert_eq!(function_signature(Type::Void, &d), None);
     }
 }

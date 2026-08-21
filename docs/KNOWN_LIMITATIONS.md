@@ -278,6 +278,84 @@ declarations and struct members have real `Type`s, `Expr::Member` and plain
 `Expr::Ident` variable/parameter lookups can return them instead of `Unknown`, closing
 most of this gap without any further change to Step 2's own logic.
 
+**Update**: Step 3 is now implemented -- see the next entry. It closed the gap this
+entry predicted, though not "for free": `MacroTyper` itself is unchanged (still
+`Unknown` on a struct-member macro argument in isolation), because Step 3 doesn't
+reuse it -- see the next entry's note on why.
+
+---
+
+## Typechecker Step 3 (type checking): 93.1% of all expressions get a type; 0 assignment/call-argument incompatibilities found after fixing a real normalization bug
+
+**Where**: `transpiler/src/typecheck/declared_types.rs`, `transpiler/src/typecheck/check.rs`,
+`transpiler/src/typecheck/types.rs`.
+
+Step 3 is "Step 0, but for full types": `declared_types.rs`'s `DeclaredTypesResolver`
+mirrors `ExportResolver`'s exact recursive, cycle-guarded, `#include`-union shape, but
+extracts a real `Type`/`FunctionSignature` per declaration (typedef, function,
+variable, struct/union field) instead of a coarse `SymbolKind`. `check.rs`'s `Checker`
+then walks a translation unit exactly like Step 1's `Resolver` (same scopes, same
+declaration/statement/expression shapes) computing a `Type` for every expression, and
+flags every declaration-initializer/`=`/call-argument site whose value type isn't
+`types::is_assignment_compatible` with its target.
+
+**Doesn't delegate macro typing to `MacroTyper`**: a macro's arguments at a real call
+site can reference the calling function's locals and struct fields (`SHORT(mobj->x)`),
+which `MacroTyper`'s own `type_of_expr` has no access to -- so `check.rs` reimplements
+the same small substitute-then-type dance directly against its own richer
+`type_of_expr`, rather than trying to inject Step 3's context into Step 2's
+self-contained struct. This is what actually closed the previous entry's gap (verified:
+`SHORT(mobj->x)` now types as `Int`, not `Unknown`, whenever `mobj_t`'s field layout is
+in scope).
+
+**A real bug, caught by measurement, not a design gap**: the first version of this
+step normalized *nothing* before comparing types -- `Type::Named("fixed_t")` (an
+unresolved typedef reference) was compared directly against `Type::Int`, and since
+they're structurally different, every `fixed_t x = <int-typed-expr>;` in the corpus
+(the single most common declaration shape in `linuxdoom-1.10`) came back "incompatible".
+The corpus run reported 1310 diagnostics, dominated by `Named("fixed_t") <- Int` (137
+assignments + 99 call-arguments) and `Named("boolean") <- Int` (266) alone -- not a
+subtle long tail, an obviously-wrong headline number, exactly the kind of result this
+project's "measure before trusting" methodology exists to catch. Root cause:
+`DeclaredTypes::resolve_typedef` (added to do exactly this unwrapping) was never
+actually called at any of the three comparison sites. Fixed by adding
+`DeclaredTypes::normalize` (recurses through `Pointer`/`Array`/`Function` too, unlike
+`resolve_typedef` alone -- needed for e.g. `Pointer(Named("mobj_t"))` vs.
+`Pointer(Struct("mobj_s"))`, two spellings of the same type once `mobj_t`'s chain is
+followed) and calling it on both sides at every check site. Diagnostics dropped
+1310 -> 92.
+
+**The remaining 92 were real modeling gaps, also fixed**: `Pointer(Unknown)` (address
+of an untyped struct member) was being compared structurally against a known pointer
+type and flagged, even though "unknown" isn't "confirmed different" -- fixed by
+`is_assignment_compatible` withholding judgment (`contains_unknown`) when `Unknown`
+appears anywhere inside either type, not just at the top level. A bare function value
+passed where a function pointer (or `void*`) was expected was flagged too, missing
+that a function decays to a pointer to itself the same way an array decays to a
+pointer to its element -- both are core to Doom's action-pointer idiom (see this
+doc's "Doom Idioms" section in `docs/02_TYPECHECKER.md`) and are now allowed
+explicitly. After both fixes: **0 diagnostics** across the corpus.
+
+**Measured**: across the 62-file corpus, 94301 expressions were typed; 6508 (6.9%)
+came back `Unknown` (up from Step 2's 9% *macro-reference-only* gap -- this number
+covers *every* expression, a much larger surface, and still resolves more of it).
+0 assignment/call-argument compatibility diagnostics were found. That's a real,
+positive result, not a placeholder: the two unit tests that construct a genuine
+mismatch by hand (`test_pointer_to_unrelated_pointer_assignment_is_flagged`,
+`test_call_argument_mismatch_is_flagged`) still correctly flag it, so the checker
+isn't vacuous -- `linuxdoom-1.10` (once typedefs, function decay, and `void*`
+looseness are modeled the way a real compiler treats them) simply doesn't trip the
+approximated C89 rules this step checks.
+
+**Scope note**: like Step 0, `declared_types.rs` only scans *top-level* declarations
+(Step 6a's `skip_bodies`, non-recursive `scan_decl_specifiers`) -- a struct defined
+inline inside another struct's field list isn't captured. Not yet measured to matter.
+Aggregate (`{ ... }`) initializers are typed but not checked member-by-member (would
+need walking them in lockstep with the target's field/element types). Return-type
+compatibility (a `return` statement's value vs. the function's declared return type)
+isn't checked in this pass either -- not in Step 3's stated "assignment/cast/call-
+argument" list, so deliberately out of scope, not an oversight.
+
 ---
 
 ## Step 3's `#if` expression evaluator can't handle function-macro invocations, so some real system headers never resolve at all
