@@ -10,6 +10,10 @@ NULL checks/passing) to infer it here rather than guessing at codegen time.
 ---
 
 ## 🎯 Goals
+0. **Exported Declarations**: Generalize Step 6b's `#include`-as-import treatment
+   beyond typedef names to everything else a header exports -- function prototypes,
+   `extern`/global variables, struct/union/enum tags, and enum constants -- so later
+   steps see the same cross-header symbols a real compiler would.
 1. **Symbol Resolution**: Build lexical scopes and resolve all identifiers to their
    declarations (functions, global variables, local variables, struct/union members,
    enums).
@@ -34,7 +38,8 @@ NULL checks/passing) to infer it here rather than guessing at codegen time.
 
 ```mermaid
 flowchart TD
-    AST[C AST from Phase 1] --> Scope[1. Scope and Symbol Resolution]
+    AST[C AST from Phase 1] --> Export[0. Exported Declarations]
+    Export --> Scope[1. Scope and Symbol Resolution]
     Scope --> MacroType[2. Macro Typing]
     MacroType --> Typecheck[3. Type Checking and Promotion Resolution]
     Typecheck --> ArrayInf[4. Pointer-to-Array Parameter Inference]
@@ -47,6 +52,50 @@ flowchart TD
 
 ## 🛠️ Step-by-Step Breakdown
 
+### Step 0: Exported Declarations
+* **Objective**: `#include` is treated as an import throughout this pipeline (see
+  `docs/01_PARSER.md` Step 6) -- a `.c` file's own parsed AST contains only its own
+  top-level items, never the textually-included contents of a header. Step 6b
+  (`transpiler/src/parser/imports.rs`) already generalizes this for *typedef names*:
+  a file's own top-level typedefs, unioned with everything transitively `#include`d.
+  Step 1's `SymbolTable` needs the same treatment for the rest of the ordinary
+  namespace (function prototypes/definitions, `extern`/top-level variables, enum
+  constants) and the tag namespace (`struct`/`union`/`enum` tags) -- without it, a
+  call to a function declared in another header, or a reference to a tag/enum defined
+  there, has nothing to resolve against. Step 1's own corpus measurement made the gap
+  concrete: only 3 of 62 `.c` translation units fully resolve today (see
+  `docs/KNOWN_LIMITATIONS.md`); everything else references at least one symbol
+  declared outside the file itself.
+* **Approach**:
+  - Mirrors Step 6b/4b/7's established pattern exactly: recursively union a file's own
+    top-level exported declarations with those of everything it transitively
+    `#include`s (local `"..."` and system `<...>`, resolved the same way -- searched
+    across the real system include directories, memoized, cycle-guarded, reusing
+    `system_headers.rs`) -- a fourth resolver shaped like the first three, not a new
+    design.
+  - Reuses Step 6a's "rough, top-level-only, skip function bodies" scanning approach:
+    a top-level declaration is never ambiguous at file scope (the same reasoning Step
+    6a already relies on for typedefs), so this needs no typedef table of its own to
+    do its job either.
+  - Collects *names and a coarse kind* only (function, variable, tag, enum constant),
+    not full types -- matching how Step 1 itself defers full `Type` computation to
+    Step 3. A symbol's actual type still isn't resolved until Step 3 needs it.
+* **Respects linkage, unlike typedef export**: a `static` top-level declaration has
+  internal linkage -- real C, but genuinely invisible to anything that merely
+  `#include`s the file it's declared in. Typedef *names* were never subject to this
+  distinction (a `typedef` is a compile-time alias, not a linked symbol), which is why
+  Step 6b never had to make it -- this step does: a `static` function or variable is
+  collected into the *defining* file's own export set (so that file still resolves its
+  own references to it) but is never unioned into whatever `#include`s that file.
+* **Validation Criteria**: Corpus re-measurement of Step 1's own "N of 62 files fully
+  resolve" metric, now seeded with this step's export sets. Not required to reach
+  62/62 in one pass -- implicit-`int`/K&R-style undeclared function calls, and libc
+  functions outside what Step 6b's system-header resolution reaches, are real,
+  separate wrinkles -- report the actual number for follow-up, matching this
+  project's "measure before assuming" methodology throughout.
+
+---
+
 ### Step 1: Symbol Resolution & Scope Tables
 * **Objective**: Build the scope structure every later step resolves identifiers
   against.
@@ -57,8 +106,9 @@ flowchart TD
   - Tag namespace for `struct`, `union`, and `enum` tags (separate from the ordinary
     identifier namespace, per C89).
 * **Key Considerations**:
-  - Reuse Step 6b's import graph (`transpiler/src/parser/imports.rs`) so a symbol
-    declared in an `#include`d header resolves the same way its typedefs already do.
+  - Seed the global scope from Step 0's exported-declaration set, the same way Step
+    6c seeds its typedef table from Step 6b's, so a symbol declared in an
+    `#include`d header resolves the same way its typedefs already do.
   - Function parameters get their own scope nested directly inside the function body's
     block scope, per C89 scoping rules.
 * **Validation Criteria**: Every identifier reference in every one of the 62 `.c`

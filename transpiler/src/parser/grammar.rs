@@ -139,6 +139,18 @@ pub fn parse_block_items_from_tokens(
     Ok(items)
 }
 
+/// Typechecker Step 0: like Step 6a, but keeps the full top-level
+/// `TranslationUnit` (function definitions with their bodies brace-skipped,
+/// declarations, struct/union/enum specifiers) instead of discarding
+/// everything but typedef names -- Step 0 needs every kind of top-level
+/// export, not just typedefs. Same rough/heuristic mode as Step 6a: no
+/// typedef table exists yet, and none is needed, since a bare leading
+/// identifier at file scope is never ambiguous (see module docs).
+pub fn extract_top_level_decls(stream: &CommentedStream) -> Vec<ExternalDecl> {
+    let mut parser = Parser::new(stream, TypedefCheck::Heuristic, true);
+    parser.run().map(|tu| tu.items).unwrap_or_default()
+}
+
 /// How the parser decides whether a bare identifier at a declaration-
 /// specifier position is a type name.
 enum TypedefCheck {
