@@ -69,6 +69,76 @@ pub fn extract_top_level_typedefs(stream: &CommentedStream) -> Vec<String> {
     parser.discovered_typedefs
 }
 
+/// Step 7: parses a raw token stream (already lexed, no comments/directives)
+/// as a single expression -- reusing this module's own expression grammar,
+/// seeded with `typedefs` for cast-vs-call disambiguation (e.g. `(fixed_t)(x)`).
+/// Fails if the tokens are empty or don't reduce to exactly one expression
+/// with nothing left over; see `docs/01_PARSER.md` Step 7.
+pub fn parse_expr_from_tokens(
+    tokens: Vec<Token>,
+    typedefs: HashSet<String>,
+) -> Result<Expr, ParseError> {
+    if tokens.is_empty() {
+        return Err(ParseError {
+            message: "empty token stream".to_string(),
+            near: String::new(),
+        });
+    }
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        typedef_check: TypedefCheck::Lookup(typedefs),
+        discovered_typedefs: Vec::new(),
+        skip_bodies: false,
+    };
+    let expr = parser.parse_expr()?;
+    if let Some(tok) = parser.peek() {
+        return Err(ParseError {
+            message: "unexpected trailing tokens after expression".to_string(),
+            near: tok.text.clone(),
+        });
+    }
+    Ok(expr)
+}
+
+/// Step 7: parses a raw token stream as a sequence of block items
+/// (declarations and/or statements, freely mixed, in any order -- exactly
+/// what's allowed inside a `{ ... }` body) rather than a single expression.
+/// For a macro body that reads like `parse_expr_from_tokens` failed on it
+/// because it's several statements, not one expression -- e.g.
+/// `(oc) = 0; if ((my) < 0) (oc) |= TOP; ...` -- this parses it the same
+/// way it would parse if pasted directly into a function body: repeated
+/// block items until the tokens run out. An empty token stream is *not*
+/// treated as zero items here (that's `MacroBody::Empty`'s case, checked
+/// before either of these entry points is reached).
+pub fn parse_block_items_from_tokens(
+    tokens: Vec<Token>,
+    typedefs: HashSet<String>,
+) -> Result<Vec<BlockItem>, ParseError> {
+    if tokens.is_empty() {
+        return Err(ParseError {
+            message: "empty token stream".to_string(),
+            near: String::new(),
+        });
+    }
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        typedef_check: TypedefCheck::Lookup(typedefs),
+        discovered_typedefs: Vec::new(),
+        skip_bodies: false,
+    };
+    let mut items = Vec::new();
+    while parser.peek().is_some() {
+        if parser.looks_like_decl_start() {
+            items.push(BlockItem::Decl(parser.parse_declaration()?));
+        } else {
+            items.push(BlockItem::Stmt(parser.parse_stmt()?));
+        }
+    }
+    Ok(items)
+}
+
 /// How the parser decides whether a bare identifier at a declaration-
 /// specifier position is a type name.
 enum TypedefCheck {
