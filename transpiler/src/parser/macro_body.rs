@@ -36,9 +36,18 @@ pub enum MacroBody {
         params: Vec<String>,
         body: Expr,
     },
-    /// Didn't reduce to a single expression (empty body, leftover tokens, or
-    /// a non-expression fragment) -- kept for provenance/diagnostics, not a
-    /// hard error. See `docs/KNOWN_LIMITATIONS.md`.
+    /// No replacement text at all (`#define FOO`, or `#define FOO(x)` with
+    /// nothing after the parameter list) -- a pure flag macro, meaningful
+    /// only to `#ifdef`/`defined()`, never substituted as a value. Kept
+    /// distinct from `Unparseable`: this isn't a body that failed to parse,
+    /// there's no body to parse in the first place.
+    Empty {
+        params: Option<Vec<String>>,
+    },
+    /// Had replacement text, but it didn't reduce to a single expression
+    /// (leftover tokens, or a non-expression fragment like a statement or a
+    /// bare type name) -- kept for provenance/diagnostics, not a hard
+    /// error. See `docs/KNOWN_LIMITATIONS.md`.
     Unparseable(String),
 }
 
@@ -126,6 +135,11 @@ fn parse_macro_body(
     body_text: &str,
     typedefs: &HashSet<String>,
 ) -> MacroBody {
+    if body_text.trim().is_empty() {
+        return MacroBody::Empty {
+            params: params.clone(),
+        };
+    }
     let Some(tokens) = lex_body_tokens(body_text).filter(|t| !t.is_empty()) else {
         return MacroBody::Unparseable(body_text.to_string());
     };
@@ -226,12 +240,28 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_body_is_unparseable() {
+    fn test_empty_body_is_empty_not_unparseable() {
         let typedefs = HashSet::new();
-        assert!(matches!(
+        assert_eq!(
             parse_macro_body(&None, "", &typedefs),
-            MacroBody::Unparseable(_)
-        ));
+            MacroBody::Empty { params: None }
+        );
+        assert_eq!(
+            parse_macro_body(&None, "   ", &typedefs),
+            MacroBody::Empty { params: None }
+        );
+    }
+
+    #[test]
+    fn test_empty_function_like_body_keeps_params() {
+        let typedefs = HashSet::new();
+        let params = Some(vec!["x".to_string()]);
+        assert_eq!(
+            parse_macro_body(&params, "", &typedefs),
+            MacroBody::Empty {
+                params: Some(vec!["x".to_string()])
+            }
+        );
     }
 
     #[test]
@@ -276,18 +306,20 @@ mod tests {
         assert!(files.len() > 50, "expected the full Doom .c corpus");
 
         let mut resolver = MacroBodyResolver::new();
-        let (mut objects, mut functions, mut unparseable) = (0, 0, 0);
+        let (mut objects, mut functions, mut empty, mut unparseable) = (0, 0, 0, 0);
         for path in &files {
             for body in resolver.resolve(path).values() {
                 match body {
                     MacroBody::Object(_) => objects += 1,
                     MacroBody::Function { .. } => functions += 1,
+                    MacroBody::Empty { .. } => empty += 1,
                     MacroBody::Unparseable(_) => unparseable += 1,
                 }
             }
         }
         eprintln!(
-            "macro body parsing over {} files: {objects} object, {functions} function, {unparseable} unparseable",
+            "macro body parsing over {} files: {objects} object, {functions} function, \
+             {empty} empty, {unparseable} unparseable",
             files.len()
         );
         assert!(
