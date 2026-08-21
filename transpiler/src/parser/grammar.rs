@@ -244,13 +244,18 @@ fn flex_to_abstract_direct(d: FlexDirect) -> Option<DirectAbstractDeclarator> {
     }
 }
 
-fn direct_declarator_name(d: &DirectDeclarator) -> Option<String> {
+pub(crate) fn direct_declarator_name(d: &DirectDeclarator) -> Option<String> {
     match d {
         DirectDeclarator::Ident(s) => Some(s.clone()),
         DirectDeclarator::Paren(inner) => direct_declarator_name(&inner.direct),
         DirectDeclarator::Array(inner, _) => direct_declarator_name(inner),
         DirectDeclarator::Function(inner, _) => direct_declarator_name(inner),
     }
+}
+
+/// The name a (non-abstract) declarator introduces, e.g. `x` in `int *x[3]`.
+pub(crate) fn declarator_name(d: &Declarator) -> Option<String> {
+    direct_declarator_name(&d.direct)
 }
 
 fn binop_info(kind: TokenKind) -> Option<(BinaryOp, u8)> {
