@@ -135,6 +135,9 @@ pub fn own_defined_symbols(items: &[ExternalDecl]) -> Vec<DefinedSymbol> {
 /// be a real duplicate-definition bug, not a mere forward declaration.
 pub struct RawDeclarationIndex {
     declared_in: HashMap<String, HashSet<String>>,
+    /// Reverse of `declared_in`: which names each file itself bare-declares
+    /// at its own top level, independent of who else also declares them.
+    by_file: HashMap<String, HashSet<String>>,
 }
 
 fn file_key(path: &Path) -> String {
@@ -148,6 +151,7 @@ impl RawDeclarationIndex {
     /// no full grammar parse needed just to read off top-level names.
     pub fn build(c_files: &[std::path::PathBuf]) -> Self {
         let mut declared_in: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut by_file: HashMap<String, HashSet<String>> = HashMap::new();
         for path in c_files {
             let Ok((_, resolved)) = parse(path.to_str().unwrap_or_default()) else {
                 continue;
@@ -161,13 +165,20 @@ impl RawDeclarationIndex {
                 if let ExternalDecl::Declaration(decl) = item {
                     for init_decl in &decl.declarators {
                         if let Some(name) = declarator_name(&init_decl.declarator) {
-                            declared_in.entry(name).or_default().insert(fname.clone());
+                            declared_in
+                                .entry(name.clone())
+                                .or_default()
+                                .insert(fname.clone());
+                            by_file.entry(fname.clone()).or_default().insert(name);
                         }
                     }
                 }
             }
         }
-        Self { declared_in }
+        Self {
+            declared_in,
+            by_file,
+        }
     }
 
     /// True if some `.c` file other than `defining_file` redeclares `name`
@@ -176,6 +187,14 @@ impl RawDeclarationIndex {
         self.declared_in
             .get(name)
             .is_some_and(|files| files.iter().any(|f| f != defining_file))
+    }
+
+    /// Names `file` (its bare filename, e.g. `"m_misc.c"`) itself
+    /// bare-redeclares at its own top level -- e.g. `m_misc.c`'s own
+    /// `extern int key_right;`, with no header on either end. Empty if
+    /// `file` declares nothing this way.
+    pub fn names_declared_by(&self, file: &str) -> HashSet<String> {
+        self.by_file.get(file).cloned().unwrap_or_default()
     }
 }
 
