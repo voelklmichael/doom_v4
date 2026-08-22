@@ -1,37 +1,34 @@
-//! Phase 3: Thinker Struct Field Translation
+//! Phase 3: Struct Field Translation
 //!
-//! Turns a `p_spec.h`-style thinker-subclass struct's C field list into
-//! its Rust equivalent, per `docs/03_TRANSPILER.md`'s Memory Model
-//! decisions: the embedded `thinker_t thinker;` header every such struct
-//! starts with is dropped entirely (arena identity -- the `enum Thinker`
-//! wrapper plus its `Handle<Thinker>` -- replaces its role: the C struct
-//! needed that header to be walkable as a node in `thinkercap`'s list and
-//! dispatchable via its `function` pointer; the Rust port gets both from
-//! the arena instead), and a `sector_t*` field becomes a `SectorId` (level
-//! geometry's plain index newtype, not an `Option` -- corpus-checked for
-//! the structs this step covers: `p_lights.c`'s tick functions dereference
-//! `flash->sector` unconditionally, and every spawn function sets it from
-//! a required, non-null parameter).
+//! Turns a C struct's field list into its Rust equivalent, field by field,
+//! failing loudly (`map_struct_fields` returns `Err`) on anything not yet
+//! recognized rather than guessing. Grown as real usage demanded it, never
+//! ahead of it -- started with the four simplest `p_spec.h` thinkers (a
+//! bare `int` and a single-level `sector_t*`), now covers every thinker
+//! subclass including `mobj_t`, and the core level-geometry structs
+//! (`vertex_t`/`side_t`/`subsector_t`/`seg_t`/`line_t` fully, `sector_t`
+//! up to its one dynamically-sized field). See `docs/03_TRANSPILER.md`'s
+//! Structs section for the current, up-to-date type-mapping summary
+//! (kept there rather than duplicated here, to avoid the two drifting
+//! apart as this module keeps growing).
 //!
-//! **Grown as real usage demands it, not ahead of it**: started mapping
-//! only a bare `int` field and a single-level `sector_t*` pointer (the
-//! four lighting-effect thinkers); now also `fixed_t` (-> `FixedT`),
-//! `boolean` (-> Rust's native `bool` -- Doom's state/animation code never
-//! does arithmetic on this *specific* enum the way it does on the
-//! animation-sequence ones, so the Enums decision's "plain `i32`, not a
-//! real enum" reasoning doesn't apply to it; see `enum_values.rs`'s own
-//! `false`/`true`-keyword-collision fix, which this mapping makes moot),
-//! `short` (-> `i16`), and any locally `typedef enum`'d name (-> `i32`,
-//! resolved generically via `collect_enum_typedef_names` rather than
-//! hardcoding each enum's name -- `plat_e`/`plattype_e`/`vldoor_e`/
-//! `ceiling_e`/`floor_e` are all defined directly in `p_spec.h` itself,
-//! reachable by the same scan that finds the structs). A field type still
-//! outside all of this fails loudly (`map_struct_fields` returns `Err`)
-//! rather than silently emitting something wrong -- e.g. `mobj_t`'s own
-//! fields (self-referential `mobj_s*`, `player_s*`, `state_t*`, ...) are
-//! well beyond this step's scope.
+//! Two mapping decisions are name-based, not type-based, and worth calling
+//! out specifically since nothing else in this module works that way:
+//! `specialdata: void*` (`sector_t`/`line_t`) is corpus-checked to always
+//! hold a `ceiling_t*`/`plat_t*`/`vldoor_t*`/`floormove_t*` back-reference
+//! -> `Option<Handle<Thinker>>`, and `backsector: sector_t*`
+//! (`line_t`/`seg_t`) is corpus-checked genuinely nullable (one-sided
+//! lines) unlike every other `sector_t*` field -> `Option<SectorId>`,
+//! while its sibling `frontsector` stays a bare `SectorId`. Both are
+//! deliberately scoped by field *name*, not by type alone -- a blanket
+//! rule keyed only on `void*` or `sector_t*` would be wrong for some
+//! other, unrelated field this step hasn't specifically checked.
 
-use crate::parser::ast::{DeclSpecifiers, ExternalDecl, FieldDecl, StorageClass, TypeSpecifier};
+use crate::codegen::enum_values::fold_const_int;
+use crate::parser::ast::{
+    DeclSpecifiers, Declarator, DirectDeclarator, ExternalDecl, FieldDecl, StorageClass,
+    TypeSpecifier,
+};
 use crate::parser::grammar::declarator_name;
 use std::collections::HashSet;
 
@@ -98,6 +95,15 @@ fn map_type(
             [TypeSpecifier::TypedefName(name)] if name == "mapthing_t" => {
                 Some("MapThing".to_string())
             }
+            // degenmobj_t (r_defs.h): embedded by value in
+            // sector_t.soundorg, a sound-origin point. Its own `thinker_t
+            // thinker;` field is dropped by `is_thinker_header` as usual
+            // (the header comment even calls it out itself: "not used for
+            // anything"); left with just x/y/z fixed_t, so it maps cleanly
+            // once its own name is known here.
+            [TypeSpecifier::TypedefName(name)] if name == "degenmobj_t" => {
+                Some("DegenMobj".to_string())
+            }
             [TypeSpecifier::TypedefName(name)] if enum_typedefs.contains(name) => {
                 Some("i32".to_string())
             }
@@ -162,6 +168,32 @@ fn map_type(
             {
                 Some("Option<PlayerId>".to_string())
             }
+            // `mobj_t*` (typedef form -- unlike mobj_t's own self-referential
+            // fields, which use the bare `struct mobj_s*` tag form since
+            // they're declared before their own typedef exists yet, a field
+            // in a *different*, later-parsed struct like `sector_t` sees
+            // the typedef name instead; same target type either way).
+            // Nullable: `sector_t.soundtarget`/`.thinglist` are legitimately
+            // empty (no sound target, no things in the sector).
+            [TypeSpecifier::TypedefName(name)] if name == "mobj_t" => {
+                Some("Option<Handle<Thinker>>".to_string())
+            }
+            [TypeSpecifier::TypedefName(name)] if name == "vertex_t" => {
+                Some("VertexId".to_string())
+            }
+            [TypeSpecifier::TypedefName(name)] if name == "side_t" => Some("SideId".to_string()),
+            // `line_t*` (typedef form, e.g. `seg_t.linedef`) and `struct
+            // line_s*` (tag form, e.g. `sector_t.frontsector`'s sibling
+            // fields use the tag directly since `line_t` itself is still
+            // being defined at that point in some headers) are the same
+            // type under two spellings, same reasoning as mobj_t/mobj_s
+            // above.
+            [TypeSpecifier::TypedefName(name)] if name == "line_t" => Some("LineId".to_string()),
+            [TypeSpecifier::Struct(spec)]
+                if spec.fields.is_none() && spec.name.as_deref() == Some("line_s") =>
+            {
+                Some("LineId".to_string())
+            }
             _ => None,
         };
     }
@@ -208,6 +240,34 @@ fn rust_field_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+/// The Rust type for a field's full declarator shape (pointer depth *and*
+/// array dimensions) over `specs`. Only a single array dimension is
+/// handled (`int blockbox[4];` -> `[i32; 4]`, `sector_t.blockbox`); a
+/// nested one (`fixed_t bbox[2][4];`, `node_t.bbox`) is left unmapped
+/// rather than guessed at the declarator-nesting order -- not yet needed
+/// by anything this step has translated. The array length is folded via
+/// `enum_values.rs`'s own `fold_const_int` (reused, not reimplemented --
+/// every array length in the corpus fields mapped so far is a bare
+/// integer literal, exactly the shape that folder already handles).
+fn map_field_type(
+    specs: &DeclSpecifiers,
+    declarator: &Declarator,
+    enum_typedefs: &HashSet<String>,
+) -> Option<String> {
+    let pointer_depth = declarator.pointer_quals.len();
+    match &declarator.direct {
+        DirectDeclarator::Ident(_) => map_type(specs, pointer_depth, enum_typedefs),
+        DirectDeclarator::Array(base, Some(size_expr))
+            if matches!(base.as_ref(), DirectDeclarator::Ident(_)) =>
+        {
+            let size = fold_const_int(size_expr)?;
+            let elem_type = map_type(specs, pointer_depth, enum_typedefs)?;
+            Some(format!("[{elem_type}; {size}]"))
+        }
+        _ => None,
+    }
+}
+
 /// Maps every field of a defining struct/union's field list to its Rust
 /// equivalent, in source order, dropping the `thinker_t` header field.
 /// `enum_typedefs` should come from `collect_enum_typedef_names`, scanned
@@ -233,8 +293,45 @@ pub fn map_struct_fields(
             let c_name = declarator_name(declarator)
                 .ok_or_else(|| "field declarator has no name".to_string())?;
             let name = rust_field_name(&c_name)?;
-            let pointer_depth = declarator.pointer_quals.len();
-            let rust_type = map_type(&field.specifiers, pointer_depth, enum_typedefs)
+            // `void* specialdata` (sector_t/line_t): always assigned a
+            // ceiling_t*/plat_t*/vldoor_t*/floormove_t* -- the "one active
+            // mover on this piece of geometry" back-reference, checked for
+            // truthiness before starting a new one and reset to NULL when
+            // done (p_ceilng.c/p_plats.c/p_floor.c). Special-cased by field
+            // *name*, not by `void*` in general -- a blanket `void* ->
+            // Option<Handle<Thinker>>` rule would be wrong for some other,
+            // unrelated `void*` field this step hasn't checked.
+            if c_name == "specialdata"
+                && declarator.pointer_quals.len() == 1
+                && matches!(
+                    field.specifiers.type_specifiers.as_slice(),
+                    [TypeSpecifier::Void]
+                )
+            {
+                out.push(MappedField {
+                    name,
+                    rust_type: "Option<Handle<Thinker>>".to_string(),
+                });
+                continue;
+            }
+            // `backsector: sector_t*` (`line_t`/`seg_t`) -- genuinely
+            // nullable, unlike every other `sector_t*` field mapped so far:
+            // `if (!ld->backsector)`/`if (!backsector)` (p_map.c, r_bsp.c,
+            // p_maputl.c) guard it explicitly for one-sided lines, while
+            // its sibling `frontsector` is dereferenced with no such guard
+            // anywhere in the corpus. Special-cased by field name, same
+            // reasoning as `specialdata` above -- the type alone
+            // (`sector_t*`) can't distinguish this from every other
+            // always-set `sector_t*` field this step has already mapped to
+            // a bare `SectorId`.
+            if c_name == "backsector" && declarator.pointer_quals.len() == 1 {
+                out.push(MappedField {
+                    name,
+                    rust_type: "Option<SectorId>".to_string(),
+                });
+                continue;
+            }
+            let rust_type = map_field_type(&field.specifiers, declarator, enum_typedefs)
                 .ok_or_else(|| format!("no type mapping yet for field `{c_name}`"))?;
             out.push(MappedField { name, rust_type });
         }
@@ -612,6 +709,185 @@ mod tests {
                 field("lastlook", "i32"),
                 field("spawnpoint", "MapThing"),
                 field("tracer", "Option<Handle<Thinker>>"),
+            ]
+        );
+    }
+
+    fn parse_r_defs() -> Vec<ExternalDecl> {
+        parse_rough("r_defs.h")
+    }
+
+    #[test]
+    fn test_maps_vertex_t_exactly() {
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "vertex_t").expect("vertex_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(mapped, vec![field("x", "FixedT"), field("y", "FixedT")]);
+    }
+
+    #[test]
+    fn test_maps_degenmobj_t_exactly() {
+        // Its own thinker_t header is dropped like any other, leaving just
+        // x/y/z -- see r_defs.h's own "not used for anything" comment.
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "degenmobj_t").expect("degenmobj_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("x", "FixedT"),
+                field("y", "FixedT"),
+                field("z", "FixedT")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_side_t_exactly() {
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "side_t").expect("side_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("textureoffset", "FixedT"),
+                field("rowoffset", "FixedT"),
+                field("toptexture", "i16"),
+                field("bottomtexture", "i16"),
+                field("midtexture", "i16"),
+                field("sector", "SectorId"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_subsector_t_exactly() {
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "subsector_t").expect("subsector_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("sector", "SectorId"),
+                field("numlines", "i16"),
+                field("firstline", "i16"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_seg_t_exactly() {
+        // Exercises VertexId/SideId/LineId, the newest ID types, all in
+        // one struct with no arrays or unmapped fields in the way.
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "seg_t").expect("seg_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("v1", "VertexId"),
+                field("v2", "VertexId"),
+                field("offset", "FixedT"),
+                field("angle", "u32"),
+                field("sidedef", "SideId"),
+                field("linedef", "LineId"),
+                field("frontsector", "SectorId"),
+                field("backsector", "Option<SectorId>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_line_t_completely() {
+        // line_t (struct line_s in r_defs.h) maps end to end -- exercises
+        // single-dimension array support (sidenum[2]/bbox[4]), a locally
+        // typedef'd enum (slopetype), the struct-tag/typedef dual spelling
+        // for cross-references (vertex_t*/sector_t*), and both name-based
+        // special cases (backsector nullable, specialdata -> the Thinker
+        // arena) in one struct.
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "line_t").expect("line_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("v1", "VertexId"),
+                field("v2", "VertexId"),
+                field("dx", "FixedT"),
+                field("dy", "FixedT"),
+                field("flags", "i16"),
+                field("special", "i16"),
+                field("tag", "i16"),
+                field("sidenum", "[i16; 2]"),
+                field("bbox", "[FixedT; 4]"),
+                field("slopetype", "i32"),
+                field("frontsector", "SectorId"),
+                field("backsector", "Option<SectorId>"),
+                field("validcount", "i32"),
+                field("specialdata", "Option<Handle<Thinker>>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sector_t_maps_up_to_its_sized_pointer_array() {
+        // sector_t exercises the same array/specialdata pieces as line_t,
+        // plus an embedded DegenMobj value and a nullable mobj_t*
+        // cross-reference into the Thinker arena (soundtarget/thinglist).
+        // Stops at `lines: struct line_s** lines;` -- a *dynamically*
+        // sized array (`// [linecount] size`, a separate C convention this
+        // step doesn't model at all: pointer-to-array-of-pointers, sized
+        // by a sibling field). That's a real design question (Vec<LineId>,
+        // most likely, populated at level-load time) rather than a type
+        // this step can just add a match arm for.
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "sector_t").expect("sector_t not found");
+        let result = map_struct_fields(fields, &enum_typedefs);
+        assert!(
+            result.is_err(),
+            "sector_t.lines is a dynamically-sized pointer array -- should still fail, not guess"
+        );
+
+        // But everything up to (and other than) `lines` maps: walk each
+        // field individually to show that's the *only* gap.
+        let mut mapped_names = Vec::new();
+        for f in fields {
+            if is_thinker_header(&f.specifiers) {
+                continue;
+            }
+            if map_struct_fields(std::slice::from_ref(f), &enum_typedefs).is_ok() {
+                for (d, _) in &f.declarators {
+                    if let Some(d) = d {
+                        mapped_names.push(declarator_name(d).unwrap());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mapped_names,
+            vec![
+                "floorheight",
+                "ceilingheight",
+                "floorpic",
+                "ceilingpic",
+                "lightlevel",
+                "special",
+                "tag",
+                "soundtraversed",
+                "soundtarget",
+                "blockbox",
+                "soundorg",
+                "validcount",
+                "thinglist",
+                "specialdata",
+                "linecount",
             ]
         );
     }

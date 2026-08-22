@@ -12,7 +12,9 @@ pub mod visibility;
 pub use enum_values::{compute_enum_values, fold_const_int, render_enum_consts};
 pub use mod_tree::render_mod_declarations;
 pub use modules::{Module, ModuleGraph, ModuleKind, build_module_graph};
-pub use runtime::{Arena, FixedT, Handle, PlayerId, SectorId, SubsectorId};
+pub use runtime::{
+    Arena, FixedT, Handle, LineId, PlayerId, SectorId, SideId, SubsectorId, VertexId,
+};
 pub use struct_fields::{MappedField, find_typedef_struct, map_struct_fields, render_struct};
 pub use thinkers::{render_thinker_dispatch_stub, render_thinker_enum, render_thinker_structs};
 pub use use_stmt::render_use_block;
