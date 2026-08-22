@@ -20,16 +20,61 @@
 //! `DeclaredTypesResolver`, `ImportResolver`, ...); reused here rather than
 //! reimplemented.
 //!
-//! **Deliberately not attempted here**: `.c`-to-`.c` module `use` edges
-//! (module A calling a function Step 0 found public in module B). Unlike
-//! header-only imports, that needs real identifier-usage resolution --
-//! which function bodies in A actually reference which cross-module
-//! symbol -- not just `#include`-graph reachability; a `.c` file doesn't
-//! `#include` another `.c` file's module at all in the C source, so there's
-//! no graph to walk here the way there is for headers. Left for a
-//! follow-up step.
+//! ## Step 2: exact-path imports for cross-module symbols
+//!
+//! The piece Step 1 deliberately left out: a `.c` file's module can only
+//! `pub use header_only_module::*;` for a header-only header -- everything
+//! such a header declares really is defined in that Rust module, so a glob
+//! is safe and mirrors C's own "an `#include` brings everything into scope,
+//! used or not" semantics. That safety doesn't extend to a header (of
+//! either kind) that merely `extern`-declares a function or global actually
+//! *defined* in some other `.c` file: `p_local.h` declares `P_TryMove`, but
+//! the item genuinely lives in the `p_map` module, not `p_local`'s -- no
+//! glob of `p_local` would ever bring it in, because `p_local`'s own module
+//! never contains it. Those names need an exact `use owner::name;` instead,
+//! pointed at wherever the symbol is actually defined.
+//!
+//! Unlike the header-only glob, this tier is *usage-pruned*, not
+//! "declared, not used": measured against the real corpus, "every name
+//! reachable through a file's transitive `#include` closure" is a much
+//! weaker filter than it sounds -- central headers like `doomstat.h`-style
+//! ones fan out to 24-53 of the 62 `.c` files, so `p_map.c` (player
+//! movement/collision) would otherwise pick up exact-path imports for
+//! symbols from `r_main`/`r_draw` (rendering) it never calls. A glob import
+//! is one line regardless of how much it covers, so "declared, not used"
+//! costs nothing there; a *list* of hundreds of mostly-dead exact-path
+//! imports is a real quality problem for generated code, so this tier
+//! keeps only what's actually referenced.
+//!
+//! Two pieces already in this codebase give exactly this, no new resolver
+//! needed: `resolve_module_visibility` (Step 0) gives, per `.c` file, the
+//! externally-linked symbols it *defines* and exposes -- corpus-wide,
+//! that's a `name -> defining module` map (`build_symbol_owner`, unique per
+//! C's one-definition rule for external linkage). And `typecheck::resolve`'s
+//! Step 1 symbol resolver, run *unseeded* (no header exports fed in), gives
+//! every identifier a file references that its own declarations don't
+//! explain -- locals, params, the file's own top-level decls, and enum
+//! constants/typedefs are all still resolved correctly by that walk, so
+//! nothing genuinely local or shadowed ever shows up here by construction.
+//! Intersecting that unresolved set against `symbol_owner`, and dropping
+//! misses (libc calls, unexpanded macros, anything no `.c` file defines),
+//! is exactly the cross-module edge this step needs.
+//!
+//! One pattern the resolver can't help with: `RawDeclarationIndex`'s bare
+//! top-level redeclaration with no header at all (e.g. `m_misc.c`'s own
+//! `extern int key_right;`, sourced from `g_game.c`). The resolver
+//! satisfies a reference to `key_right` *locally*, against that file's own
+//! redeclaration -- it would never show up as unresolved even when the
+//! file's code does call it. Since this pattern is narrow (`visibility.rs`
+//! measured just two corpus-wide symbols needing it), its mere existence is
+//! treated as need rather than chased for actual use -- matching that same
+//! module's own "not worth more machinery for a two-symbol gap" call.
 
+use crate::codegen::visibility::{RawDeclarationIndex, resolve_module_visibility};
+use crate::parser::parse_full;
 use crate::parser::system_headers::{read_resolved_chunks_and_includes, resolve_include_path};
+use crate::typecheck::exports::ExportResolver;
+use crate::typecheck::resolve::resolve_translation_unit;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -55,6 +100,12 @@ pub struct ModuleGraph {
     /// Source module name -> the header-only module names it needs to
     /// `use` items from.
     pub header_only_imports: HashMap<String, HashSet<String>>,
+    /// Source module name -> owning Source module name -> the exact symbol
+    /// names it needs a `use owner::name;` for (Step 2: a function/global
+    /// declared in some header this module includes, or bare-redeclared at
+    /// its own top level, but actually *defined* in a different `.c`
+    /// file's module -- never safe to reach via a header-only glob).
+    pub source_symbol_imports: HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
 fn module_name(path: &Path) -> String {
@@ -93,6 +144,79 @@ fn corpus_files(corpus_dir: &Path, ext: &str) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+/// Corpus-wide `name -> defining module` map: every externally-linked
+/// symbol any `.c` file's module exposes (Step 0's `resolve_module_visibility`
+/// public set), keyed by name. A name two different modules both define
+/// with external linkage would be a genuine one-definition-rule violation
+/// in the original C, not a case this pipeline needs to handle -- the first
+/// module found wins.
+fn build_symbol_owner(c_files: &[PathBuf]) -> HashMap<String, String> {
+    let mut exports = ExportResolver::new();
+    let raw_decls = RawDeclarationIndex::build(c_files);
+    let mut owner = HashMap::new();
+    for c in c_files {
+        let Some(vis) = resolve_module_visibility(c, &mut exports, &raw_decls) else {
+            continue;
+        };
+        let name = module_name(c);
+        for sym in vis.public {
+            owner.entry(sym.name).or_insert_with(|| name.clone());
+        }
+    }
+    owner
+}
+
+fn file_key(path: &Path) -> String {
+    path.file_name().unwrap().to_string_lossy().to_string()
+}
+
+fn record_import(
+    result: &mut HashMap<String, HashMap<String, HashSet<String>>>,
+    symbol_owner: &HashMap<String, String>,
+    own_name: &str,
+    name: &str,
+) {
+    let Some(owner) = symbol_owner.get(name) else {
+        return;
+    };
+    if owner != own_name {
+        result
+            .entry(own_name.to_string())
+            .or_default()
+            .entry(owner.clone())
+            .or_default()
+            .insert(name.to_string());
+    }
+}
+
+/// For every `.c` file, the exact-path imports it needs from other Source
+/// modules: identifiers Step 1's symbol resolver (run unseeded) can't
+/// explain from the file's own declarations, plus names it bare-redeclares
+/// at its own top level with no header at all, that resolve via
+/// `symbol_owner` to a *different* `.c` file's module.
+fn build_source_symbol_imports(
+    c_files: &[PathBuf],
+    symbol_owner: &HashMap<String, String>,
+) -> HashMap<String, HashMap<String, HashSet<String>>> {
+    let raw_decls = RawDeclarationIndex::build(c_files);
+    let mut result: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+
+    for c in c_files {
+        let own_name = module_name(c);
+        for name in raw_decls.names_declared_by(&file_key(c)) {
+            record_import(&mut result, symbol_owner, &own_name, &name);
+        }
+        let Ok((_, unit)) = parse_full(c.to_str().unwrap_or_default()) else {
+            continue;
+        };
+        let resolved = resolve_translation_unit(&unit);
+        for u in &resolved.unresolved {
+            record_import(&mut result, symbol_owner, &own_name, &u.name);
+        }
+    }
+    result
 }
 
 /// Builds the full module graph for every `.c`/`.h` file under
@@ -138,9 +262,13 @@ pub fn build_module_graph(corpus_dir: &Path) -> ModuleGraph {
         }
     }
 
+    let symbol_owner = build_symbol_owner(&c_files);
+    let source_symbol_imports = build_source_symbol_imports(&c_files, &symbol_owner);
+
     ModuleGraph {
         modules,
         header_only_imports,
+        source_symbol_imports,
     }
 }
 
@@ -204,6 +332,26 @@ mod tests {
     }
 
     #[test]
+    fn test_p_map_needs_exact_path_import_for_p_maputl_symbol() {
+        // p_map.c calls P_SetThingPosition, declared (only) via the shared
+        // p_local.h but actually defined in p_maputl.c -- p_local itself
+        // never defines it, so this must be an exact-path import pointed
+        // at p_maputl, not just a p_local glob.
+        let graph = build_module_graph(&corpus_dir());
+        let needed = graph
+            .source_symbol_imports
+            .get("p_map")
+            .expect("p_map.c should need at least one exact-path import");
+        let from_p_maputl = needed
+            .get("p_maputl")
+            .expect("p_map.c should need something from p_maputl");
+        assert!(
+            from_p_maputl.contains("P_SetThingPosition"),
+            "expected P_SetThingPosition among p_map's imports from p_maputl, got {from_p_maputl:?}"
+        );
+    }
+
+    #[test]
     fn test_corpus_module_graph_reports_coverage() {
         // Not a pass/fail assertion (matching this project's "measure,
         // don't assume" methodology) -- reports how many Source modules
@@ -235,5 +383,38 @@ mod tests {
             graph.header_only_imports.len(),
         );
         eprintln!("header-only modules by number of Source-module importers: {usage:?}");
+    }
+
+    #[test]
+    fn test_corpus_source_symbol_imports_reports_coverage() {
+        // Not a pass/fail assertion (same "measure, don't assume"
+        // methodology as the header-only coverage test) -- reports how
+        // many Source modules need at least one exact-path import from
+        // another Source module, and the total symbol count, so this can
+        // be cross-checked against docs/03_TRANSPILER.md going forward.
+        let graph = build_module_graph(&corpus_dir());
+        let modules_needing_imports = graph.source_symbol_imports.len();
+        let total_symbols: usize = graph
+            .source_symbol_imports
+            .values()
+            .flat_map(|owners| owners.values())
+            .map(|names| names.len())
+            .sum();
+        let total_edges: usize = graph
+            .source_symbol_imports
+            .values()
+            .map(|owners| owners.len())
+            .sum();
+        eprintln!(
+            "source-to-source exact-path imports: {modules_needing_imports} of {} Source \
+             modules need at least one, {total_edges} module-pair edges, \
+             {total_symbols} exact symbol imports total",
+            graph
+                .modules
+                .iter()
+                .filter(|m| m.kind == ModuleKind::Source)
+                .count(),
+        );
+        assert!(modules_needing_imports > 0);
     }
 }
