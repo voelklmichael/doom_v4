@@ -87,6 +87,17 @@ fn map_type(
             // angle_t is `typedef unsigned angle_t;` (tables.h) -- a plain
             // BAM-angle integer, not an enum.
             [TypeSpecifier::TypedefName(name)] if name == "angle_t" => Some("u32".to_string()),
+            // mapthing_t (doomdata.h) is a plain value struct (five `short`
+            // fields, no pointers -- see its own translation in this
+            // module's tests) embedded by value in mobj_t.spawnpoint, not
+            // referenced by pointer -- "MapThing" is this step's own
+            // translated name for it, same ad hoc naming as every other
+            // corpus struct this module renders (there's no automatic
+            // snake_case_t -> PascalCase converter yet; each caller has
+            // picked a name explicitly so far).
+            [TypeSpecifier::TypedefName(name)] if name == "mapthing_t" => {
+                Some("MapThing".to_string())
+            }
             [TypeSpecifier::TypedefName(name)] if enum_typedefs.contains(name) => {
                 Some("i32".to_string())
             }
@@ -138,6 +149,18 @@ fn map_type(
                 if spec.fields.is_none() && spec.name.as_deref() == Some("mobj_s") =>
             {
                 Some("Option<Handle<Thinker>>".to_string())
+            }
+            // `struct player_s*` -- `g_game.c`'s `player_t
+            // players[MAXPLAYERS];` is a plain, fixed-size, never-resized
+            // array (program lifetime, not per-level), so a plain
+            // `PlayerId` index (`runtime/player.rs`) like `SectorId`, no
+            // arena needed. Nullable: most mobjs (monsters, items,
+            // decorations) never have a player attached, only actual
+            // player pawns do.
+            [TypeSpecifier::Struct(spec)]
+                if spec.fields.is_none() && spec.name.as_deref() == Some("player_s") =>
+            {
+                Some("Option<PlayerId>".to_string())
             }
             _ => None,
         };
@@ -508,17 +531,39 @@ mod tests {
     }
 
     #[test]
-    fn test_mobj_t_maps_up_to_its_first_player_pointer() {
-        // mobj_t (p_mobj.h) is much larger than any p_spec.h thinker.
-        // mobjinfo_t*/state_t* now map to &'static references into
-        // mobjinfo[]/states[] (info.h) -- genuinely static, program-
-        // lifetime, read-only tables, a different pointer category from
-        // everything mapped before them. What's still unbuilt: a separate
-        // Player arena for `player: struct player_s*` (no design decided
-        // yet), and translating the embedded `mapthing_t spawnpoint` value
-        // struct. This measures -- and asserts -- exactly how far real
-        // mobj_t translation gets today: through `threshold` (the 28th
-        // field after dropping thinker_t), failing right at `player`.
+    fn test_maps_mapthing_t_exactly() {
+        // doomdata.h's mapthing_t: a plain value struct, five `short`
+        // fields, no pointers, not a thinker subclass at all (no embedded
+        // thinker_t header to drop) -- used as mobj_t.spawnpoint (by
+        // value) and as raw level-load data elsewhere.
+        let items = parse_rough("doomdata.h");
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "mapthing_t").expect("mapthing_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("x", "i16"),
+                field("y", "i16"),
+                field("angle", "i16"),
+                field("r#type", "i16"),
+                field("options", "i16"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mobj_t_maps_completely() {
+        // mobj_t (p_mobj.h), the 9th and by far largest thinker subclass,
+        // now maps end to end: mobjinfo_t*/state_t* as &'static references
+        // into mobjinfo[]/states[] (info.h) -- genuinely static, program-
+        // lifetime, read-only tables; `player: struct player_s*` as
+        // `Option<PlayerId>` (`g_game.c`'s `player_t players[MAXPLAYERS];`
+        // is a plain, fixed-size, never-resized array, program lifetime
+        // not per-level -- the same "no generation counter needed"
+        // reasoning as `SectorId`, so no separate arena turned out to be
+        // needed); `spawnpoint: mapthing_t` as the embedded `MapThing`
+        // value struct (`test_maps_mapthing_t_exactly`, above).
         //
         // spritenum_t/mobjtype_t are typedef'd enums in info.h, not
         // p_mobj.h itself -- collect_enum_typedef_names needs both files'
@@ -528,24 +573,10 @@ mod tests {
         items.extend(parse_rough("p_mobj.h"));
         let enum_typedefs = collect_enum_typedef_names(&items);
         let fields = find_typedef_struct(&items, "mobj_t").expect("mobj_t not found");
-
-        let mut out = Vec::new();
-        let mut first_failure = None;
-        for f in fields {
-            if is_thinker_header(&f.specifiers) {
-                continue;
-            }
-            match map_struct_fields(std::slice::from_ref(f), &enum_typedefs) {
-                Ok(mapped) => out.extend(mapped),
-                Err(e) => {
-                    first_failure = Some(e);
-                    break;
-                }
-            }
-        }
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("mobj_t should map cleanly");
 
         assert_eq!(
-            out,
+            mapped,
             vec![
                 field("x", "FixedT"),
                 field("y", "FixedT"),
@@ -577,12 +608,11 @@ mod tests {
                 field("target", "Option<Handle<Thinker>>"),
                 field("reactiontime", "i32"),
                 field("threshold", "i32"),
+                field("player", "Option<PlayerId>"),
+                field("lastlook", "i32"),
+                field("spawnpoint", "MapThing"),
+                field("tracer", "Option<Handle<Thinker>>"),
             ]
-        );
-        let err = first_failure.expect("player: struct player_s* should still be unmapped");
-        assert!(
-            err.contains("player"),
-            "expected the first failure to be at `player`, got: {err}"
         );
     }
 }
