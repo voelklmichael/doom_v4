@@ -1,13 +1,4 @@
-//! Phase 3 Rust Runtime Support
-//!
-//! Unlike the rest of `codegen/`, this isn't analysis over the corpus --
-//! it's literal Rust source that the transpiled crate will need alongside
-//! its generated modules (its own copy of this file, not something
-//! `ModuleGraph` has an entry for). Kept here, compiled and tested as part
-//! of this crate too, so its behavior is verified once rather than trusted
-//! by inspection wherever it eventually gets copied.
-//!
-//! ## `FixedT`: Doom's 16.16 fixed-point type
+//! `FixedT`: Doom's 16.16 fixed-point type
 //!
 //! Mirrors `m_fixed.c`/`m_fixed.h` exactly, including its two odd corners,
 //! rather than a "cleaner" reimplementation -- the whole point of a
