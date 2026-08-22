@@ -162,6 +162,38 @@ impl ExportResolver {
         self.resolve_inner(path, &mut visiting)
     }
 
+    /// `resolve`'s include-union half only -- what `path`'s `#include` graph
+    /// declares, deliberately *excluding* `path`'s own top-level
+    /// declarations. Phase 3's module-visibility step (`codegen::visibility`)
+    /// needs these kept apart: "what a `.c` file defines itself" and "what
+    /// some header (any header, not just the name-matching one) says about
+    /// it" are two different questions, and conflating them (as plain
+    /// `resolve` does, by design, for Step 1's symbol-resolution use case)
+    /// would make every self-defined symbol look header-declared.
+    pub fn resolve_via_includes(&mut self, path: &Path) -> ExportedDecls {
+        let mut result = ExportedDecls::default();
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut visiting = HashSet::new();
+        visiting.insert(key.clone());
+        if let Some((_, includes)) = read_resolved_chunks_and_includes(&key) {
+            let dir = key.parent().unwrap_or_else(|| Path::new("."));
+            for inc in includes {
+                if let Some(resolved_path) = resolve_include_path(&inc, dir) {
+                    let included = self.resolve_inner(&resolved_path, &mut visiting);
+                    for (name, sym) in included.symbols {
+                        if sym.storage != Some(StorageClass::Static) {
+                            result.symbols.entry(name).or_insert(sym);
+                        }
+                    }
+                    for (name, tag) in included.tags {
+                        result.tags.entry(name).or_insert(tag);
+                    }
+                }
+            }
+        }
+        result
+    }
+
     fn resolve_inner(&mut self, path: &Path, visiting: &mut HashSet<PathBuf>) -> ExportedDecls {
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if let Some(cached) = self.cache.get(&key) {
@@ -273,6 +305,27 @@ mod tests {
             Some(Some(StorageClass::Static))
         );
         assert!(exported.symbols.contains_key("used"));
+    }
+
+    #[test]
+    fn test_resolve_via_includes_excludes_own_top_level_but_includes_headers() {
+        // am_map.c's own top-level `static int cheating` must not surface --
+        // resolve_via_includes only reports what am_map.c's #include graph
+        // itself declares. `automapactive` (extern in doomstat.h, one hop
+        // away) and `AM_Stop` (a prototype in am_map.c's own matching
+        // am_map.h, still just one of the files am_map.c includes) both
+        // must, since both really are declared by a header am_map.c
+        // includes.
+        let mut resolver = ExportResolver::new();
+        let via_includes = resolver.resolve_via_includes(&corpus_dir().join("am_map.c"));
+        assert!(!via_includes.symbols.contains_key("cheating"));
+        assert!(via_includes.symbols.contains_key("automapactive"));
+        assert!(via_includes.symbols.contains_key("AM_Stop"));
+
+        // Plain resolve(), by contrast, does include am_map.c's own top
+        // level -- that's the whole point of the distinction.
+        let full = resolver.resolve(&corpus_dir().join("am_map.c"));
+        assert!(full.symbols.contains_key("cheating"));
     }
 
     #[test]
