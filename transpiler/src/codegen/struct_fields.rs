@@ -79,6 +79,7 @@ fn map_type(
         return match specs.type_specifiers.as_slice() {
             [TypeSpecifier::Int] => Some("i32".to_string()),
             [TypeSpecifier::Short] => Some("i16".to_string()),
+            [TypeSpecifier::Unsigned, TypeSpecifier::Short] => Some("u16".to_string()),
             [TypeSpecifier::TypedefName(name)] if name == "fixed_t" => Some("FixedT".to_string()),
             [TypeSpecifier::TypedefName(name)] if name == "boolean" => Some("bool".to_string()),
             // angle_t is `typedef unsigned angle_t;` (tables.h) -- a plain
@@ -240,32 +241,42 @@ fn rust_field_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+/// Wraps `elem` in `[elem; N]` for `d`'s array dimensions, any number of
+/// them (`node_t.bbox`'s `fixed_t bbox[2][4];` needs two). The parser's
+/// declarator AST for `a[2][4]` is `Array(base=Array(base=Ident(a),
+/// size=2), size=4)` -- the *outermost* AST node holds the *last*-written
+/// bracket (`[4]`), which is C's fastest-varying, innermost dimension
+/// (`a[2][4]` is "2 rows of 4", i.e. `[[T;4];2]` in Rust, not `[[T;2];4]`
+/// -- confirmed against the parser's real output, not assumed, since
+/// getting this backwards would silently transpose every 2D array's
+/// dimensions). So each AST level's own size must wrap `elem` *before*
+/// recursing into its base, not after -- the size closest to the AST root
+/// ends up closest to the element type in the finished Rust type, exactly
+/// mirroring the C reading (rightmost bracket = innermost dimension).
+/// Every array length in the corpus fields mapped so far is a bare integer
+/// literal, so `enum_values.rs`'s own `fold_const_int` (reused, not
+/// reimplemented) is all the evaluation this needs.
+fn wrap_arrays(d: &DirectDeclarator, elem: &str) -> Option<String> {
+    match d {
+        DirectDeclarator::Ident(_) => Some(elem.to_string()),
+        DirectDeclarator::Array(base, Some(size_expr)) => {
+            let size = fold_const_int(size_expr)?;
+            wrap_arrays(base, &format!("[{elem}; {size}]"))
+        }
+        _ => None,
+    }
+}
+
 /// The Rust type for a field's full declarator shape (pointer depth *and*
-/// array dimensions) over `specs`. Only a single array dimension is
-/// handled (`int blockbox[4];` -> `[i32; 4]`, `sector_t.blockbox`); a
-/// nested one (`fixed_t bbox[2][4];`, `node_t.bbox`) is left unmapped
-/// rather than guessed at the declarator-nesting order -- not yet needed
-/// by anything this step has translated. The array length is folded via
-/// `enum_values.rs`'s own `fold_const_int` (reused, not reimplemented --
-/// every array length in the corpus fields mapped so far is a bare
-/// integer literal, exactly the shape that folder already handles).
+/// any array dimensions) over `specs`.
 fn map_field_type(
     specs: &DeclSpecifiers,
     declarator: &Declarator,
     enum_typedefs: &HashSet<String>,
 ) -> Option<String> {
     let pointer_depth = declarator.pointer_quals.len();
-    match &declarator.direct {
-        DirectDeclarator::Ident(_) => map_type(specs, pointer_depth, enum_typedefs),
-        DirectDeclarator::Array(base, Some(size_expr))
-            if matches!(base.as_ref(), DirectDeclarator::Ident(_)) =>
-        {
-            let size = fold_const_int(size_expr)?;
-            let elem_type = map_type(specs, pointer_depth, enum_typedefs)?;
-            Some(format!("[{elem_type}; {size}]"))
-        }
-        _ => None,
-    }
+    let elem_type = map_type(specs, pointer_depth, enum_typedefs)?;
+    wrap_arrays(&declarator.direct, &elem_type)
 }
 
 /// Maps every field of a defining struct/union's field list to its Rust
@@ -328,6 +339,36 @@ pub fn map_struct_fields(
                 out.push(MappedField {
                     name,
                     rust_type: "Option<SectorId>".to_string(),
+                });
+                continue;
+            }
+            // `lines: struct line_s** lines;` (`sector_t`) -- the comment
+            // right there in `r_defs.h` ("// [linecount] size") names the
+            // C idiom: a pointer to a heap-allocated array of pointers,
+            // sized by the sibling `linecount` field, not by any fixed
+            // dimension a declarator carries (unlike `blockbox`/`bbox`'s
+            // real fixed-size arrays, handled generically by
+            // `map_field_type` already). `Vec<LineId>` is the standard,
+            // uncontroversial Rust translation for that pattern -- `lines`
+            // is the only field in the corpus struct list mapped so far
+            // shaped this way, so special-cased by name rather than a
+            // general "any T** -> Vec<TId>" rule that hasn't been checked
+            // against other double-pointer fields. `linecount` itself is
+            // kept as its own field regardless (redundant with
+            // `lines.len()` once `lines` is a real `Vec`, same "preserve
+            // the original's struct shape 1:1" call already made for
+            // `mobj_t.info`'s redundancy with `.type`).
+            if c_name == "lines"
+                && declarator.pointer_quals.len() == 2
+                && matches!(
+                    field.specifiers.type_specifiers.as_slice(),
+                    [TypeSpecifier::Struct(spec)]
+                        if spec.fields.is_none() && spec.name.as_deref() == Some("line_s")
+                )
+            {
+                out.push(MappedField {
+                    name,
+                    rust_type: "Vec<LineId>".to_string(),
                 });
                 continue;
             }
@@ -836,58 +877,82 @@ mod tests {
     }
 
     #[test]
-    fn test_sector_t_maps_up_to_its_sized_pointer_array() {
+    fn test_maps_sector_t_completely() {
         // sector_t exercises the same array/specialdata pieces as line_t,
-        // plus an embedded DegenMobj value and a nullable mobj_t*
-        // cross-reference into the Thinker arena (soundtarget/thinglist).
-        // Stops at `lines: struct line_s** lines;` -- a *dynamically*
-        // sized array (`// [linecount] size`, a separate C convention this
-        // step doesn't model at all: pointer-to-array-of-pointers, sized
-        // by a sibling field). That's a real design question (Vec<LineId>,
-        // most likely, populated at level-load time) rather than a type
-        // this step can just add a match arm for.
+        // plus an embedded DegenMobj value, a nullable mobj_t*
+        // cross-reference into the Thinker arena (soundtarget/thinglist),
+        // and its own dynamically-sized `lines: struct line_s** lines;`
+        // (`// [linecount] size` in r_defs.h -- a pointer to a
+        // heap-allocated array of pointers, sized by the sibling
+        // `linecount` field, not by any fixed declarator dimension) ->
+        // `Vec<LineId>`, the standard translation for that C idiom.
+        // `linecount` itself is kept as its own field regardless --
+        // redundant with `lines.len()` once `lines` is a real `Vec`, same
+        // "preserve the original's struct shape 1:1" call already made for
+        // `mobj_t.info`'s redundancy with `.type`.
         let items = parse_r_defs();
         let enum_typedefs = collect_enum_typedef_names(&items);
         let fields = find_typedef_struct(&items, "sector_t").expect("sector_t not found");
-        let result = map_struct_fields(fields, &enum_typedefs);
-        assert!(
-            result.is_err(),
-            "sector_t.lines is a dynamically-sized pointer array -- should still fail, not guess"
-        );
-
-        // But everything up to (and other than) `lines` maps: walk each
-        // field individually to show that's the *only* gap.
-        let mut mapped_names = Vec::new();
-        for f in fields {
-            if is_thinker_header(&f.specifiers) {
-                continue;
-            }
-            if map_struct_fields(std::slice::from_ref(f), &enum_typedefs).is_ok() {
-                for (d, _) in &f.declarators {
-                    if let Some(d) = d {
-                        mapped_names.push(declarator_name(d).unwrap());
-                    }
-                }
-            }
-        }
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
         assert_eq!(
-            mapped_names,
+            mapped,
             vec![
-                "floorheight",
-                "ceilingheight",
-                "floorpic",
-                "ceilingpic",
-                "lightlevel",
-                "special",
-                "tag",
-                "soundtraversed",
-                "soundtarget",
-                "blockbox",
-                "soundorg",
-                "validcount",
-                "thinglist",
-                "specialdata",
-                "linecount",
+                field("floorheight", "FixedT"),
+                field("ceilingheight", "FixedT"),
+                field("floorpic", "i16"),
+                field("ceilingpic", "i16"),
+                field("lightlevel", "i16"),
+                field("special", "i16"),
+                field("tag", "i16"),
+                field("soundtraversed", "i32"),
+                field("soundtarget", "Option<Handle<Thinker>>"),
+                field("blockbox", "[i32; 4]"),
+                field("soundorg", "DegenMobj"),
+                field("validcount", "i32"),
+                field("thinglist", "Option<Handle<Thinker>>"),
+                field("specialdata", "Option<Handle<Thinker>>"),
+                field("linecount", "i32"),
+                field("lines", "Vec<LineId>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nested_array_dimension_order() {
+        // `fixed_t bbox[2][4];` -- 2 rows of 4, not 4 rows of 2. Locked in
+        // directly against the parser's real AST shape (see
+        // `wrap_arrays`'s own docs), not just exercised incidentally via
+        // node_t below.
+        let items = parse_items("struct { fixed_t bbox[2][4]; };");
+        let ExternalDecl::Declaration(decl) = &items[0] else {
+            panic!("expected a Declaration");
+        };
+        let TypeSpecifier::Struct(spec) = &decl.specifiers.type_specifiers[0] else {
+            panic!("expected a Struct specifier");
+        };
+        let fields = spec.fields.as_ref().unwrap();
+        let mapped = map_struct_fields(fields, &HashSet::new()).expect("should map cleanly");
+        assert_eq!(mapped, vec![field("bbox", "[[FixedT; 4]; 2]")]);
+    }
+
+    #[test]
+    fn test_maps_node_t_exactly() {
+        // node_t (r_defs.h): exercises the nested-array fix (bbox[2][4])
+        // and `unsigned short` (children[2] -> [u16; 2]), the last two
+        // gaps in this cluster.
+        let items = parse_r_defs();
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "node_t").expect("node_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("x", "FixedT"),
+                field("y", "FixedT"),
+                field("dx", "FixedT"),
+                field("dy", "FixedT"),
+                field("bbox", "[[FixedT; 4]; 2]"),
+                field("children", "[u16; 2]"),
             ]
         );
     }
