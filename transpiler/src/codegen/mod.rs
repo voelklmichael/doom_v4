@@ -10,7 +10,7 @@ pub mod visibility;
 pub use enum_values::{compute_enum_values, fold_const_int, render_enum_consts};
 pub use mod_tree::render_mod_declarations;
 pub use modules::{Module, ModuleGraph, ModuleKind, build_module_graph};
-pub use runtime::FixedT;
+pub use runtime::{Arena, FixedT, Handle};
 pub use use_stmt::render_use_block;
 pub use visibility::{
     DefinedSymbol, ModuleVisibility, RawDeclarationIndex, own_defined_symbols,
