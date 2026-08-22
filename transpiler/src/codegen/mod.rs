@@ -4,13 +4,15 @@ pub mod enum_values;
 pub mod mod_tree;
 pub mod modules;
 pub mod runtime;
+pub mod struct_fields;
 pub mod use_stmt;
 pub mod visibility;
 
 pub use enum_values::{compute_enum_values, fold_const_int, render_enum_consts};
 pub use mod_tree::render_mod_declarations;
 pub use modules::{Module, ModuleGraph, ModuleKind, build_module_graph};
-pub use runtime::{Arena, FixedT, Handle};
+pub use runtime::{Arena, FixedT, Handle, SectorId};
+pub use struct_fields::{MappedField, find_typedef_struct, map_struct_fields, render_struct};
 pub use use_stmt::render_use_block;
 pub use visibility::{
     DefinedSymbol, ModuleVisibility, RawDeclarationIndex, own_defined_symbols,
