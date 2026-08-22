@@ -19,6 +19,17 @@
 //! variants, one macro) not to pull in full macro substitution just for
 //! them, matching `visibility.rs`'s own "not worth more machinery for a
 //! two-symbol gap" precedent.
+//!
+//! **A second gap, found while starting to actually render struct fields
+//! against this module's output**: `doomtype.h`'s `typedef enum {false,
+//! true} boolean;` folds its two variants to `0`/`1` cleanly (no macro
+//! involved), but rendering them as `pub const false: i32 = 0;` doesn't
+//! parse -- `false`/`true` are Rust *strict* keywords, not usable as an
+//! identifier even via `r#raw` escaping. `render_enum_consts` now skips
+//! any variant whose name collides with one (corpus-wide, only this one
+//! enum's variants do); moot for `boolean` specifically anyway, once a
+//! `boolean`-typed field maps to Rust's own native `bool` rather than
+//! going through this module's `i32`-constant treatment at all.
 
 use crate::parser::ast::{BinaryOp, EnumSpec, Expr, UnaryOp};
 
@@ -110,14 +121,37 @@ pub fn compute_enum_values(spec: &EnumSpec) -> Vec<(String, Option<i64>)> {
     out
 }
 
+/// Rust strict keywords: never usable as an identifier, not even via
+/// `r#raw` escaping (unlike a contextual/reserved keyword). Corpus-wide,
+/// only one enum's variants collide with this list at all --
+/// `doomtype.h`'s `typedef enum {false, true} boolean;` -- and that whole
+/// enum's constants are moot anyway once a `boolean`-typed field maps to
+/// Rust's own native `bool` (its real `false`/`true` literals already
+/// exist as language builtins). Kept as a general check here, not a
+/// `boolean`-specific special case, as defense in depth for any other enum
+/// a future corpus revision might add.
+const RUST_STRICT_KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
+    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
+    "while", "dyn", "async", "await",
+];
+
 /// Renders `spec`'s variants as `pub const NAME: i32 = value;` lines, one
-/// per successfully-folded variant. An unfoldable variant is skipped, not
-/// panicked on -- never happens on the real corpus (see this module's
-/// docs), but the renderer shouldn't crash the whole run over it either.
+/// per successfully-folded, non-keyword-colliding variant. An unfoldable
+/// variant is skipped, not panicked on -- never happens on the real corpus
+/// (see this module's docs), but the renderer shouldn't crash the whole
+/// run over it either; same for a variant whose name collides with a Rust
+/// keyword (`pub const false: i32 = 0;` doesn't parse).
 pub fn render_enum_consts(spec: &EnumSpec) -> String {
     compute_enum_values(spec)
         .into_iter()
-        .filter_map(|(name, value)| value.map(|v| format!("pub const {name}: i32 = {v};")))
+        .filter_map(|(name, value)| {
+            if RUST_STRICT_KEYWORDS.contains(&name.as_str()) {
+                return None;
+            }
+            value.map(|v| format!("pub const {name}: i32 = {v};"))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -209,6 +243,26 @@ mod tests {
         assert_eq!(
             render_enum_consts(&spec),
             "pub const A: i32 = 0;\npub const B: i32 = 5;"
+        );
+    }
+
+    #[test]
+    fn test_render_skips_rust_keyword_colliding_variants() {
+        // doomtype.h's real shape: typedef enum {false, true} boolean;
+        let spec = parse_enum("enum { false, true }");
+        assert_eq!(
+            render_enum_consts(&spec),
+            "",
+            "false/true can't be Rust identifiers, even escaped"
+        );
+    }
+
+    #[test]
+    fn test_render_skips_only_the_colliding_variant_not_its_siblings() {
+        let spec = parse_enum("enum { A, false, B }");
+        assert_eq!(
+            render_enum_consts(&spec),
+            "pub const A: i32 = 0;\npub const B: i32 = 2;"
         );
     }
 
