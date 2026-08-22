@@ -98,6 +98,23 @@ fn map_type(
             [TypeSpecifier::TypedefName(name)] if name == "sector_t" => {
                 Some("SectorId".to_string())
             }
+            // mobjinfo_t*/state_t* point into mobjinfo[]/states[] (info.h):
+            // static, program-lifetime, read-only tables -- never freed or
+            // per-level, unlike everything else mapped so far, so a real
+            // `&'static` reference is simpler and more idiomatic than an
+            // index newtype once those tables exist as translated Rust
+            // statics (a separate, large undertaking -- translating
+            // info.c's data -- not started by this). `info` is observably
+            // redundant with `type` corpus-wide (always `&mobjinfo[type]`,
+            // `p_mobj.c`/`p_saveg.c`), but kept as its own field for now --
+            // preserving the original's struct shape 1:1 rather than
+            // silently restructuring it away.
+            [TypeSpecifier::TypedefName(name)] if name == "mobjinfo_t" => {
+                Some("&'static MobjInfo".to_string())
+            }
+            [TypeSpecifier::TypedefName(name)] if name == "state_t" => {
+                Some("&'static State".to_string())
+            }
             // `struct subsector_s*` (a forward reference -- `fields: None`,
             // since it's never redefined at the point of use): subsectors
             // are level geometry, same "bulk-allocated once per level,
@@ -491,18 +508,17 @@ mod tests {
     }
 
     #[test]
-    fn test_mobj_t_maps_up_to_its_first_static_table_pointer() {
-        // mobj_t (p_mobj.h) is much larger than any p_spec.h thinker and
-        // depends on infrastructure this step hasn't built yet: a static
-        // read-only table reference for `info: mobjinfo_t*`/`state:
-        // state_t*` (mobjinfo[]/states[] in info.h, never freed, not
-        // per-level or arena-managed -- a genuinely different pointer
-        // category from anything mapped so far), a separate Player arena
-        // for `player: struct player_s*`, and translating the embedded
-        // `mapthing_t spawnpoint` value struct. None of that is built, so
-        // this measures -- and asserts -- exactly how far real mobj_t
-        // translation gets today: through `type` (mobjtype_t, the 11th
-        // field after dropping thinker_t), failing right at `info`.
+    fn test_mobj_t_maps_up_to_its_first_player_pointer() {
+        // mobj_t (p_mobj.h) is much larger than any p_spec.h thinker.
+        // mobjinfo_t*/state_t* now map to &'static references into
+        // mobjinfo[]/states[] (info.h) -- genuinely static, program-
+        // lifetime, read-only tables, a different pointer category from
+        // everything mapped before them. What's still unbuilt: a separate
+        // Player arena for `player: struct player_s*` (no design decided
+        // yet), and translating the embedded `mapthing_t spawnpoint` value
+        // struct. This measures -- and asserts -- exactly how far real
+        // mobj_t translation gets today: through `threshold` (the 28th
+        // field after dropping thinker_t), failing right at `player`.
         //
         // spritenum_t/mobjtype_t are typedef'd enums in info.h, not
         // p_mobj.h itself -- collect_enum_typedef_names needs both files'
@@ -551,12 +567,22 @@ mod tests {
                 field("momz", "FixedT"),
                 field("validcount", "i32"),
                 field("r#type", "i32"),
+                field("info", "&'static MobjInfo"),
+                field("tics", "i32"),
+                field("state", "&'static State"),
+                field("flags", "i32"),
+                field("health", "i32"),
+                field("movedir", "i32"),
+                field("movecount", "i32"),
+                field("target", "Option<Handle<Thinker>>"),
+                field("reactiontime", "i32"),
+                field("threshold", "i32"),
             ]
         );
-        let err = first_failure.expect("info: mobjinfo_t* should still be unmapped");
+        let err = first_failure.expect("player: struct player_s* should still be unmapped");
         assert!(
-            err.contains("info"),
-            "expected the first failure to be at `info`, got: {err}"
+            err.contains("player"),
+            "expected the first failure to be at `player`, got: {err}"
         );
     }
 }
