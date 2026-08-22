@@ -3,11 +3,23 @@
 //! level and never individually resized or freed mid-level, so a plain
 //! index is enough -- no generation counter, unlike `Arena<T>`'s handles.
 //!
-//! Only `SectorId` exists so far, since it's the only one any translated
-//! struct references yet (the four `p_spec.h` lighting-effect thinkers).
-//! More (`LineId`, `SideId`, `VertexId`, ...) get added the same way, as
-//! real translated fields actually need them -- not spun up speculatively
-//! ahead of that.
+//! `SectorId`/`SubsectorId` (`p_spec.h`'s lighting-effect thinkers,
+//! `mobj_t.subsector`) and `VertexId`/`SideId`/`LineId` (`r_defs.h`'s
+//! `vertex_t`/`side_t`/`line_t`, cross-referenced from `seg_t`/`sector_t`)
+//! exist so far. More types get added the same way, as real translated
+//! fields actually need them, not spun up speculatively ahead of that.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SectorId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubsectorId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VertexId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SideId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LineId(pub u32);

@@ -10,7 +10,9 @@
 pub mod arena;
 pub mod fixed;
 pub mod geometry;
+pub mod player;
 
 pub use arena::{Arena, Handle};
 pub use fixed::{FRACBITS, FRACUNIT, FixedT};
-pub use geometry::SectorId;
+pub use geometry::{LineId, SectorId, SideId, SubsectorId, VertexId};
+pub use player::PlayerId;
