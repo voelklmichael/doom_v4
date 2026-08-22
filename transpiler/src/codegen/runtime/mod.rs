@@ -13,4 +13,4 @@ pub mod geometry;
 
 pub use arena::{Arena, Handle};
 pub use fixed::{FRACBITS, FRACUNIT, FixedT};
-pub use geometry::SectorId;
+pub use geometry::{SectorId, SubsectorId};

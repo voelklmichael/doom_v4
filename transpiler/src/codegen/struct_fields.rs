@@ -84,6 +84,9 @@ fn map_type(
             [TypeSpecifier::Short] => Some("i16".to_string()),
             [TypeSpecifier::TypedefName(name)] if name == "fixed_t" => Some("FixedT".to_string()),
             [TypeSpecifier::TypedefName(name)] if name == "boolean" => Some("bool".to_string()),
+            // angle_t is `typedef unsigned angle_t;` (tables.h) -- a plain
+            // BAM-angle integer, not an enum.
+            [TypeSpecifier::TypedefName(name)] if name == "angle_t" => Some("u32".to_string()),
             [TypeSpecifier::TypedefName(name)] if enum_typedefs.contains(name) => {
                 Some("i32".to_string())
             }
@@ -94,6 +97,30 @@ fn map_type(
         return match specs.type_specifiers.as_slice() {
             [TypeSpecifier::TypedefName(name)] if name == "sector_t" => {
                 Some("SectorId".to_string())
+            }
+            // `struct subsector_s*` (a forward reference -- `fields: None`,
+            // since it's never redefined at the point of use): subsectors
+            // are level geometry, same "bulk-allocated once per level,
+            // never individually freed" reasoning as SectorId. Corpus-
+            // checked non-Option: P_SetThingPosition sets mobj_t.subsector
+            // unconditionally, and every read dereferences it without a
+            // null check (see runtime/geometry.rs's own docs).
+            [TypeSpecifier::Struct(spec)]
+                if spec.fields.is_none() && spec.name.as_deref() == Some("subsector_s") =>
+            {
+                Some("SubsectorId".to_string())
+            }
+            // `struct mobj_s*` -- self-referential (mobj_t's own snext/
+            // sprev/bnext/bprev/target/tracer). Once mobj_t becomes a
+            // variant of `enum Thinker`, one of these is a `Handle<Thinker>`
+            // -- genuinely nullable throughout (list-end sentinels for the
+            // sector/blockmap links, "no target/tracer yet" for the attack
+            // fields), unlike SectorId/SubsectorId's always-set corpus
+            // usage.
+            [TypeSpecifier::Struct(spec)]
+                if spec.fields.is_none() && spec.name.as_deref() == Some("mobj_s") =>
+            {
+                Some("Option<Handle<Thinker>>".to_string())
             }
             _ => None,
         };
@@ -243,17 +270,21 @@ mod tests {
     }
 
     /// The rough, typedef-table-free scan (see this module's own docs on
-    /// `find_typedef_struct`) -- `p_spec.h` can't go through `parse_full`
-    /// standalone (it relies on `boolean` being typedef'd by whichever
-    /// `.c` file includes it first, not by its own `#include` graph), and
-    /// even a `.c` file that does include it doesn't splice its struct
+    /// `find_typedef_struct`) -- these headers can't go through
+    /// `parse_full` standalone (they rely on typedefs seeded by whichever
+    /// `.c` file includes them first, not their own `#include` graph), and
+    /// even a `.c` file that does include one doesn't splice its struct
     /// *definitions* into that file's own `TranslationUnit.items`.
-    fn parse_p_spec() -> Vec<ExternalDecl> {
-        let path = corpus_dir().join("p_spec.h");
+    fn parse_rough(corpus_file: &str) -> Vec<ExternalDecl> {
+        let path = corpus_dir().join(corpus_file);
         let (_, resolved) = parse(path.to_str().unwrap()).unwrap();
         let entries = lex_chunks(&resolved).unwrap();
         let stream = attach_comments(entries);
         crate::parser::grammar::extract_top_level_decls(&stream)
+    }
+
+    fn parse_p_spec() -> Vec<ExternalDecl> {
+        parse_rough("p_spec.h")
     }
 
     /// Same rough-scan pipeline, over a literal snippet rather than a
@@ -457,5 +488,75 @@ mod tests {
         for kw in ["crate", "self", "super", "Self", "true", "false"] {
             assert!(rust_field_name(kw).is_err(), "{kw} should not be escapable");
         }
+    }
+
+    #[test]
+    fn test_mobj_t_maps_up_to_its_first_static_table_pointer() {
+        // mobj_t (p_mobj.h) is much larger than any p_spec.h thinker and
+        // depends on infrastructure this step hasn't built yet: a static
+        // read-only table reference for `info: mobjinfo_t*`/`state:
+        // state_t*` (mobjinfo[]/states[] in info.h, never freed, not
+        // per-level or arena-managed -- a genuinely different pointer
+        // category from anything mapped so far), a separate Player arena
+        // for `player: struct player_s*`, and translating the embedded
+        // `mapthing_t spawnpoint` value struct. None of that is built, so
+        // this measures -- and asserts -- exactly how far real mobj_t
+        // translation gets today: through `type` (mobjtype_t, the 11th
+        // field after dropping thinker_t), failing right at `info`.
+        //
+        // spritenum_t/mobjtype_t are typedef'd enums in info.h, not
+        // p_mobj.h itself -- collect_enum_typedef_names needs both files'
+        // items, mirroring how a real caller would eventually need to
+        // merge a struct's own #include closure, not just its own file.
+        let mut items = parse_rough("info.h");
+        items.extend(parse_rough("p_mobj.h"));
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "mobj_t").expect("mobj_t not found");
+
+        let mut out = Vec::new();
+        let mut first_failure = None;
+        for f in fields {
+            if is_thinker_header(&f.specifiers) {
+                continue;
+            }
+            match map_struct_fields(std::slice::from_ref(f), &enum_typedefs) {
+                Ok(mapped) => out.extend(mapped),
+                Err(e) => {
+                    first_failure = Some(e);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            out,
+            vec![
+                field("x", "FixedT"),
+                field("y", "FixedT"),
+                field("z", "FixedT"),
+                field("snext", "Option<Handle<Thinker>>"),
+                field("sprev", "Option<Handle<Thinker>>"),
+                field("angle", "u32"),
+                field("sprite", "i32"),
+                field("frame", "i32"),
+                field("bnext", "Option<Handle<Thinker>>"),
+                field("bprev", "Option<Handle<Thinker>>"),
+                field("subsector", "SubsectorId"),
+                field("floorz", "FixedT"),
+                field("ceilingz", "FixedT"),
+                field("radius", "FixedT"),
+                field("height", "FixedT"),
+                field("momx", "FixedT"),
+                field("momy", "FixedT"),
+                field("momz", "FixedT"),
+                field("validcount", "i32"),
+                field("r#type", "i32"),
+            ]
+        );
+        let err = first_failure.expect("info: mobjinfo_t* should still be unmapped");
+        assert!(
+            err.contains("info"),
+            "expected the first failure to be at `info`, got: {err}"
+        );
     }
 }
