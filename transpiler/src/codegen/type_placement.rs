@@ -13,7 +13,11 @@
 //! itself goes in `p_tick` -- where `P_InitThinkers`/`P_AddThinker`/
 //! `P_RemoveThinker`/`P_RunThinkers` (the original's own thinker-list
 //! management) already live, since the enum + dispatch replace exactly
-//! that mechanism. `MobjInfo`/`State` (`Mobj`'s `info`/`state` fields)
+//! that mechanism. `World` (see `world.rs`) joins it there too: both are
+//! new, invented infrastructure with no direct corpus counterpart, and
+//! `Thinker::tick` needs `World` to resolve any cross-reference field a
+//! real body touches (`function_body.rs`'s docs walk through why, via
+//! `T_FireFlicker`). `MobjInfo`/`State` (`Mobj`'s `info`/`state` fields)
 //! live in `info` -- `info.c` exists, so it's `Source` like `p_spec`/
 //! `p_mobj`/`p_tick`, not `HeaderOnly`. `ActionFn` (`State.action`, the
 //! Doom Action Pointer representation -- see `docs/03_TRANSPILER.md`)
@@ -49,7 +53,7 @@ pub fn type_home_module(name: &str) -> Option<&'static str> {
             Some("r_defs")
         }
         "MapThing" => Some("doomdata"),
-        "Thinker" => Some("p_tick"),
+        "Thinker" | "World" => Some("p_tick"),
         "MobjInfo" | "State" | "ActionFn" => Some("info"),
         // Player/PlayerSpriteState (player_t/pspdef_t) aren't translated
         // as real structs yet -- referenced here the same way MobjInfo/
