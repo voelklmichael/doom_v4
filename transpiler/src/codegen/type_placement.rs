@@ -13,12 +13,14 @@
 //! itself goes in `p_tick` -- where `P_InitThinkers`/`P_AddThinker`/
 //! `P_RemoveThinker`/`P_RunThinkers` (the original's own thinker-list
 //! management) already live, since the enum + dispatch replace exactly
-//! that mechanism.
+//! that mechanism. `MobjInfo`/`State` (`Mobj`'s `info`/`state` fields)
+//! live in `info` -- `info.c` exists, so it's `Source` like `p_spec`/
+//! `p_mobj`/`p_tick`, not `HeaderOnly`.
 //!
-//! A type not in this table at all (`MobjInfo`/`State` -- referenced by
-//! `Mobj`'s `info`/`state` fields but not yet translated as real structs,
-//! see `docs/03_TRANSPILER.md`) is simply not imported: a known,
-//! documented gap, not something this step guesses at.
+//! A type not in this table at all (e.g. the still-undesigned Doom Action
+//! Pointer representation for `state_t.action`, see
+//! `docs/03_TRANSPILER.md`) is simply not imported: a known, documented
+//! gap, not something this step guesses at.
 //!
 //! **Imports are computed by scanning already-rendered field-type
 //! strings**, not hand-written per struct: `render_imports_for` tokenizes
@@ -43,6 +45,7 @@ pub fn type_home_module(name: &str) -> Option<&'static str> {
         }
         "MapThing" => Some("doomdata"),
         "Thinker" => Some("p_tick"),
+        "MobjInfo" | "State" => Some("info"),
         "FixedT" | "Handle" | "SectorId" | "SubsectorId" | "VertexId" | "SideId" | "LineId"
         | "PlayerId" | "Arena" => Some("runtime"),
         _ => None,
@@ -122,16 +125,23 @@ mod tests {
         assert_eq!(kind_of("p_spec"), ModuleKind::Source);
         assert_eq!(kind_of("p_mobj"), ModuleKind::Source);
         assert_eq!(kind_of("p_tick"), ModuleKind::Source);
+        assert_eq!(kind_of("info"), ModuleKind::Source);
         assert_eq!(kind_of("r_defs"), ModuleKind::HeaderOnly);
         assert_eq!(kind_of("doomdata"), ModuleKind::HeaderOnly);
     }
 
     #[test]
+    fn test_mobjinfo_and_state_live_in_info() {
+        assert_eq!(type_home_module("MobjInfo"), Some("info"));
+        assert_eq!(type_home_module("State"), Some("info"));
+    }
+
+    #[test]
     fn test_unknown_type_has_no_home_module() {
-        // MobjInfo/State: referenced by Mobj's fields, not yet translated
-        // as real structs -- a known gap, not guessed at.
-        assert_eq!(type_home_module("MobjInfo"), None);
-        assert_eq!(type_home_module("State"), None);
+        // The state-table action pointer's own Rust representation isn't
+        // designed yet (docs/03_TRANSPILER.md's "Doom Action Pointers"
+        // item) -- a known gap, not guessed at.
+        assert_eq!(type_home_module("ActionFn"), None);
         assert_eq!(type_home_module("i32"), None);
     }
 
@@ -146,6 +156,7 @@ mod tests {
         assert_eq!(
             rendered,
             "use crate::doomdata::{MapThing};\n\
+             use crate::info::{MobjInfo, State};\n\
              use crate::p_tick::{Thinker};\n\
              use crate::runtime::{FixedT, Handle, PlayerId, SubsectorId};"
         );
