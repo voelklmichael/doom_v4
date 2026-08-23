@@ -413,4 +413,81 @@ pub fn T_FireFlicker(flick: &mut FireFlicker, world: &mut World) {
 }";
         assert_eq!(rendered, expected);
     }
+
+    fn light_effect_field_types() -> HashMap<String, String> {
+        [
+            ("sector".to_string(), "SectorId".to_string()),
+            ("count".to_string(), "i32".to_string()),
+            ("maxlight".to_string(), "i32".to_string()),
+            ("minlight".to_string(), "i32".to_string()),
+            ("maxtime".to_string(), "i32".to_string()),
+            ("mintime".to_string(), "i32".to_string()),
+            ("brighttime".to_string(), "i32".to_string()),
+            ("darktime".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Structurally near-identical to `T_FireFlicker` (same `--x` guard,
+    /// same cross-reference field), but the `if`'s own comparison is `==`
+    /// rather than `<` -- confirms `is_comparison_or_logical` and the
+    /// precedence renderer generalize beyond the one function they were
+    /// built against, not hand-tuned to it alone.
+    #[test]
+    fn test_t_light_flash_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "T_LightFlash",
+            "LightFlash",
+            &light_effect_field_types(),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_LightFlash(flash: &mut LightFlash, world: &mut World) {
+    flash.count -= 1;
+    if flash.count != 0 {
+        return;
+    }
+    if world[flash.sector].lightlevel == flash.maxlight {
+        world[flash.sector].lightlevel = flash.minlight;
+        flash.count = (P_Random() & flash.mintime) + 1;
+    } else {
+        world[flash.sector].lightlevel = flash.maxlight;
+        flash.count = (P_Random() & flash.maxtime) + 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// Same shape again, this time with a plain field-to-field assignment
+    /// (`flash->count = flash->brighttime;`, no arithmetic at all) on one
+    /// branch -- confirms a bare `Member` rhs needs no special handling.
+    #[test]
+    fn test_t_strobe_flash_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "T_StrobeFlash",
+            "Strobe",
+            &light_effect_field_types(),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_StrobeFlash(flash: &mut Strobe, world: &mut World) {
+    flash.count -= 1;
+    if flash.count != 0 {
+        return;
+    }
+    if world[flash.sector].lightlevel == flash.minlight {
+        world[flash.sector].lightlevel = flash.maxlight;
+        flash.count = flash.brighttime;
+    } else {
+        world[flash.sector].lightlevel = flash.minlight;
+        flash.count = flash.darktime;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
 }
