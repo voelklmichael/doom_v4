@@ -25,10 +25,24 @@
 //! so a `PreIncDec` used directly as an `if`'s condition is hoisted into
 //! its own statement immediately before the `if`, matching C's own
 //! evaluation order (decrement happens, *then* the result is tested).
+//!
+//! **`switch`/`case` (`T_Glow`)**: C parses `case N: stmt` as a single
+//! labeled statement wrapping only the *one* statement right after the
+//! colon -- everything else in that case's body is a flat sibling in the
+//! same enclosing block, up to the next `case`/`default` or a `break`.
+//! `render_switch` re-groups those flat siblings back into one Rust match
+//! arm's block per case, and requires each group to end in an explicit
+//! `break` before the next label (or run to the end of the switch) --
+//! C's implicit fallthrough (a case with no `break`) isn't recognized
+//! yet, since no real function has needed it so far, and Rust `match`
+//! arms don't fall through the same way regardless. A `switch` with no
+//! `default:` gets an implicit trailing `_ => {}` arm, matching C's own
+//! "no case matched, do nothing" semantics for a plain integer subject
+//! (not a closed enum Rust could check exhaustiveness on directly).
 
 use crate::parser::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, FunctionDef,
-    IncDecOp, ParamDeclarator, Stmt, TypeSpecifier,
+    IncDecOp, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
 };
 use crate::parser::grammar::declarator_name;
 use crate::parser::parse_full;
@@ -147,6 +161,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
                 false,
             ))
+        }
+        Expr::Unary { op, expr } => {
+            let op_text = match op {
+                UnaryOp::Minus => "-",
+                UnaryOp::Plus => "+",
+                UnaryOp::Not | UnaryOp::BitNot => "!",
+                UnaryOp::Deref | UnaryOp::AddrOf => {
+                    return Err(format!(
+                        "render_expr: unary {op:?} isn't supported yet -- translated code has no real pointers"
+                    ));
+                }
+            };
+            let (inner_text, _) = render_expr(expr, ctx)?;
+            // Unary operators bind tighter than every binary operator this
+            // renderer handles, so any binary child always needs parens.
+            let inner_text = parenthesize_if_needed(expr, &inner_text, u8::MAX, false);
+            Ok((format!("{op_text}{inner_text}"), false))
         }
         Expr::Call { callee, args } => {
             let (callee_text, _) = render_expr(callee, ctx)?;
@@ -279,8 +310,92 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             }
             Ok(lines)
         }
+        Stmt::Switch { cond, body } => render_switch(cond, body, ctx, depth),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
+}
+
+/// Renders `switch (cond) { ... }` as a Rust `match` -- see module docs
+/// for how C's per-statement `case`/`default` labels get re-grouped into
+/// one block per arm, and why an implicit `_ => {}` is added when there's
+/// no explicit `default:`.
+fn render_switch(
+    cond: &Expr,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let (cond_text, _) = render_expr(cond, ctx)?;
+    let Stmt::Compound(c) = body else {
+        return Err("render_switch: only a compound switch body is supported so far".to_string());
+    };
+    let mut stmts: Vec<&Stmt> = Vec::with_capacity(c.items.len());
+    for item in &c.items {
+        let BlockItem::Stmt(s) = item else {
+            return Err(
+                "render_switch: only statements are supported directly inside a switch body, not declarations"
+                    .to_string(),
+            );
+        };
+        stmts.push(s);
+    }
+
+    let mut arms: Vec<(Option<String>, Vec<&Stmt>)> = Vec::new();
+    let mut has_default = false;
+    let mut i = 0;
+    while i < stmts.len() {
+        let (label, first_stmt) = match stmts[i] {
+            Stmt::Case { expr, stmt } => (Some(render_expr(expr, ctx)?.0), stmt.as_ref()),
+            Stmt::Default(stmt) => {
+                has_default = true;
+                (None, stmt.as_ref())
+            }
+            other => {
+                return Err(format!(
+                    "render_switch: expected a `case`/`default` label here, got {other:?}"
+                ));
+            }
+        };
+        i += 1;
+        let mut arm_stmts = vec![first_stmt];
+        let mut saw_break = false;
+        while i < stmts.len() {
+            match stmts[i] {
+                Stmt::Case { .. } | Stmt::Default(_) => break,
+                Stmt::Break => {
+                    saw_break = true;
+                    i += 1;
+                    break;
+                }
+                other => {
+                    arm_stmts.push(other);
+                    i += 1;
+                }
+            }
+        }
+        if !saw_break && i < stmts.len() {
+            return Err(
+                "render_switch: fallthrough (a case with no `break` before the next case) isn't supported yet"
+                    .to_string(),
+            );
+        }
+        arms.push((label, arm_stmts));
+    }
+
+    let mut lines = vec![format!("{}match {cond_text} {{", indent(depth))];
+    for (label, arm_stmts) in &arms {
+        let pattern = label.clone().unwrap_or_else(|| "_".to_string());
+        lines.push(format!("{}{pattern} => {{", indent(depth + 1)));
+        for s in arm_stmts {
+            lines.extend(render_stmt(s, ctx, depth + 2)?);
+        }
+        lines.push(format!("{}}}", indent(depth + 1)));
+    }
+    if !has_default {
+        lines.push(format!("{}_ => {{}}", indent(depth + 1)));
+    }
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
 }
 
 /// `Expr::Assign` is rendered here (not in `render_expr`) since Doom's
@@ -486,6 +601,46 @@ pub fn T_StrobeFlash(flash: &mut Strobe, world: &mut World) {
     } else {
         world[flash.sector].lightlevel = flash.minlight;
         flash.count = flash.darktime;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// A genuinely different control-flow shape from the other three
+    /// (`switch`/`case` instead of straight-line `if`/`else`), plus
+    /// compound-assignment operators (`+=`/`-=`) and a unary-negative
+    /// case label (`case -1:`) -- exercises `render_switch` and
+    /// `Expr::Unary` for the first time.
+    #[test]
+    fn test_t_glow_renders_exactly() {
+        let field_types: HashMap<String, String> = [
+            ("sector".to_string(), "SectorId".to_string()),
+            ("minlight".to_string(), "i32".to_string()),
+            ("maxlight".to_string(), "i32".to_string()),
+            ("direction".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rendered = render_fn(&corpus_dir(), "p_lights.c", "T_Glow", "Glow", &field_types)
+            .expect("should render cleanly");
+        let expected = "\
+pub fn T_Glow(g: &mut Glow, world: &mut World) {
+    match g.direction {
+        -1 => {
+            world[g.sector].lightlevel -= GLOWSPEED;
+            if world[g.sector].lightlevel <= g.minlight {
+                world[g.sector].lightlevel += GLOWSPEED;
+                g.direction = 1;
+            }
+        }
+        1 => {
+            world[g.sector].lightlevel += GLOWSPEED;
+            if world[g.sector].lightlevel >= g.maxlight {
+                world[g.sector].lightlevel -= GLOWSPEED;
+                g.direction = -1;
+            }
+        }
+        _ => {}
     }
 }";
         assert_eq!(rendered, expected);
