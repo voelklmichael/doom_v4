@@ -44,7 +44,7 @@ use crate::parser::{attach_comments, lex_chunks, parse, parse_full};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-fn rough_scan(path: &Path) -> Vec<ExternalDecl> {
+pub(crate) fn rough_scan(path: &Path) -> Vec<ExternalDecl> {
     let (_, resolved) = parse(path.to_str().unwrap()).unwrap_or_else(|e| panic!("{e}"));
     let entries = lex_chunks(&resolved).expect("lexing should succeed");
     let stream = attach_comments(entries);
@@ -87,8 +87,11 @@ pub fn build_constant_index(
 /// Renders one initializer value expression as Rust source text, tracking
 /// any cross-module `use` this rendering needs in `imports` (keyed by
 /// module, keyed away from `home_module` itself). `None` for a shape this
-/// renderer doesn't recognize (see module docs).
-fn render_value_expr(
+/// renderer doesn't recognize (see module docs). Reused by
+/// `states_data.rs` for `state_t`'s own plain-value fields (`sprite`,
+/// `frame`, `tics`, `nextstate`, `misc1`, `misc2`) -- only `action`'s
+/// nested union-initializer shape needs its own renderer there.
+pub(crate) fn render_value_expr(
     e: &Expr,
     home_module: &str,
     constants: &HashMap<String, (String, i64)>,
