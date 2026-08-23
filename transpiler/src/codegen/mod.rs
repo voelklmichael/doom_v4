@@ -1,6 +1,7 @@
 //! Phase 3: Transpilation & Code Generation (docs/03_TRANSPILER.md)
 
 pub mod enum_values;
+pub mod mobjinfo_data;
 pub mod mod_tree;
 pub mod modules;
 pub mod runtime;
@@ -11,6 +12,7 @@ pub mod use_stmt;
 pub mod visibility;
 
 pub use enum_values::{compute_enum_values, fold_const_int, render_enum_consts};
+pub use mobjinfo_data::{MobjinfoTable, build_constant_index, render_mobjinfo_table};
 pub use mod_tree::render_mod_declarations;
 pub use modules::{Module, ModuleGraph, ModuleKind, build_module_graph};
 pub use runtime::{
