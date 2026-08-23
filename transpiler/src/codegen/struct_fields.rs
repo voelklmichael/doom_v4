@@ -111,6 +111,13 @@ fn map_type(
             [TypeSpecifier::TypedefName(name)] if name == "degenmobj_t" => {
                 Some("DegenMobj".to_string())
             }
+            // actionf_t (state_t.action) -- Doom's other function-pointer
+            // dispatch union, see action_fn.rs's own docs. Nullable:
+            // `states[]`'s own data (info.c) initializes plenty of entries
+            // `{NULL}`, states with no action at all.
+            [TypeSpecifier::TypedefName(name)] if name == "actionf_t" => {
+                Some("Option<ActionFn>".to_string())
+            }
             [TypeSpecifier::TypedefName(name)] if enum_typedefs.contains(name) => {
                 Some("i32".to_string())
             }
@@ -1006,43 +1013,28 @@ mod tests {
     }
 
     #[test]
-    fn test_maps_state_t_up_to_its_action_pointer() {
+    fn test_maps_state_t_completely() {
         // state_t (info.h) exercises spritenum_t/statenum_t (enum
-        // typedefs, mapped generically) and `long` (new -- bit-identical
-        // to `int` on this project's ILP32 target), then stops at
-        // `action: actionf_t` -- Doom's *other* function-pointer
-        // mechanism (the state-table action dispatch, `docs/
-        // 03_TRANSPILER.md`'s still-undesigned "Doom Action Pointers"
-        // item, a separate question from the Thinker enum's own
-        // function-pointer replacement).
+        // typedefs, mapped generically), `long` (bit-identical to `int` on
+        // this project's ILP32 target), and actionf_t -> Option<ActionFn>
+        // (action_fn.rs's own closed 2-variant enum for Doom's other
+        // function-pointer dispatch union, nullable since states[]'s own
+        // data initializes plenty of entries `{NULL}`).
         let items = parse_rough("info.h");
         let enum_typedefs = collect_enum_typedef_names(&items);
         let fields = find_typedef_struct(&items, "state_t").expect("state_t not found");
-
-        let mut out = Vec::new();
-        let mut first_failure = None;
-        for f in fields {
-            match map_struct_fields(std::slice::from_ref(f), &enum_typedefs) {
-                Ok(mapped) => out.extend(mapped),
-                Err(e) => {
-                    first_failure = Some(e);
-                    break;
-                }
-            }
-        }
-
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
         assert_eq!(
-            out,
+            mapped,
             vec![
                 field("sprite", "i32"),
                 field("frame", "i32"),
-                field("tics", "i32")
+                field("tics", "i32"),
+                field("action", "Option<ActionFn>"),
+                field("nextstate", "i32"),
+                field("misc1", "i32"),
+                field("misc2", "i32"),
             ]
-        );
-        let err = first_failure.expect("action: actionf_t should still be unmapped");
-        assert!(
-            err.contains("action"),
-            "expected the first failure to be at `action`, got: {err}"
         );
     }
 }

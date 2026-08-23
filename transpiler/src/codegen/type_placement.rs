@@ -15,12 +15,17 @@
 //! management) already live, since the enum + dispatch replace exactly
 //! that mechanism. `MobjInfo`/`State` (`Mobj`'s `info`/`state` fields)
 //! live in `info` -- `info.c` exists, so it's `Source` like `p_spec`/
-//! `p_mobj`/`p_tick`, not `HeaderOnly`.
+//! `p_mobj`/`p_tick`, not `HeaderOnly`. `ActionFn` (`State.action`, the
+//! Doom Action Pointer representation -- see `docs/03_TRANSPILER.md`)
+//! joins `MobjInfo`/`State` in `info` too, since it's only ever a field
+//! type there. `Player`/`PlayerSpriteState` (`player_t`/`pspdef_t`) are
+//! registered (`d_player`/`p_pspr`) even though neither is translated as a
+//! real struct yet -- referenced from `ActionFn`'s own variant the same
+//! way `MobjInfo`/`State` were from `Mobj` before *they* existed.
 //!
-//! A type not in this table at all (e.g. the still-undesigned Doom Action
-//! Pointer representation for `state_t.action`, see
-//! `docs/03_TRANSPILER.md`) is simply not imported: a known, documented
-//! gap, not something this step guesses at.
+//! A type not in this table at all is simply not imported: a known,
+//! documented gap (see `docs/03_TRANSPILER.md`), not something this step
+//! guesses at.
 //!
 //! **Imports are computed by scanning already-rendered field-type
 //! strings**, not hand-written per struct: `render_imports_for` tokenizes
@@ -45,7 +50,13 @@ pub fn type_home_module(name: &str) -> Option<&'static str> {
         }
         "MapThing" => Some("doomdata"),
         "Thinker" => Some("p_tick"),
-        "MobjInfo" | "State" => Some("info"),
+        "MobjInfo" | "State" | "ActionFn" => Some("info"),
+        // Player/PlayerSpriteState (player_t/pspdef_t) aren't translated
+        // as real structs yet -- referenced here the same way MobjInfo/
+        // State were from Mobj before they existed, so ActionFn's own
+        // rendering doesn't have to wait for player_t's translation.
+        "Player" => Some("d_player"),
+        "PlayerSpriteState" => Some("p_pspr"),
         "FixedT" | "Handle" | "SectorId" | "SubsectorId" | "VertexId" | "SideId" | "LineId"
         | "PlayerId" | "Arena" => Some("runtime"),
         _ => None,
@@ -138,11 +149,15 @@ mod tests {
 
     #[test]
     fn test_unknown_type_has_no_home_module() {
-        // The state-table action pointer's own Rust representation isn't
-        // designed yet (docs/03_TRANSPILER.md's "Doom Action Pointers"
-        // item) -- a known gap, not guessed at.
-        assert_eq!(type_home_module("ActionFn"), None);
+        assert_eq!(type_home_module("SomeUntranslatedType"), None);
         assert_eq!(type_home_module("i32"), None);
+    }
+
+    #[test]
+    fn test_action_fn_and_player_types_registered() {
+        assert_eq!(type_home_module("ActionFn"), Some("info"));
+        assert_eq!(type_home_module("Player"), Some("d_player"));
+        assert_eq!(type_home_module("PlayerSpriteState"), Some("p_pspr"));
     }
 
     #[test]
