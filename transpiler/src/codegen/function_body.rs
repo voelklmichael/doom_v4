@@ -588,7 +588,17 @@ fn render_switch(
                 }
             }
         }
-        if !saw_break && i < stmts.len() {
+        // Falling into a `default: break;` with *no other statements*
+        // (Doom's own `case donutRaise: ...; default: break;` idiom,
+        // confirmed against the real parsed AST) has no observable
+        // effect either way -- `default`'s own body is empty -- so it's
+        // safe to treat this arm as if it had its own `break`, without
+        // actually merging any statements across arms. Any other
+        // fallthrough (into a case/default with real statements) still
+        // errs loudly rather than guessing.
+        let falls_into_empty_default = i < stmts.len()
+            && matches!(stmts[i], Stmt::Default(stmt) if matches!(stmt.as_ref(), Stmt::Break));
+        if !saw_break && i < stmts.len() && !falls_into_empty_default {
             return Err(
                 "render_switch: fallthrough (a case with no `break` before the next case) isn't supported yet"
                     .to_string(),
@@ -2259,6 +2269,79 @@ pub fn T_VerticalDoor(door: &mut VerticalDoor, world: &mut World, handle: Handle
             }
         }
         _ => {}
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `T_MoveFloor` (`p_floor.c`) -- structurally close to
+    /// `T_VerticalDoor` (self-removal, `NULL` -> `None`, the sound-cast/
+    /// reference pair, `r#type`), but with a genuine `switch` fallthrough
+    /// Doom uses in two places: `case donutRaise: stmt1; stmt2; default:
+    /// break;` -- `donutRaise` has *no* `break` of its own, falling into
+    /// `default`'s. Since `default`'s own body is just `break;` (no
+    /// statements), the fallthrough has no observable effect either way,
+    /// so `render_switch` now recognizes falling into an empty `default:
+    /// break;` specifically as safe and renders `donutRaise` as its own
+    /// complete arm -- confirmed against the real parsed AST before
+    /// relaxing the fallthrough rejection, and still narrow: falling into
+    /// anything with real statements still errs loudly. Also exercises
+    /// `!(leveltime&7)` (`Unary::Not` over a `Binary`, not `PreIncDec` --
+    /// already handled generically by `render_bool_expr`, needing no new
+    /// code) and confirms Rust's `&`-binds-tighter-than-`==` precedence
+    /// matches C's exactly, so `leveltime & 7 == 0` needs no parens.
+    #[test]
+    fn test_t_move_floor_renders_exactly() {
+        let field_types = field_types(&[
+            ("sector", "SectorId"),
+            ("r#type", "i32"),
+            ("crush", "bool"),
+            ("direction", "i32"),
+            ("newspecial", "i32"),
+            ("texture", "i16"),
+            ("floordestheight", "FixedT"),
+            ("speed", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_floor.c",
+            "T_MoveFloor",
+            "FloorMove",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_MoveFloor(floor: &mut FloorMove, world: &mut World, handle: Handle<Thinker>, arena: &mut Arena<Thinker>) {
+    let mut res;
+    res = T_MovePlane(floor.sector, floor.speed, floor.floordestheight, floor.crush, 0, floor.direction);
+    if leveltime & 7 == 0 {
+        S_StartSound(&world[floor.sector].soundorg, sfx_stnmov);
+    }
+    if res == pastdest {
+        world[floor.sector].specialdata = None;
+        if floor.direction == 1 {
+            match floor.r#type {
+                donutRaise => {
+                    world[floor.sector].special = floor.newspecial;
+                    world[floor.sector].floorpic = floor.texture;
+                }
+                _ => {
+                }
+            }
+        } else {
+            if floor.direction == -1 {
+                match floor.r#type {
+                    lowerAndChange => {
+                        world[floor.sector].special = floor.newspecial;
+                        world[floor.sector].floorpic = floor.texture;
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        arena.remove(handle);
+        S_StartSound(&world[floor.sector].soundorg, sfx_pstop);
     }
 }";
         assert_eq!(rendered, expected);
