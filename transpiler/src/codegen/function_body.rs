@@ -216,6 +216,26 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        Expr::Unary {
+            op: UnaryOp::AddrOf,
+            expr,
+        } if matches!(
+            expr.as_ref(),
+            Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sectors")
+        ) =>
+        {
+            // `&sectors[i]` -- the corpus's own idiom for getting a
+            // `sector_t*` by index (`sectors` is the level's global
+            // sector array). Since `sector_t*` already maps to `SectorId`
+            // (a plain index, not a real pointer -- see the memory-model
+            // decision), this needs no real address-of or array-index
+            // operation at all, just wrapping the index itself.
+            let Expr::Index { index, .. } = expr.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("SectorId({index_text} as u32)"), false))
+        }
         Expr::Unary { op, expr } => {
             let op_text = match op {
                 UnaryOp::Minus => "-",
@@ -290,6 +310,17 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             op: UnaryOp::Not,
             expr,
         } => Ok(format!("{} == 0", render_expr(expr, ctx)?.0)),
+        // A bare value used for truthiness (not a comparison/negation) --
+        // C's `if (x)` tests non-zero/non-null. `specialdata` is the one
+        // corpus field known to be `Option`-typed (`struct_fields.rs`'s
+        // own name-based special case, reused by `render_expr_stmt`'s
+        // `Some(..)`-wrapping too), so a bare reference to it needs
+        // `.is_some()`, not the `== 0` truthiness every other (plain
+        // `int`) value gets -- nothing else this renderer handles is
+        // `Option`-typed yet.
+        Expr::Member { field, .. } if field == "specialdata" => {
+            Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
+        }
         _ => Err(format!(
             "render_bool_expr: unsupported condition shape: {cond:?}"
         )),
@@ -330,12 +361,18 @@ fn render_block(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<Strin
 }
 
 fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String>, String> {
+    // `int amount;` (a plain scalar) and `sector_t* sec;` (a single
+    // pointer to an already-known cross-reference type, e.g.
+    // `EV_StartLightStrobing`'s own loop variable) both render the same
+    // way: Rust infers the type from later use, so no annotation is
+    // needed regardless of which C type it was. Anything else (arrays,
+    // multiple declarators, an initializer) isn't supported yet.
     if !matches!(
         d.specifiers.type_specifiers.as_slice(),
-        [TypeSpecifier::Int]
+        [TypeSpecifier::Int] | [TypeSpecifier::TypedefName(_)]
     ) {
         return Err(format!(
-            "render_decl: only a bare `int` declaration is supported so far, got {:?}",
+            "render_decl: only a bare `int` or single-pointer known-type declaration is supported so far, got {:?}",
             d.specifiers.type_specifiers
         ));
     }
@@ -344,6 +381,12 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
     };
     if decl.initializer.is_some() {
         return Err("render_decl: an initializer is not supported so far".to_string());
+    }
+    if !matches!(decl.declarator.direct, DirectDeclarator::Ident(_)) {
+        return Err(
+            "render_decl: only a plain (non-array, non-function) declarator is supported so far"
+                .to_string(),
+        );
     }
     let name = declarator_name(&decl.declarator)
         .ok_or_else(|| "render_decl: declarator has no plain name".to_string())?;
@@ -384,6 +427,8 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             Ok(lines)
         }
         Stmt::Switch { cond, body } => render_switch(cond, body, ctx, depth),
+        Stmt::While { cond, body } => render_while(cond, body, ctx, depth),
+        Stmt::Continue => Ok(vec![format!("{}continue;", indent(depth))]),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
 }
@@ -467,6 +512,61 @@ fn render_switch(
     if !has_default {
         lines.push(format!("{}_ => {{}}", indent(depth + 1)));
     }
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
+}
+
+/// Renders `while (cond) body` -- so far, only the `while ((x = f(..))
+/// CMP y) { .. }` idiom Doom's tagged-object iteration uses everywhere
+/// (`while ((secnum = P_FindSectorFromLineTag(line,secnum)) >= 0)`).
+/// Rust's `while` re-evaluates a *fresh* condition expression each pass
+/// with no way to inject a statement first (unlike the `--x`-as-condition
+/// idiom `render_condition` hoists ahead of an `if`, which only needs to
+/// run *once*), so this becomes `loop { <hoisted assignment>; if !(<test>)
+/// { break; } <body> }` instead: the assignment runs every pass, exactly
+/// where C's own re-evaluation would run it, and the `loop` gives
+/// somewhere to put it.
+fn render_while(
+    cond: &Expr,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let Expr::Binary { op, lhs, rhs } = cond else {
+        return Err(format!(
+            "render_while: unsupported condition shape: {cond:?}"
+        ));
+    };
+    if !is_comparison_or_logical(*op) {
+        return Err(format!(
+            "render_while: unsupported condition shape: {cond:?}"
+        ));
+    }
+    let Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: assign_lhs,
+        rhs: assign_rhs,
+    } = lhs.as_ref()
+    else {
+        return Err(
+            "render_while: only the `(x = f()) CMP y` condition idiom is supported so far"
+                .to_string(),
+        );
+    };
+    let (target_text, _) = render_expr(assign_lhs, ctx)?;
+    let (value_text, _) = render_expr(assign_rhs, ctx)?;
+    let (rhs_text, _) = render_expr(rhs, ctx)?;
+    let test = format!("{target_text} {} {rhs_text}", render_binop(*op));
+
+    let mut lines = vec![format!("{}loop {{", indent(depth))];
+    lines.push(format!(
+        "{}{target_text} = {value_text};",
+        indent(depth + 1)
+    ));
+    lines.push(format!("{}if !({test}) {{", indent(depth + 1)));
+    lines.push(format!("{}break;", indent(depth + 2)));
+    lines.push(format!("{}}}", indent(depth + 1)));
+    lines.extend(render_block(body, ctx, depth + 1)?);
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
 }
@@ -880,6 +980,34 @@ fn stmt_uses_bare_ctor_ident(s: &Stmt, ctor_var: &str) -> bool {
 /// side-effect statement that doesn't itself reference `var` bare (a
 /// back-reference like `sec->specialdata = door;`, seen in `p_doors.c`'s
 /// door spawners, isn't supported yet -- see `docs/03_TRANSPILER.md`).
+/// Renders `f`'s own parameter list as `name: RustType` pairs, using
+/// `param_types` for each one's Rust type -- shared by every entry point
+/// past `render_fn` (whose own single `self` parameter is handled
+/// separately, since it always gets `&mut` and doesn't come from this
+/// map).
+fn render_params(
+    f: &FunctionDef,
+    fn_name: &str,
+    param_types: &HashMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let DirectDeclarator::Function(_, params) = &f.declarator.direct else {
+        return Err(format!("{fn_name}: not a function declarator"));
+    };
+    let mut rendered = Vec::with_capacity(params.params.len());
+    for p in &params.params {
+        let ParamDeclarator::Named(d) = &p.declarator else {
+            return Err(format!("{fn_name}: an unnamed parameter isn't supported"));
+        };
+        let name = declarator_name(d)
+            .ok_or_else(|| format!("{fn_name}: a parameter declarator has no plain name"))?;
+        let rust_type = param_types
+            .get(&name)
+            .ok_or_else(|| format!("{fn_name}: parameter `{name}`'s Rust type isn't known"))?;
+        rendered.push(format!("{name}: {rust_type}"));
+    }
+    Ok(rendered)
+}
+
 pub fn render_spawn_fn(
     corpus_dir: &Path,
     file: &str,
@@ -892,21 +1020,7 @@ pub fn render_spawn_fn(
     let f = find_function_def(&unit.items, fn_name)
         .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
 
-    let DirectDeclarator::Function(_, params) = &f.declarator.direct else {
-        return Err(format!("{fn_name}: not a function declarator"));
-    };
-    let mut rendered_params = Vec::with_capacity(params.params.len());
-    for p in &params.params {
-        let ParamDeclarator::Named(d) = &p.declarator else {
-            return Err(format!("{fn_name}: an unnamed parameter isn't supported"));
-        };
-        let name = declarator_name(d)
-            .ok_or_else(|| format!("{fn_name}: a parameter declarator has no plain name"))?;
-        let rust_type = param_cross_ref_types
-            .get(&name)
-            .ok_or_else(|| format!("{fn_name}: parameter `{name}`'s Rust type isn't known"))?;
-        rendered_params.push(format!("{name}: {rust_type}"));
-    }
+    let rendered_params = render_params(f, fn_name, param_cross_ref_types)?;
 
     let mut ctor_var: Option<String> = None;
     for item in &f.body.items {
@@ -1078,6 +1192,55 @@ pub fn render_spawn_fn(
         "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
         rendered_params.join(", "),
         lines.join("\n")
+    ))
+}
+
+/// Renders a "trigger" function -- a third kind of body, alongside a
+/// tick function's `self`-dispatched logic (`render_fn`) and a
+/// constructor's field fill-in (`render_spawn_fn`). A trigger function
+/// (e.g. `EV_StartLightStrobing`) has no `self`-like receiver at all: it
+/// just takes some already-cross-reference-typed parameters (`line:
+/// LineId`) and does something to the level in response, typically
+/// iterating tagged sectors and spawning thinkers into them -- so it
+/// always needs both `world: &mut World` and `thinkers: &mut
+/// Arena<Thinker>`, the same as a constructor, but with no field-
+/// synthesis logic at all (`FnBodyContext::ctor_var` stays empty).
+///
+/// `local_var_types` gives the Rust cross-reference type for any local
+/// variable the function declares and later assigns from an already-
+/// translated expression (`sector_t* sec;`, assigned via `sec =
+/// &sectors[secnum];` -- see `render_expr`'s own special case for that
+/// exact idiom) -- merged into `param_types` for `FnBodyContext::
+/// extra_cross_ref_idents`, since both are just "this identifier's own
+/// declared type," regardless of whether it's a parameter or a local.
+pub fn render_trigger_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    param_types: &HashMap<String, String>,
+    local_var_types: &HashMap<String, String>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+
+    let rendered_params = render_params(f, fn_name, param_types)?;
+
+    let mut all_cross_refs = param_types.clone();
+    all_cross_refs.extend(local_var_types.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let ctx = FnBodyContext {
+        self_param: "",
+        self_field_types: &HashMap::new(),
+        extra_cross_ref_idents: &all_cross_refs,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+    };
+
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    Ok(format!(
+        "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
+        rendered_params.join(", "),
+        body_lines.join("\n")
     ))
 }
 
@@ -1491,6 +1654,53 @@ pub fn P_SpawnDoorRaiseIn5Mins(sec: SectorId, secnum: i32, world: &mut World, th
     let handle = thinkers.insert(Thinker::VerticalDoor(VerticalDoor { sector, direction, r#type, speed, topheight, topwait, topcountdown }));
     world[sec].specialdata = Some(handle);
     world[sec].special = 0;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// A third kind of function body -- no `self`-struct at all, just
+    /// local variables and calls -- exercising several new pieces at
+    /// once: `while ((secnum = P_FindSectorFromLineTag(line,secnum)) >=
+    /// 0)` needs restructuring into `loop { ..; if !(..) { break; } .. }`
+    /// (Rust's `while` can't re-run a hoisted assignment each pass);
+    /// `&sectors[secnum]` needs the `SectorId`-wrapping special case
+    /// (`sector_t*` already maps to a plain index, not a real pointer);
+    /// `if (sec->specialdata) continue;` needs `.is_some()` truthiness,
+    /// not `== 0` (`specialdata` is the one `Option`-typed field this
+    /// renderer knows); and a plain local (`sector_t* sec;`) needs the
+    /// same deferred-`let` handling `int` locals already had.
+    #[test]
+    fn test_ev_start_light_strobing_renders_exactly() {
+        let params: HashMap<String, String> = [("line".to_string(), "LineId".to_string())]
+            .into_iter()
+            .collect();
+        let locals: HashMap<String, String> = [("sec".to_string(), "SectorId".to_string())]
+            .into_iter()
+            .collect();
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "EV_StartLightStrobing",
+            &params,
+            &locals,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut secnum;
+    let mut sec;
+    secnum = -1;
+    loop {
+        secnum = P_FindSectorFromLineTag(line, secnum);
+        if !(secnum >= 0) {
+            break;
+        }
+        sec = SectorId(secnum as u32);
+        if world[sec].specialdata.is_some() {
+            continue;
+        }
+        P_SpawnStrobeFlash(sec, SLOWDARK, 0);
+    }
 }";
         assert_eq!(rendered, expected);
     }
