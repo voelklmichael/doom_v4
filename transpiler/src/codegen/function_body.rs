@@ -520,6 +520,16 @@ fn collect_case_labels<'a>(
 /// for how C's per-statement `case`/`default` labels get re-grouped into
 /// one block per arm, and why an implicit `_ => {}` is added when there's
 /// no explicit `default:`.
+/// One `case`/`default` label group, before fallthrough resolution:
+/// its own labels (`None` for `default`), the statements written
+/// directly under it, and whether it falls into whatever comes next
+/// (no `break` before the next label, and something *does* follow).
+struct RawArm<'a> {
+    labels: Option<Vec<String>>,
+    own_stmts: Vec<&'a Stmt>,
+    falls_through: bool,
+}
+
 fn render_switch(
     cond: &Expr,
     body: &Stmt,
@@ -541,7 +551,15 @@ fn render_switch(
         stmts.push(s);
     }
 
-    let mut arms: Vec<(Option<Vec<String>>, Vec<&Stmt>)> = Vec::new();
+    // Pass 1: split into raw arms, in source order, recording (rather
+    // than rejecting) whether each one falls through into the next --
+    // real C fallthrough (`case silentCrushAndRaise: S_StartSound(..);
+    // case fastCrushAndRaise: case crushAndRaise: ceiling->direction =
+    // -1; break;`, confirmed against the real parsed AST, not assumed)
+    // needs the *target*'s own statements folded into the source arm's
+    // body, since Rust `match` arms never fall through -- done below, in
+    // pass 2.
+    let mut arms: Vec<RawArm> = Vec::new();
     let mut has_default = false;
     let mut i = 0;
     while i < stmts.len() {
@@ -569,7 +587,7 @@ fn render_switch(
         // so it needs recognizing here rather than being pushed as a real
         // body statement.
         let mut saw_break = matches!(first_stmt, Stmt::Break);
-        let mut arm_stmts: Vec<&Stmt> = if saw_break {
+        let mut own_stmts: Vec<&Stmt> = if saw_break {
             Vec::new()
         } else {
             vec![first_stmt]
@@ -583,38 +601,42 @@ fn render_switch(
                     break;
                 }
                 other => {
-                    arm_stmts.push(other);
+                    own_stmts.push(other);
                     i += 1;
                 }
             }
         }
-        // Falling into a `default: break;` with *no other statements*
-        // (Doom's own `case donutRaise: ...; default: break;` idiom,
-        // confirmed against the real parsed AST) has no observable
-        // effect either way -- `default`'s own body is empty -- so it's
-        // safe to treat this arm as if it had its own `break`, without
-        // actually merging any statements across arms. Any other
-        // fallthrough (into a case/default with real statements) still
-        // errs loudly rather than guessing.
-        let falls_into_empty_default = i < stmts.len()
-            && matches!(stmts[i], Stmt::Default(stmt) if matches!(stmt.as_ref(), Stmt::Break));
-        if !saw_break && i < stmts.len() && !falls_into_empty_default {
-            return Err(
-                "render_switch: fallthrough (a case with no `break` before the next case) isn't supported yet"
-                    .to_string(),
-            );
+        let falls_through = !saw_break && i < stmts.len();
+        arms.push(RawArm {
+            labels,
+            own_stmts,
+            falls_through,
+        });
+    }
+
+    // Pass 2: resolve each arm's real body, back to front, so a falling-
+    // through arm can borrow its already-resolved successor's body --
+    // handles multi-level fallthrough (an arm falling into another arm
+    // that itself falls through) for free, since each arm only ever
+    // looks one step ahead at its own already-finished neighbor.
+    let mut resolved: Vec<Vec<&Stmt>> = vec![Vec::new(); arms.len()];
+    for k in (0..arms.len()).rev() {
+        let mut body_stmts = arms[k].own_stmts.clone();
+        if arms[k].falls_through {
+            body_stmts.extend(resolved[k + 1].iter().copied());
         }
-        arms.push((labels, arm_stmts));
+        resolved[k] = body_stmts;
     }
 
     let mut lines = vec![format!("{}match {cond_text} {{", indent(depth))];
-    for (labels, arm_stmts) in &arms {
-        let pattern = labels
+    for (k, arm) in arms.iter().enumerate() {
+        let pattern = arm
+            .labels
             .as_ref()
             .map(|ls| ls.join(" | "))
             .unwrap_or_else(|| "_".to_string());
         lines.push(format!("{}{pattern} => {{", indent(depth + 1)));
-        for s in arm_stmts {
+        for s in &resolved[k] {
             lines.extend(render_stmt(s, ctx, depth + 2)?);
         }
         lines.push(format!("{}}}", indent(depth + 1)));
@@ -2342,6 +2364,129 @@ pub fn T_MoveFloor(floor: &mut FloorMove, world: &mut World, handle: Handle<Thin
         }
         arena.remove(handle);
         S_StartSound(&world[floor.sector].soundorg, sfx_pstop);
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `T_MoveCeiling` (`p_ceilng.c`) -- real `switch` fallthrough with
+    /// genuine content, not just an empty `default: break;`
+    /// (`T_MoveFloor`'s narrow case). `case silentCrushAndRaise:
+    /// S_StartSound(..); case crushAndRaise: ceiling->speed = CEILSPEED;
+    /// case fastCrushAndRaise: ceiling->direction = 1; break;` is a real
+    /// *three*-level fallthrough chain: `silentCrushAndRaise` needs all
+    /// three statements, `crushAndRaise` needs the last two, and
+    /// `fastCrushAndRaise` needs only its own. `render_switch`'s
+    /// pass-2 back-to-front resolution (`resolved[k] = own_stmts[k] ++
+    /// resolved[k+1]` when `k` falls through) builds exactly this,
+    /// confirmed against the real parsed AST first -- each arm keeps its
+    /// own identity and pattern (they can't share one, since their
+    /// bodies genuinely differ), just with the right statements folded
+    /// forward into each entry point. `Ceiling` has no self-removal here
+    /// at all (`P_RemoveActiveCeiling`, a different, not-yet-translated
+    /// function, not `T_VerticalDoor`'s literal `P_RemoveThinker(&self->
+    /// thinker)` shape) -- confirms `render_fn`'s signature-extension
+    /// logic doesn't false-positive on a similarly-named but structurally
+    /// different removal call.
+    #[test]
+    fn test_t_move_ceiling_renders_exactly() {
+        let field_types = field_types(&[
+            ("sector", "SectorId"),
+            ("r#type", "i32"),
+            ("bottomheight", "FixedT"),
+            ("topheight", "FixedT"),
+            ("speed", "FixedT"),
+            ("crush", "bool"),
+            ("direction", "i32"),
+            ("tag", "i32"),
+            ("olddirection", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "T_MoveCeiling",
+            "Ceiling",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_MoveCeiling(ceiling: &mut Ceiling, world: &mut World) {
+    let mut res;
+    match ceiling.direction {
+        0 => {
+        }
+        1 => {
+            res = T_MovePlane(ceiling.sector, ceiling.speed, ceiling.topheight, false, 1, ceiling.direction);
+            if leveltime & 7 == 0 {
+                match ceiling.r#type {
+                    silentCrushAndRaise => {
+                    }
+                    _ => {
+                        S_StartSound(&world[ceiling.sector].soundorg, sfx_stnmov);
+                    }
+                }
+            }
+            if res == pastdest {
+                match ceiling.r#type {
+                    raiseToHighest => {
+                        P_RemoveActiveCeiling(ceiling);
+                    }
+                    silentCrushAndRaise => {
+                        S_StartSound(&world[ceiling.sector].soundorg, sfx_pstop);
+                        ceiling.direction = -1;
+                    }
+                    fastCrushAndRaise | crushAndRaise => {
+                        ceiling.direction = -1;
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        -1 => {
+            res = T_MovePlane(ceiling.sector, ceiling.speed, ceiling.bottomheight, ceiling.crush, 1, ceiling.direction);
+            if leveltime & 7 == 0 {
+                match ceiling.r#type {
+                    silentCrushAndRaise => {
+                    }
+                    _ => {
+                        S_StartSound(&world[ceiling.sector].soundorg, sfx_stnmov);
+                    }
+                }
+            }
+            if res == pastdest {
+                match ceiling.r#type {
+                    silentCrushAndRaise => {
+                        S_StartSound(&world[ceiling.sector].soundorg, sfx_pstop);
+                        ceiling.speed = CEILSPEED;
+                        ceiling.direction = 1;
+                    }
+                    crushAndRaise => {
+                        ceiling.speed = CEILSPEED;
+                        ceiling.direction = 1;
+                    }
+                    fastCrushAndRaise => {
+                        ceiling.direction = 1;
+                    }
+                    lowerAndCrush | lowerToFloor => {
+                        P_RemoveActiveCeiling(ceiling);
+                    }
+                    _ => {
+                    }
+                }
+            } else {
+                if res == crushed {
+                    match ceiling.r#type {
+                        silentCrushAndRaise | crushAndRaise | lowerAndCrush => {
+                            ceiling.speed = CEILSPEED / 8;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }";
         assert_eq!(rendered, expected);
