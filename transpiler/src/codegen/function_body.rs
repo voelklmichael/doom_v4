@@ -255,6 +255,30 @@ fn parenthesize_if_needed(
     }
 }
 
+/// Renders `cond` as a plain boolean-valued Rust expression -- a
+/// comparison/logical `Binary` passes straight through (already `bool`-
+/// valued); `!x` on a plain (non-`bool`) C value is C's truthiness test,
+/// so it becomes `x == 0`, not Rust's own `!` (which would silently
+/// compile as a *bitwise* NOT on an integer, a real, wrong-behavior trap
+/// -- this renderer has no per-identifier `bool`-vs-`int` tracking beyond
+/// this, so it's applied unconditionally for now; a genuinely `bool`-
+/// typed operand would need this revisited, not encountered yet). Used
+/// both by `render_condition` (an `if` statement's test) and by the
+/// if/else-as-expression field synthesis in `render_spawn_fn` (a
+/// condition with no statements to hoist).
+fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
+    match cond {
+        Expr::Binary { op, .. } if is_comparison_or_logical(*op) => Ok(render_expr(cond, ctx)?.0),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => Ok(format!("{} == 0", render_expr(expr, ctx)?.0)),
+        _ => Err(format!(
+            "render_bool_expr: unsupported condition shape: {cond:?}"
+        )),
+    }
+}
+
 /// Renders `cond` as an `if`'s test, returning any statements that must
 /// be hoisted immediately before it (only nonempty for the `--x`-as-
 /// condition idiom -- see module docs) plus the condition text itself.
@@ -273,12 +297,7 @@ fn render_condition(
             let hoisted = vec![format!("{}{target_text} {op_text};", indent(depth))];
             Ok((hoisted, format!("{target_text} != 0")))
         }
-        Expr::Binary { op, .. } if is_comparison_or_logical(*op) => {
-            Ok((Vec::new(), render_expr(cond, ctx)?.0))
-        }
-        _ => Err(format!(
-            "render_condition: unsupported condition shape: {cond:?}"
-        )),
+        _ => Ok((Vec::new(), render_bool_expr(cond, ctx)?)),
     }
 }
 
@@ -598,37 +617,138 @@ fn ctor_field_assign<'a>(s: &'a Stmt, ctor_var: &str) -> Option<(&'a str, &'a Ex
     }
 }
 
-/// A conservative, `render_expr`-shaped walk: `true` for exactly the
-/// expression shapes this renderer understands *and* that don't mention
-/// `name`, and `true` (defensively) for anything it doesn't recognize --
-/// so `render_spawn_fn` errs loudly on a statement it can't prove is safe
-/// to reorder, rather than silently mistranslating it.
-fn expr_references_ident(e: &Expr, name: &str) -> bool {
-    match e {
-        Expr::Ident(n) => n == name,
-        Expr::IntLiteral(_) => false,
-        Expr::Member { base, .. } => expr_references_ident(base, name),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_references_ident(lhs, name) || expr_references_ident(rhs, name)
+/// `if (cond) { var->field = then_val; } else { var->field = else_val; }`
+/// -- both branches assigning the *same* field, with no `else if` chain
+/// (each branch a single plain statement, not a further nested `If`).
+/// This is the "field defined entirely by a condition" idiom
+/// (`P_SpawnStrobeFlash`'s `count`, which has no unconditional assignment
+/// anywhere else in the function) -- distinct from a single-branch
+/// conditional *override* of an already-`let`-bound field
+/// (`P_SpawnStrobeFlash`'s `minlight`, handled by the ordinary
+/// `render_stmt` path once that field's initial `let` is marked `mut`),
+/// which this deliberately does not match (no `else`).
+fn if_else_ctor_field_assign<'a>(
+    s: &'a Stmt,
+    ctor_var: &str,
+) -> Option<(&'a str, &'a Expr, &'a Expr)> {
+    let Stmt::If {
+        then_branch,
+        else_branch: Some(else_branch),
+        ..
+    } = s
+    else {
+        return None;
+    };
+    let (then_field, then_rhs) = ctor_field_assign(then_branch, ctor_var)?;
+    let (else_field, else_rhs) = ctor_field_assign(else_branch, ctor_var)?;
+    (then_field == else_field).then_some((then_field, then_rhs, else_rhs))
+}
+
+/// Counts, for every field of `ctor_var`, how many statements assign it
+/// -- anywhere in the function body, including nested inside `if`/`switch`
+/// bodies, not just at the top level. A field assigned more than once
+/// needs its initial `let` marked `mut` (`P_SpawnStrobeFlash`'s
+/// `minlight`: one unconditional set, then a conditional override).
+fn count_ctor_field_assigns(
+    items: &[BlockItem],
+    ctor_var: &str,
+    counts: &mut HashMap<String, usize>,
+) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            count_ctor_field_assigns_stmt(s, ctor_var, counts);
         }
-        Expr::Unary { expr, .. } => expr_references_ident(expr, name),
+    }
+}
+
+fn count_ctor_field_assigns_stmt(s: &Stmt, ctor_var: &str, counts: &mut HashMap<String, usize>) {
+    if let Some((field, _)) = ctor_field_assign(s, ctor_var) {
+        *counts.entry(field.to_string()).or_insert(0) += 1;
+        return;
+    }
+    match s {
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            count_ctor_field_assigns_stmt(then_branch, ctor_var, counts);
+            if let Some(eb) = else_branch {
+                count_ctor_field_assigns_stmt(eb, ctor_var, counts);
+            }
+        }
+        Stmt::Switch { body, .. } => count_ctor_field_assigns_stmt(body, ctor_var, counts),
+        Stmt::Compound(c) => count_ctor_field_assigns(&c.items, ctor_var, counts),
+        _ => {}
+    }
+}
+
+/// A conservative, `render_expr`/`render_stmt`-shaped walk: `true` if
+/// `ctor_var` appears anywhere *other than* as the base of a
+/// `ctor_var->field` member access (which `FnBodyContext::ctor_var`
+/// already resolves to that field's own `let`-bound local, so it's fine
+/// wherever `render_stmt`/`render_expr` themselves would accept it) --
+/// and `true` (defensively) for any expression/statement shape this
+/// walk doesn't specifically recognize, so `render_spawn_fn` errs loudly
+/// on a statement it can't prove is safe, rather than silently
+/// mistranslating a bare reference to the not-yet-fully-built value
+/// (`sec->specialdata = door;`, seen in `p_doors.c`'s door spawners, isn't
+/// supported yet -- see `docs/03_TRANSPILER.md`).
+fn bare_ctor_ident_used(e: &Expr, ctor_var: &str) -> bool {
+    match e {
+        Expr::Ident(n) => n == ctor_var,
+        Expr::IntLiteral(_) => false,
+        Expr::Member { base, .. } => {
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctor_var) {
+                false
+            } else {
+                bare_ctor_ident_used(base, ctor_var)
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            bare_ctor_ident_used(lhs, ctor_var) || bare_ctor_ident_used(rhs, ctor_var)
+        }
+        Expr::Unary { expr, .. } => bare_ctor_ident_used(expr, ctor_var),
         Expr::Call { callee, args } => {
-            expr_references_ident(callee, name)
-                || args.iter().any(|a| expr_references_ident(a, name))
+            bare_ctor_ident_used(callee, ctor_var)
+                || args.iter().any(|a| bare_ctor_ident_used(a, ctor_var))
         }
         Expr::Assign { lhs, rhs, .. } => {
-            expr_references_ident(lhs, name) || expr_references_ident(rhs, name)
+            bare_ctor_ident_used(lhs, ctor_var) || bare_ctor_ident_used(rhs, ctor_var)
         }
         _ => true,
     }
 }
 
-fn statement_references_ident(s: &Stmt, name: &str) -> bool {
+fn stmt_uses_bare_ctor_ident(s: &Stmt, ctor_var: &str) -> bool {
     match s {
-        Stmt::Expr(Some(e)) => expr_references_ident(e, name),
+        Stmt::Expr(Some(e)) => bare_ctor_ident_used(e, ctor_var),
         Stmt::Expr(None) => false,
-        Stmt::Return(Some(e)) => expr_references_ident(e, name),
+        Stmt::Return(Some(e)) => bare_ctor_ident_used(e, ctor_var),
         Stmt::Return(None) => false,
+        Stmt::Break => false,
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            bare_ctor_ident_used(cond, ctor_var)
+                || stmt_uses_bare_ctor_ident(then_branch, ctor_var)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_uses_bare_ctor_ident(eb, ctor_var))
+        }
+        Stmt::Switch { cond, body } => {
+            bare_ctor_ident_used(cond, ctor_var) || stmt_uses_bare_ctor_ident(body, ctor_var)
+        }
+        Stmt::Case { expr, stmt } => {
+            bare_ctor_ident_used(expr, ctor_var) || stmt_uses_bare_ctor_ident(stmt, ctor_var)
+        }
+        Stmt::Default(stmt) => stmt_uses_bare_ctor_ident(stmt, ctor_var),
+        Stmt::Compound(c) => c.items.iter().any(|item| match item {
+            BlockItem::Stmt(s) => stmt_uses_bare_ctor_ident(s, ctor_var),
+            BlockItem::Decl(_) => false,
+        }),
         _ => true,
     }
 }
@@ -662,10 +782,13 @@ fn statement_references_ident(s: &Stmt, name: &str) -> bool {
 /// **Scope**: only functions matching this exact shape -- one local
 /// `Foo* var;`, allocated via `Z_Malloc`, immediately `P_AddThinker`'d,
 /// with every other statement either a recognized discard, a `var->field
-/// = expr;` constructor field, or an "other" side-effect statement that
-/// doesn't itself reference `var` (a back-reference like `sec->specialdata
-/// = door;`, seen in `p_doors.c`'s door spawners, isn't supported yet --
-/// see `docs/03_TRANSPILER.md`).
+/// = expr;` constructor field (possibly reassigned later by a plain
+/// conditional override, or -- if it has no unconditional assignment at
+/// all -- fully decided by an `if`/`else` where both branches assign it,
+/// rendered as one `let field = if cond {..} else {..};`), or an "other"
+/// side-effect statement that doesn't itself reference `var` bare (a
+/// back-reference like `sec->specialdata = door;`, seen in `p_doors.c`'s
+/// door spawners, isn't supported yet -- see `docs/03_TRANSPILER.md`).
 pub fn render_spawn_fn(
     corpus_dir: &Path,
     file: &str,
@@ -727,6 +850,9 @@ pub fn render_spawn_fn(
         ctor_var: &ctor_var,
     };
 
+    let mut reassign_counts: HashMap<String, usize> = HashMap::new();
+    count_ctor_field_assigns(&f.body.items, &ctor_var, &mut reassign_counts);
+
     // Each `var->field = expr;` becomes its own `let field = expr;` (in
     // original source order), not a flat struct-literal entry directly:
     // a later field's own value can legitimately read an earlier one back
@@ -735,7 +861,12 @@ pub fn render_spawn_fn(
     // already-`let`-bound local rather than the (nonexistent, in the
     // translated output) original C pointer. This also means every field
     // name already matches its binding, so the final literal is plain
-    // shorthand.
+    // shorthand. A field assigned more than once (`reassign_counts`) gets
+    // `let mut` -- its later reassignment (e.g. a plain conditional
+    // override, `if (flash->minlight == flash->maxlight) flash->minlight
+    // = 0;`) then falls out of the *ordinary* `render_stmt` path with no
+    // special-casing at all, since `ctx.ctor_var` already resolves every
+    // `flash->field` reference to that field's own local either way.
     let mut lines: Vec<String> = Vec::new();
     let mut ctor_field_names: Vec<String> = Vec::new();
     for item in &f.body.items {
@@ -746,18 +877,41 @@ pub fn render_spawn_fn(
         {
             continue;
         }
+        if let Some((field, then_rhs, else_rhs)) = if_else_ctor_field_assign(s, &ctor_var) {
+            if ctor_field_names.iter().any(|f| f == field) {
+                return Err(format!(
+                    "{fn_name}: field `{field}` already has an unconditional value; an if/else fully re-deciding it too isn't supported yet"
+                ));
+            }
+            let Stmt::If { cond, .. } = s else {
+                unreachable!("if_else_ctor_field_assign only matches Stmt::If")
+            };
+            let cond_text = render_bool_expr(cond, &ctx)?;
+            let (then_text, _) = render_expr(then_rhs, &ctx)?;
+            let (else_text, _) = render_expr(else_rhs, &ctx)?;
+            lines.push(format!(
+                "    let {field} = if {cond_text} {{ {then_text} }} else {{ {else_text} }};"
+            ));
+            ctor_field_names.push(field.to_string());
+            continue;
+        }
         if let Some((field, rhs)) = ctor_field_assign(s, &ctor_var) {
             let (rhs_text, _) = render_expr(rhs, &ctx)?;
             // `flick->sector = sector;`-style passthroughs need no `let`
             // at all -- the field's shorthand in the final literal
             // already resolves to the same outer binding.
             if rhs_text != field {
-                lines.push(format!("    let {field} = {rhs_text};"));
+                let mutability = if reassign_counts.get(field).copied().unwrap_or(0) > 1 {
+                    "mut "
+                } else {
+                    ""
+                };
+                lines.push(format!("    let {mutability}{field} = {rhs_text};"));
             }
             ctor_field_names.push(field.to_string());
             continue;
         }
-        if statement_references_ident(s, &ctor_var) {
+        if stmt_uses_bare_ctor_ident(s, &ctor_var) {
             return Err(format!(
                 "{fn_name}: a statement referencing the constructed value in an unsupported way: {s:?}"
             ));
@@ -1016,6 +1170,46 @@ pub fn P_SpawnGlowingLight(sector: SectorId, world: &mut World, thinkers: &mut A
     let direction = -1;
     world[sector].special = 0;
     thinkers.insert(Thinker::Glow(Glow { sector, minlight, maxlight, direction }));
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// Two new field-construction idioms in one function: `minlight` is
+    /// unconditionally computed, then conditionally overridden (needs
+    /// `let mut` and falls through the *ordinary* `render_stmt`/`if`
+    /// path, no special-casing); `count` has *no* unconditional
+    /// assignment at all, decided entirely by an `if`/`else` whose
+    /// condition is `!inSync` (an `int`, not a real `bool` -- exercises
+    /// `render_bool_expr`'s C-truthiness `== 0` rendering).
+    #[test]
+    fn test_p_spawn_strobe_flash_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("sector".to_string(), "SectorId".to_string()),
+            ("fastOrSlow".to_string(), "i32".to_string()),
+            ("inSync".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rendered = render_spawn_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "P_SpawnStrobeFlash",
+            "Strobe",
+            &params,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnStrobeFlash(sector: SectorId, fastOrSlow: i32, inSync: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let darktime = fastOrSlow;
+    let brighttime = STROBEBRIGHT;
+    let maxlight = world[sector].lightlevel;
+    let mut minlight = P_FindMinSurroundingLight(sector, world[sector].lightlevel);
+    if minlight == maxlight {
+        minlight = 0;
+    }
+    world[sector].special = 0;
+    let count = if inSync == 0 { (P_Random() & 7) + 1 } else { 1 };
+    thinkers.insert(Thinker::Strobe(Strobe { sector, darktime, brighttime, maxlight, minlight, count }));
 }";
         assert_eq!(rendered, expected);
     }
