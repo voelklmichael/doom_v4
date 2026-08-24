@@ -39,6 +39,16 @@
 //! `default:` gets an implicit trailing `_ => {}` arm, matching C's own
 //! "no case matched, do nothing" semantics for a plain integer subject
 //! (not a closed enum Rust could check exhaustiveness on directly).
+//!
+//! **`P_Spawn*` constructor functions (`render_spawn_fn`)**: a genuinely
+//! different idiom from a tick function's straight-line/`if`/`switch`
+//! logic, not just new statement/expression shapes -- see its own doc
+//! comment for the full reasoning. `Z_Malloc` + `P_AddThinker` + a field-
+//! by-field imperative fill-in becomes one `Thinker::Variant(Struct {
+//! ... })` literal handed to `Arena::insert`, reordering statements
+//! (every field write groups at the `insert` call) in a way that's sound
+//! only because C's single-threaded, synchronous execution means nothing
+//! ever observes the value mid-construction.
 
 use crate::parser::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, FunctionDef,
@@ -60,6 +70,22 @@ fn is_cross_ref(rust_type: &str) -> bool {
 struct FnBodyContext<'a> {
     self_param: &'a str,
     self_field_types: &'a HashMap<String, String>,
+    /// Other identifiers (typically a constructor function's own
+    /// parameters, e.g. `sector: SectorId`) whose *own* declared type is
+    /// directly a cross-reference index type -- distinct from
+    /// `self_field_types`, which is about a *field of* `self_param`.
+    /// Empty for ordinary tick functions, whose only cross-references are
+    /// through `self`'s own fields.
+    extra_cross_ref_idents: &'a HashMap<String, String>,
+    /// A constructor function's own not-yet-fully-built local (e.g.
+    /// `flash` in `P_SpawnLightFlash`), if any. A field access rooted at
+    /// it (`flash->maxtime`, referencing a field `render_spawn_fn` has
+    /// already emitted as `let maxtime = ...;`) resolves to that bare
+    /// local name rather than `world[...]` indexing or a plain `.field`
+    /// access -- unlike `self_param`, this isn't a real existing value to
+    /// dereference, just a name for fields being built up one `let` at a
+    /// time. Empty for ordinary tick functions.
+    ctor_var: &'a str,
 }
 
 fn indent(depth: usize) -> String {
@@ -135,8 +161,19 @@ fn render_assign_op(op: AssignOp) -> &'static str {
 fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> {
     match e {
         Expr::IntLiteral(s) => Ok((s.clone(), false)),
-        Expr::Ident(name) => Ok((name.clone(), false)),
+        Expr::Ident(name) => {
+            let is_crossref = ctx
+                .extra_cross_ref_idents
+                .get(name.as_str())
+                .is_some_and(|t| is_cross_ref(t));
+            Ok((name.clone(), is_crossref))
+        }
         Expr::Member { base, field, .. } => {
+            if !ctx.ctor_var.is_empty()
+                && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
+            {
+                return Ok((field.clone(), false));
+            }
             let (base_text, base_is_crossref) = render_expr(base, ctx)?;
             let base_text = if base_is_crossref {
                 format!("world[{base_text}]")
@@ -471,14 +508,271 @@ pub fn render_fn(
         .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
     let param_name = first_param_name(f)
         .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
+    let no_extra_cross_refs = HashMap::new();
     let ctx = FnBodyContext {
         self_param: &param_name,
         self_field_types,
+        extra_cross_ref_idents: &no_extra_cross_refs,
+        ctor_var: "",
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     Ok(format!(
         "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World) {{\n{}\n}}",
         body_lines.join("\n")
+    ))
+}
+
+/// True for `var = Z_Malloc(...);` -- the allocation call itself, always
+/// discarded (see module docs: `render_spawn_fn` replaces it with
+/// `Arena::insert`).
+fn is_malloc_assign(s: &Stmt, ctor_var: &str) -> bool {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+    else {
+        return false;
+    };
+    matches!(lhs.as_ref(), Expr::Ident(n) if n == ctor_var)
+        && matches!(rhs.as_ref(), Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "Z_Malloc"))
+}
+
+/// True for `P_AddThinker(&var->thinker);` -- always discarded, same
+/// reason.
+fn is_add_thinker_call(s: &Stmt) -> bool {
+    let Stmt::Expr(Some(Expr::Call { callee, .. })) = s else {
+        return false;
+    };
+    matches!(callee.as_ref(), Expr::Ident(n) if n == "P_AddThinker")
+}
+
+/// True for `var->thinker.function.acpN = (cast) FnName;` -- the deepest
+/// `Member` in the chain (closest to `var`) names field `"thinker"`,
+/// regardless of how many `.function`/`.acpN` levels sit on top of it.
+/// Always discarded: the enum variant tag already encodes which function
+/// this is.
+fn is_function_pointer_assign(s: &Stmt, ctor_var: &str) -> bool {
+    fn innermost_base_and_field(e: &Expr) -> Option<(&str, &str)> {
+        let Expr::Member { base, field, .. } = e else {
+            return None;
+        };
+        match base.as_ref() {
+            Expr::Ident(name) => Some((name.as_str(), field.as_str())),
+            inner => innermost_base_and_field(inner),
+        }
+    }
+    let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s else {
+        return false;
+    };
+    innermost_base_and_field(lhs)
+        .is_some_and(|(base, field)| base == ctor_var && field == "thinker")
+}
+
+/// `var->field = expr;`, split into which field and the right-hand side
+/// -- used both to recognize `var->thinker.function.acpN = (cast) FnName;`
+/// (the `field == "thinker"` case, discarded -- the enum variant tag
+/// already encodes which function this is) and every other field, which
+/// becomes one constructor-literal field.
+fn ctor_field_assign<'a>(s: &'a Stmt, ctor_var: &str) -> Option<(&'a str, &'a Expr)> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+    else {
+        return None;
+    };
+    let Expr::Member {
+        base,
+        field,
+        arrow: true,
+    } = lhs.as_ref()
+    else {
+        return None;
+    };
+    if matches!(base.as_ref(), Expr::Ident(n) if n == ctor_var) {
+        Some((field.as_str(), rhs))
+    } else {
+        None
+    }
+}
+
+/// A conservative, `render_expr`-shaped walk: `true` for exactly the
+/// expression shapes this renderer understands *and* that don't mention
+/// `name`, and `true` (defensively) for anything it doesn't recognize --
+/// so `render_spawn_fn` errs loudly on a statement it can't prove is safe
+/// to reorder, rather than silently mistranslating it.
+fn expr_references_ident(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Ident(n) => n == name,
+        Expr::IntLiteral(_) => false,
+        Expr::Member { base, .. } => expr_references_ident(base, name),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_references_ident(lhs, name) || expr_references_ident(rhs, name)
+        }
+        Expr::Unary { expr, .. } => expr_references_ident(expr, name),
+        Expr::Call { callee, args } => {
+            expr_references_ident(callee, name)
+                || args.iter().any(|a| expr_references_ident(a, name))
+        }
+        Expr::Assign { lhs, rhs, .. } => {
+            expr_references_ident(lhs, name) || expr_references_ident(rhs, name)
+        }
+        _ => true,
+    }
+}
+
+fn statement_references_ident(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => expr_references_ident(e, name),
+        Stmt::Expr(None) => false,
+        Stmt::Return(Some(e)) => expr_references_ident(e, name),
+        Stmt::Return(None) => false,
+        _ => true,
+    }
+}
+
+/// Renders a `P_Spawn*`-shaped constructor function (`fn_name`, found in
+/// `corpus_dir.join(file)`) as a real Rust `pub fn` -- a genuinely
+/// different idiom from `render_fn`'s tick functions, not just new
+/// statement/expression shapes: `Z_Malloc` + `P_AddThinker` + a field-by-
+/// field imperative fill-in becomes one `Thinker::Variant(Struct { ... })`
+/// literal handed to `Arena::insert` in a single call, since the enum
+/// variant tag already replaces the `var->thinker.function.acpN =
+/// (cast) FnName;` line entirely (the same substitution `Thinker` itself
+/// already makes for the tick-dispatch side). This reorders statements
+/// relative to the original (every constructor-literal field is grouped
+/// together at the `insert` call, regardless of where its assignment fell
+/// in the original's source order) -- sound because C's own single-
+/// threaded, synchronous execution means nothing observes the
+/// partially-built value between `Z_Malloc` and the constructor function
+/// returning, so grouping the field writes changes *when* they happen
+/// relative to each other, never *whether* the final value ends up
+/// correct.
+///
+/// `ctor_rust_type` names both the constructed struct and its `Thinker`
+/// variant (true for every case seen so far -- `FireFlicker`,
+/// `LightFlash`, `Strobe`, `Glow`). `param_cross_ref_types` gives the
+/// function's own parameters' Rust types (e.g. `{"sector": "SectorId"}`),
+/// needed both to render the function's own signature and to resolve a
+/// parameter used as a cross-reference in a field's own value expression
+/// (`sector->lightlevel`, just like a tick function's `self` fields).
+///
+/// **Scope**: only functions matching this exact shape -- one local
+/// `Foo* var;`, allocated via `Z_Malloc`, immediately `P_AddThinker`'d,
+/// with every other statement either a recognized discard, a `var->field
+/// = expr;` constructor field, or an "other" side-effect statement that
+/// doesn't itself reference `var` (a back-reference like `sec->specialdata
+/// = door;`, seen in `p_doors.c`'s door spawners, isn't supported yet --
+/// see `docs/03_TRANSPILER.md`).
+pub fn render_spawn_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    ctor_rust_type: &str,
+    param_cross_ref_types: &HashMap<String, String>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+
+    let DirectDeclarator::Function(_, params) = &f.declarator.direct else {
+        return Err(format!("{fn_name}: not a function declarator"));
+    };
+    let mut rendered_params = Vec::with_capacity(params.params.len());
+    for p in &params.params {
+        let ParamDeclarator::Named(d) = &p.declarator else {
+            return Err(format!("{fn_name}: an unnamed parameter isn't supported"));
+        };
+        let name = declarator_name(d)
+            .ok_or_else(|| format!("{fn_name}: a parameter declarator has no plain name"))?;
+        let rust_type = param_cross_ref_types
+            .get(&name)
+            .ok_or_else(|| format!("{fn_name}: parameter `{name}`'s Rust type isn't known"))?;
+        rendered_params.push(format!("{name}: {rust_type}"));
+    }
+
+    let mut ctor_var: Option<String> = None;
+    for item in &f.body.items {
+        let BlockItem::Decl(d) = item else { continue };
+        if !matches!(
+            d.specifiers.type_specifiers.as_slice(),
+            [TypeSpecifier::TypedefName(_)]
+        ) {
+            continue;
+        }
+        let [decl] = d.declarators.as_slice() else {
+            continue;
+        };
+        if decl.declarator.pointer_quals.len() != 1 || decl.initializer.is_some() {
+            continue;
+        }
+        let name = declarator_name(&decl.declarator)
+            .ok_or_else(|| format!("{fn_name}: constructor-shaped local has no plain name"))?;
+        if ctor_var.is_some() {
+            return Err(format!(
+                "{fn_name}: more than one constructor-shaped local declared, not supported yet"
+            ));
+        }
+        ctor_var = Some(name);
+    }
+    let ctor_var = ctor_var
+        .ok_or_else(|| format!("{fn_name}: no constructor-shaped local (`Foo* x;`) found"))?;
+
+    let ctx = FnBodyContext {
+        self_param: "",
+        self_field_types: &HashMap::new(),
+        extra_cross_ref_idents: param_cross_ref_types,
+        ctor_var: &ctor_var,
+    };
+
+    // Each `var->field = expr;` becomes its own `let field = expr;` (in
+    // original source order), not a flat struct-literal entry directly:
+    // a later field's own value can legitimately read an earlier one back
+    // (`P_SpawnLightFlash`'s `flash->count = (P_Random()&flash->maxtime)
+    // +1;`), which only stays correct if that read resolves to an
+    // already-`let`-bound local rather than the (nonexistent, in the
+    // translated output) original C pointer. This also means every field
+    // name already matches its binding, so the final literal is plain
+    // shorthand.
+    let mut lines: Vec<String> = Vec::new();
+    let mut ctor_field_names: Vec<String> = Vec::new();
+    for item in &f.body.items {
+        let BlockItem::Stmt(s) = item else { continue };
+        if is_malloc_assign(s, &ctor_var)
+            || is_add_thinker_call(s)
+            || is_function_pointer_assign(s, &ctor_var)
+        {
+            continue;
+        }
+        if let Some((field, rhs)) = ctor_field_assign(s, &ctor_var) {
+            let (rhs_text, _) = render_expr(rhs, &ctx)?;
+            // `flick->sector = sector;`-style passthroughs need no `let`
+            // at all -- the field's shorthand in the final literal
+            // already resolves to the same outer binding.
+            if rhs_text != field {
+                lines.push(format!("    let {field} = {rhs_text};"));
+            }
+            ctor_field_names.push(field.to_string());
+            continue;
+        }
+        if statement_references_ident(s, &ctor_var) {
+            return Err(format!(
+                "{fn_name}: a statement referencing the constructed value in an unsupported way: {s:?}"
+            ));
+        }
+        lines.extend(render_stmt(s, &ctx, 1)?);
+    }
+
+    lines.push(format!(
+        "    thinkers.insert(Thinker::{ctor_rust_type}({ctor_rust_type} {{ {} }}));",
+        ctor_field_names.join(", ")
+    ));
+    Ok(format!(
+        "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
+        rendered_params.join(", "),
+        lines.join("\n")
     ))
 }
 
@@ -642,6 +936,86 @@ pub fn T_Glow(g: &mut Glow, world: &mut World) {
         }
         _ => {}
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    fn sector_param() -> HashMap<String, String> {
+        [("sector".to_string(), "SectorId".to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn test_p_spawn_fire_flicker_renders_exactly() {
+        let rendered = render_spawn_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "P_SpawnFireFlicker",
+            "FireFlicker",
+            &sector_param(),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnFireFlicker(sector: SectorId, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    world[sector].special = 0;
+    let maxlight = world[sector].lightlevel;
+    let minlight = P_FindMinSurroundingLight(sector, world[sector].lightlevel) + 16;
+    let count = 4;
+    thinkers.insert(Thinker::FireFlicker(FireFlicker { sector, maxlight, minlight, count }));
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// Confirms a field's value can legitimately read an *earlier* field
+    /// back (`flash->count = (P_Random()&flash->maxtime)+1;`) -- this only
+    /// stays correct because each field becomes its own `let` in source
+    /// order, so `maxtime` resolves to the already-bound local rather
+    /// than a nonexistent `flash` variable in the translated output.
+    #[test]
+    fn test_p_spawn_light_flash_renders_exactly() {
+        let rendered = render_spawn_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "P_SpawnLightFlash",
+            "LightFlash",
+            &sector_param(),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnLightFlash(sector: SectorId, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    world[sector].special = 0;
+    let maxlight = world[sector].lightlevel;
+    let minlight = P_FindMinSurroundingLight(sector, world[sector].lightlevel);
+    let maxtime = 64;
+    let mintime = 7;
+    let count = (P_Random() & maxtime) + 1;
+    thinkers.insert(Thinker::LightFlash(LightFlash { sector, maxlight, minlight, maxtime, mintime, count }));
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// The "other" side-effect statement (`sector->special = 0;`) falls
+    /// *after* every constructor field here (unlike the other two, where
+    /// it comes first) -- confirms statements interleave in real source
+    /// order rather than always being hoisted to one end.
+    #[test]
+    fn test_p_spawn_glowing_light_renders_exactly() {
+        let rendered = render_spawn_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "P_SpawnGlowingLight",
+            "Glow",
+            &sector_param(),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnGlowingLight(sector: SectorId, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let minlight = P_FindMinSurroundingLight(sector, world[sector].lightlevel);
+    let maxlight = world[sector].lightlevel;
+    let direction = -1;
+    world[sector].special = 0;
+    thinkers.insert(Thinker::Glow(Glow { sector, minlight, maxlight, direction }));
 }";
         assert_eq!(rendered, expected);
     }
