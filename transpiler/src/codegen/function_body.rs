@@ -203,7 +203,10 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                     .self_field_types
                     .get(field.as_str())
                     .is_some_and(|t| is_cross_ref(t));
-            Ok((format!("{base_text}.{field}"), is_crossref))
+            Ok((
+                format!("{base_text}.{}", rust_field_name(field)?),
+                is_crossref,
+            ))
         }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
@@ -462,6 +465,29 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
     }
 }
 
+/// Peels off a chain of `case` labels sharing one body (`case blazeRaise:
+/// case blazeClose: <shared body>`) -- C parses each `case X:` as a label
+/// wrapping only the *next* statement, so multiple labels in a row
+/// (nothing but another `case` between them) nest as `Case{X, stmt:
+/// Case{Y, stmt: <real body>}}` rather than appearing as flat siblings.
+/// Confirmed directly against the real parsed AST (`T_VerticalDoor`) --
+/// not assumed -- before writing this. Returns every label's own
+/// rendered text, in order, plus the first statement that isn't itself a
+/// `case` label (which may be `Stmt::Break` itself, for a group of labels
+/// whose shared body is empty -- `render_switch`'s own caller handles
+/// that).
+fn collect_case_labels<'a>(
+    mut s: &'a Stmt,
+    ctx: &FnBodyContext,
+) -> Result<(Vec<String>, &'a Stmt), String> {
+    let mut labels = Vec::new();
+    while let Stmt::Case { expr, stmt } = s {
+        labels.push(render_expr(expr, ctx)?.0);
+        s = stmt;
+    }
+    Ok((labels, s))
+}
+
 /// Renders `switch (cond) { ... }` as a Rust `match` -- see module docs
 /// for how C's per-statement `case`/`default` labels get re-grouped into
 /// one block per arm, and why an implicit `_ => {}` is added when there's
@@ -487,12 +513,15 @@ fn render_switch(
         stmts.push(s);
     }
 
-    let mut arms: Vec<(Option<String>, Vec<&Stmt>)> = Vec::new();
+    let mut arms: Vec<(Option<Vec<String>>, Vec<&Stmt>)> = Vec::new();
     let mut has_default = false;
     let mut i = 0;
     while i < stmts.len() {
-        let (label, first_stmt) = match stmts[i] {
-            Stmt::Case { expr, stmt } => (Some(render_expr(expr, ctx)?.0), stmt.as_ref()),
+        let (labels, first_stmt) = match stmts[i] {
+            Stmt::Case { .. } => {
+                let (labels, first_stmt) = collect_case_labels(stmts[i], ctx)?;
+                (Some(labels), first_stmt)
+            }
             Stmt::Default(stmt) => {
                 has_default = true;
                 (None, stmt.as_ref())
@@ -504,9 +533,20 @@ fn render_switch(
             }
         };
         i += 1;
-        let mut arm_stmts = vec![first_stmt];
-        let mut saw_break = false;
-        while i < stmts.len() {
+        // Several labels sharing one body (`case blazeRaise: case
+        // blazeClose: ...;`) can peel all the way down to a bare `break;`
+        // with nothing in between (`case blazeClose: case close: break;`
+        // -- "these types intentionally do nothing") -- `collect_case_labels`
+        // hands that back as `first_stmt` itself, not a separate sibling,
+        // so it needs recognizing here rather than being pushed as a real
+        // body statement.
+        let mut saw_break = matches!(first_stmt, Stmt::Break);
+        let mut arm_stmts: Vec<&Stmt> = if saw_break {
+            Vec::new()
+        } else {
+            vec![first_stmt]
+        };
+        while !saw_break && i < stmts.len() {
             match stmts[i] {
                 Stmt::Case { .. } | Stmt::Default(_) => break,
                 Stmt::Break => {
@@ -526,12 +566,15 @@ fn render_switch(
                     .to_string(),
             );
         }
-        arms.push((label, arm_stmts));
+        arms.push((labels, arm_stmts));
     }
 
     let mut lines = vec![format!("{}match {cond_text} {{", indent(depth))];
-    for (label, arm_stmts) in &arms {
-        let pattern = label.clone().unwrap_or_else(|| "_".to_string());
+    for (labels, arm_stmts) in &arms {
+        let pattern = labels
+            .as_ref()
+            .map(|ls| ls.join(" | "))
+            .unwrap_or_else(|| "_".to_string());
         lines.push(format!("{}{pattern} => {{", indent(depth + 1)));
         for s in arm_stmts {
             lines.extend(render_stmt(s, ctx, depth + 2)?);
@@ -1939,5 +1982,87 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
+    }
+
+    /// `T_VerticalDoor`'s innermost `switch(door->type) { case blazeClose:
+    /// case close: break; default: ...; }` -- two `case` labels sharing
+    /// one (here, empty) body. C parses `case blazeClose: case close:
+    /// break;` as `Case{blazeClose, stmt: Case{close, stmt: Break}}`, not
+    /// as flat siblings -- confirmed directly against the real parsed AST
+    /// before writing `collect_case_labels`, which peels that chain back
+    /// into one Rust match arm covering both patterns
+    /// (`blazeClose | close => {}`). The whole function still can't
+    /// render end-to-end yet (`S_StartSound`'s `(mobj_t *)&door->sector->
+    /// soundorg` cast isn't handled -- a separate, unrelated gap), so
+    /// this clones just the real shared-label `Case` chain and its real
+    /// `switch` condition out of the parsed AST and re-wraps them in a
+    /// synthetic `Switch`/`Compound` to test `render_switch`'s new
+    /// shared-label handling in isolation, without needing the whole
+    /// function to compile.
+    #[test]
+    fn test_shared_case_labels_against_real_t_vertical_door() {
+        let path = corpus_dir().join("p_doors.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_doors.c should parse");
+        let f = find_function_def(&unit.items, "T_VerticalDoor").expect("T_VerticalDoor not found");
+        // `blazeClose` labels two different arms in `T_VerticalDoor`
+        // (the `pastdest` switch's `case blazeRaise: case blazeClose:
+        // specialdata = NULL; ...` and the `crushed` switch's own `case
+        // blazeClose: case close: break;`) -- match the exact chain
+        // shape (`blazeClose` -> `close` -> a bare `break;`, nothing
+        // else) to find the second one specifically.
+        let is_blaze_close_close_break_case = |s: &Stmt| {
+            let Stmt::Case { expr, stmt } = s else {
+                return false;
+            };
+            if !matches!(expr, Expr::Ident(n) if n == "blazeClose") {
+                return false;
+            }
+            let Stmt::Case { expr, stmt } = stmt.as_ref() else {
+                return false;
+            };
+            matches!(expr, Expr::Ident(n) if n == "close") && matches!(stmt.as_ref(), Stmt::Break)
+        };
+        let case_chain = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_blaze_close_close_break_case),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `case blazeClose:` statement somewhere in T_VerticalDoor")
+            .clone();
+        let switch_cond = Expr::Member {
+            base: Box::new(Expr::Ident("door".to_string())),
+            field: "type".to_string(),
+            arrow: true,
+        };
+        let synthetic_switch = Stmt::Switch {
+            cond: switch_cond,
+            body: Box::new(Stmt::Compound(crate::parser::ast::CompoundStmt {
+                items: vec![BlockItem::Stmt(case_chain)],
+            })),
+        };
+
+        let no_self_fields = HashMap::new();
+        let no_extra_cross_refs = HashMap::new();
+        let ctx = FnBodyContext {
+            self_param: "door",
+            self_field_types: &no_self_fields,
+            extra_cross_ref_idents: &no_extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+        };
+        let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "    match door.r#type {".to_string(),
+                "        blazeClose | close => {".to_string(),
+                "        }".to_string(),
+                "        _ => {}".to_string(),
+                "    }".to_string(),
+            ]
+        );
     }
 }
