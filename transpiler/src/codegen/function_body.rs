@@ -337,16 +337,45 @@ fn render_condition(
 ) -> Result<(Vec<String>, String), String> {
     match cond {
         Expr::PreIncDec { expr, op } => {
-            let (target_text, _) = render_expr(expr, ctx)?;
-            let op_text = match op {
-                IncDecOp::Inc => "+= 1",
-                IncDecOp::Dec => "-= 1",
-            };
-            let hoisted = vec![format!("{}{target_text} {op_text};", indent(depth))];
+            let (hoisted, target_text) = hoist_pre_inc_dec(expr, *op, ctx, depth)?;
             Ok((hoisted, format!("{target_text} != 0")))
+        }
+        // `if (!--door->topcountdown)` -- the same countdown-to-zero
+        // idiom as the bare `--x` case above, just testing for zero
+        // (C's `!` truthiness on the decremented result) rather than
+        // nonzero. Extremely common in Doom's timer/countdown tick
+        // functions (`T_VerticalDoor`'s own WAITING/INITIAL WAIT states).
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr: not_expr,
+        } if matches!(not_expr.as_ref(), Expr::PreIncDec { .. }) => {
+            let Expr::PreIncDec { expr, op } = not_expr.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let (hoisted, target_text) = hoist_pre_inc_dec(expr, *op, ctx, depth)?;
+            Ok((hoisted, format!("{target_text} == 0")))
         }
         _ => Ok((Vec::new(), render_bool_expr(cond, ctx)?)),
     }
+}
+
+/// Renders `--x`/`++x` as a statement to hoist immediately before an
+/// `if`'s own test (both `render_condition` cases above need this, just
+/// with a different final comparison), returning that statement plus the
+/// plain target text for the caller to build its own comparison from.
+fn hoist_pre_inc_dec(
+    expr: &Expr,
+    op: IncDecOp,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<(Vec<String>, String), String> {
+    let (target_text, _) = render_expr(expr, ctx)?;
+    let op_text = match op {
+        IncDecOp::Inc => "+= 1",
+        IncDecOp::Dec => "-= 1",
+    };
+    let hoisted = vec![format!("{}{target_text} {op_text};", indent(depth))];
+    Ok((hoisted, target_text))
 }
 
 /// Renders `s` as the body lines of an `if`/`else` arm (or any other
@@ -1703,5 +1732,51 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
     }
 }";
         assert_eq!(rendered, expected);
+    }
+
+    /// `T_VerticalDoor` (`p_doors.c`) is far larger than anything
+    /// translated so far -- nested `switch`es with cases sharing one
+    /// body, self-removal via `P_RemoveThinker` (which would need
+    /// `Thinker::tick`'s own signature revised to carry a `Handle` and
+    /// `&mut Arena`, a consequential change not attempted yet), `NULL`
+    /// assigned to `specialdata` (needs `None`, not yet handled) -- so
+    /// this doesn't attempt the whole function. It does use
+    /// `if (!--door->topcountdown)` twice (its WAITING/INITIAL-WAIT
+    /// countdown states): the same countdown-to-zero idiom as
+    /// `T_FireFlicker`'s bare `--flick->count`, just negated (testing
+    /// for zero, not nonzero). This extracts that real condition
+    /// sub-expression directly from the parsed corpus AST -- real,
+    /// corpus-verified C, not a fabricated snippet -- to confirm
+    /// `render_condition`'s new negated-`PreIncDec` case in isolation.
+    #[test]
+    fn test_negated_pre_dec_condition_against_real_t_vertical_door() {
+        let path = corpus_dir().join("p_doors.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_doors.c should parse");
+        let f = find_function_def(&unit.items, "T_VerticalDoor").expect("T_VerticalDoor not found");
+        let Some(BlockItem::Stmt(Stmt::Switch { body, .. })) = f.body.items.get(1) else {
+            panic!("expected T_VerticalDoor's second body item to be its outer switch");
+        };
+        let Stmt::Compound(c) = body.as_ref() else {
+            panic!("expected the switch body to be a compound statement");
+        };
+        let Some(BlockItem::Stmt(Stmt::Case { stmt, .. })) = c.items.first() else {
+            panic!("expected the switch body's first item to be a case label");
+        };
+        let Stmt::If { cond, .. } = stmt.as_ref() else {
+            panic!("expected `case 0:`'s statement to be the `if (!--door->topcountdown)`");
+        };
+
+        let self_field_types = field_types(&[("topcountdown", "i32")]);
+        let no_extra_cross_refs = HashMap::new();
+        let ctx = FnBodyContext {
+            self_param: "door",
+            self_field_types: &self_field_types,
+            extra_cross_ref_idents: &no_extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+        };
+        let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
+        assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
+        assert_eq!(cond_text, "door.topcountdown == 0");
     }
 }
