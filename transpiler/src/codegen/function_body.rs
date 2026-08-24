@@ -239,15 +239,31 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SectorId({index_text} as u32)"), false))
         }
+        Expr::Unary {
+            op: UnaryOp::AddrOf,
+            expr,
+        } => {
+            // Every other cross-reference-typed field (`SectorId` etc.)
+            // has its own narrower special case above -- reaching here
+            // means `expr` is a plain *value* field (e.g. `sector_t.
+            // soundorg`, an embedded `degenmobj_t`, not a pointer/index at
+            // all), so a real Rust `&` reference is the correct,
+            // idiomatic, safe translation, not a pointer trick.
+            let (inner_text, _) = render_expr(expr, ctx)?;
+            let inner_text = parenthesize_if_needed(expr, &inner_text, u8::MAX, false);
+            Ok((format!("&{inner_text}"), false))
+        }
         Expr::Unary { op, expr } => {
             let op_text = match op {
                 UnaryOp::Minus => "-",
                 UnaryOp::Plus => "+",
                 UnaryOp::Not | UnaryOp::BitNot => "!",
-                UnaryOp::Deref | UnaryOp::AddrOf => {
-                    return Err(format!(
-                        "render_expr: unary {op:?} isn't supported yet -- translated code has no real pointers"
-                    ));
+                UnaryOp::AddrOf => unreachable!("handled by the dedicated arm above"),
+                UnaryOp::Deref => {
+                    return Err(
+                        "render_expr: unary deref isn't supported yet -- translated code has no real pointers"
+                            .to_string(),
+                    );
                 }
             };
             let (inner_text, _) = render_expr(expr, ctx)?;
@@ -256,6 +272,18 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let inner_text = parenthesize_if_needed(expr, &inner_text, u8::MAX, false);
             Ok((format!("{op_text}{inner_text}"), false))
         }
+        // A C cast, dropped entirely rather than rendered as `as
+        // TargetType` -- every one seen so far is type-erasure noise
+        // with no real value transformation behind it (matching the
+        // `(actionf_p1)` cast around an action-function pointer, already
+        // elided the same way by `ActionFn`'s own design): `(mobj_t *)
+        // &door->sector->soundorg` reinterprets a `degenmobj_t`'s memory
+        // layout as a `mobj_t*` purely so `S_StartSound`'s C signature
+        // (`void* origin`) accepts it, not because the value is actually
+        // becoming a `Mobj`. A cast reflecting a genuine numeric
+        // conversion hasn't been seen yet; this would need revisiting if
+        // one turns up.
+        Expr::Cast { expr, .. } => render_expr(expr, ctx),
         Expr::Call { callee, args } => {
             let (callee_text, _) = render_expr(callee, ctx)?;
             let mut rendered_args = Vec::with_capacity(args.len());
@@ -784,10 +812,56 @@ pub fn render_fn(
         ctor_var_handle_name: "",
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    // Only a tick function that actually removes itself somewhere in its
+    // body (`is_self_removal_call`, possibly nested arbitrarily deep in
+    // `switch`/`if` -- `T_VerticalDoor` buries several inside two levels
+    // of `switch`) needs its own `Handle<Thinker>`/`&mut Arena<Thinker>`
+    // -- confirmed against a first complete self-removing function
+    // (`T_VerticalDoor`) rather than added speculatively to every tick
+    // function's signature ahead of real evidence, matching the same
+    // "measure, don't guess" call already made for `World`.
+    let extra_params = if body_has_self_removal(&f.body.items, &param_name) {
+        ", handle: Handle<Thinker>, arena: &mut Arena<Thinker>"
+    } else {
+        ""
+    };
     Ok(format!(
-        "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World) {{\n{}\n}}",
+        "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}) {{\n{}\n}}",
         body_lines.join("\n")
     ))
+}
+
+fn body_has_self_removal(items: &[BlockItem], self_param: &str) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_self_removal(s, self_param),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn stmt_has_self_removal(s: &Stmt, self_param: &str) -> bool {
+    if let Stmt::Expr(Some(e)) = s
+        && is_self_removal_call(e, self_param)
+    {
+        return true;
+    }
+    match s {
+        Stmt::Compound(c) => body_has_self_removal(&c.items, self_param),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_has_self_removal(then_branch, self_param)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_self_removal(eb, self_param))
+        }
+        Stmt::Switch { body, .. } => stmt_has_self_removal(body, self_param),
+        Stmt::Case { stmt, .. } => stmt_has_self_removal(stmt, self_param),
+        Stmt::Default(stmt) => stmt_has_self_removal(stmt, self_param),
+        Stmt::While { body, .. } => stmt_has_self_removal(body, self_param),
+        _ => false,
+    }
 }
 
 /// True for `var = Z_Malloc(...);` -- the allocation call itself, always
@@ -2064,5 +2138,118 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
                 "    }".to_string(),
             ]
         );
+    }
+
+    /// `T_VerticalDoor` end-to-end -- the function every other test in
+    /// this module worked up to piece by piece (negated `--x`, `NULL` ->
+    /// `None`, self-removal, shared `case` labels, the `S_StartSound`
+    /// cast/`&`-reference pair), now proven complete rather than only in
+    /// isolated fragments. Confirms `render_fn`'s own signature-extension
+    /// logic (`body_has_self_removal`) correctly finds the self-removal
+    /// calls buried two `switch` levels deep and adds `handle`/`arena` to
+    /// the generated signature.
+    #[test]
+    fn test_t_vertical_door_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_doors.c",
+            "T_VerticalDoor",
+            "VerticalDoor",
+            &vldoor_field_types(),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_VerticalDoor(door: &mut VerticalDoor, world: &mut World, handle: Handle<Thinker>, arena: &mut Arena<Thinker>) {
+    let mut res;
+    match door.direction {
+        0 => {
+            door.topcountdown -= 1;
+            if door.topcountdown == 0 {
+                match door.r#type {
+                    blazeRaise => {
+                        door.direction = -1;
+                        S_StartSound(&world[door.sector].soundorg, sfx_bdcls);
+                    }
+                    normal => {
+                        door.direction = -1;
+                        S_StartSound(&world[door.sector].soundorg, sfx_dorcls);
+                    }
+                    close30ThenOpen => {
+                        door.direction = 1;
+                        S_StartSound(&world[door.sector].soundorg, sfx_doropn);
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        2 => {
+            door.topcountdown -= 1;
+            if door.topcountdown == 0 {
+                match door.r#type {
+                    raiseIn5Mins => {
+                        door.direction = 1;
+                        door.r#type = normal;
+                        S_StartSound(&world[door.sector].soundorg, sfx_doropn);
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        -1 => {
+            res = T_MovePlane(door.sector, door.speed, world[door.sector].floorheight, false, 1, door.direction);
+            if res == pastdest {
+                match door.r#type {
+                    blazeRaise | blazeClose => {
+                        world[door.sector].specialdata = None;
+                        arena.remove(handle);
+                        S_StartSound(&world[door.sector].soundorg, sfx_bdcls);
+                    }
+                    normal | close => {
+                        world[door.sector].specialdata = None;
+                        arena.remove(handle);
+                    }
+                    close30ThenOpen => {
+                        door.direction = 0;
+                        door.topcountdown = 35 * 30;
+                    }
+                    _ => {
+                    }
+                }
+            } else {
+                if res == crushed {
+                    match door.r#type {
+                        blazeClose | close => {
+                        }
+                        _ => {
+                            door.direction = 1;
+                            S_StartSound(&world[door.sector].soundorg, sfx_doropn);
+                        }
+                    }
+                }
+            }
+        }
+        1 => {
+            res = T_MovePlane(door.sector, door.speed, door.topheight, false, 1, door.direction);
+            if res == pastdest {
+                match door.r#type {
+                    blazeRaise | normal => {
+                        door.direction = 0;
+                        door.topcountdown = door.topwait;
+                    }
+                    close30ThenOpen | blazeOpen | open => {
+                        world[door.sector].specialdata = None;
+                        arena.remove(handle);
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}";
+        assert_eq!(rendered, expected);
     }
 }
