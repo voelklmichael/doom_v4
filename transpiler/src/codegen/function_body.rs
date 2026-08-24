@@ -600,28 +600,69 @@ fn render_while(
     Ok(lines)
 }
 
+/// `P_RemoveThinker(&door->thinker);` -- a tick function removing
+/// *itself* (`T_VerticalDoor`'s own "unlink and free" once a mover
+/// finishes), the single most common self-removal shape in the corpus
+/// (matching `Arena::remove`'s own doc comment on the same pattern). Only
+/// this exact shape is recognized -- removing some *other* handle
+/// (`P_RemoveThinker(&other->thinker)`) is a different, not-yet-attempted
+/// case, since it would need to *name* that other handle somehow rather
+/// than just reusing the receiver's own.
+fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
+    let Expr::Call { callee, args } = e else {
+        return false;
+    };
+    if !matches!(callee.as_ref(), Expr::Ident(n) if n == "P_RemoveThinker") {
+        return false;
+    }
+    let [arg] = args.as_slice() else {
+        return false;
+    };
+    matches!(arg, Expr::Unary { op: UnaryOp::AddrOf, expr }
+        if matches!(expr.as_ref(), Expr::Member { base, field, arrow: true }
+            if field == "thinker" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
+}
+
 /// `Expr::Assign` is rendered here (not in `render_expr`) since Doom's
 /// tick functions only ever use it as a bare statement, never nested
 /// inside a larger expression -- confirmed for `T_FireFlicker`, not yet
 /// generalized.
 fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
+    // `handle`/`arena` are the fixed names this renderer always uses for
+    // a tick function's own `Handle<Thinker>`/`&mut Arena<Thinker>`
+    // parameters, the same way `world`/`thinkers` are fixed names
+    // elsewhere -- not yet threaded through `render_fn`'s own generated
+    // signature (needs a complete real self-removing function to design
+    // that against, not just this one statement shape in isolation; see
+    // docs/03_TRANSPILER.md), so this only renders correctly once a
+    // caller supplies them by hand.
+    if is_self_removal_call(e, ctx.self_param) {
+        return Ok("arena.remove(handle)".to_string());
+    }
     if let Expr::Assign { op, lhs, rhs } = e {
         let (lhs_text, _) = render_expr(lhs, ctx)?;
         let (rhs_text, _) = render_expr(rhs, ctx)?;
         // `sector_t.specialdata`/`line_t.specialdata` map to
         // `Option<Handle<Thinker>>` (struct_fields.rs's own name-based
         // special case -- it's checked for truthiness/reset to `NULL`
-        // corpus-wide, not dereferenced unconditionally), so a
-        // constructor's back-reference assignment to it (`sec->
-        // specialdata = door;`, only reachable once `ctor_var_handle_name`
-        // is active -- see module docs) needs the same `Some(..)`
-        // wrapping every other `Option`-typed field gets from its own
-        // corpus initializer, even though this renderer has no general
-        // per-field-type awareness beyond this one matching special case.
-        let needs_option_wrap = !ctx.ctor_var_handle_name.is_empty()
-            && matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "specialdata")
+        // corpus-wide, not dereferenced unconditionally), so any
+        // assignment to it needs the same treatment every other
+        // `Option`-typed field gets from its own corpus initializer, even
+        // though this renderer has no general per-field-type awareness
+        // beyond this one matching special case: `NULL` (a mover
+        // resetting the field once it finishes, e.g. `T_VerticalDoor`'s
+        // `door->sector->specialdata = NULL;`) becomes `None`; a
+        // constructor's own back-reference (`sec->specialdata = door;`,
+        // only reachable once `ctor_var_handle_name` is active -- see
+        // module docs) becomes `Some(..)`.
+        let lhs_is_specialdata =
+            matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "specialdata");
+        let rhs_is_null = matches!(rhs.as_ref(), Expr::Ident(n) if n == "NULL");
+        let rhs_is_ctor_var = !ctx.ctor_var_handle_name.is_empty()
             && matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.ctor_var);
-        let rhs_text = if needs_option_wrap {
+        let rhs_text = if lhs_is_specialdata && rhs_is_null {
+            "None".to_string()
+        } else if lhs_is_specialdata && rhs_is_ctor_var {
             format!("Some({rhs_text})")
         } else {
             rhs_text
@@ -1778,5 +1819,125 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
         assert_eq!(cond_text, "door.topcountdown == 0");
+    }
+
+    /// Recursively searches `s` (and anything nested inside it -- `if`/
+    /// `else` branches, `switch` bodies, `case`/`default` labels,
+    /// compound blocks) for the first statement matching `pred`, so a
+    /// test can pull one real statement out of a large function's AST
+    /// (e.g. `T_VerticalDoor`) without hand-indexing through its exact
+    /// nesting shape.
+    fn find_stmt<'a>(s: &'a Stmt, pred: &dyn Fn(&Stmt) -> bool) -> Option<&'a Stmt> {
+        if pred(s) {
+            return Some(s);
+        }
+        match s {
+            Stmt::Compound(c) => find_stmt_in_body(&c.items, pred),
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => find_stmt(then_branch, pred)
+                .or_else(|| else_branch.as_ref().and_then(|eb| find_stmt(eb, pred))),
+            Stmt::Switch { body, .. } => find_stmt(body, pred),
+            Stmt::Case { stmt, .. } => find_stmt(stmt, pred),
+            Stmt::Default(stmt) => find_stmt(stmt, pred),
+            Stmt::While { body, .. } => find_stmt(body, pred),
+            _ => None,
+        }
+    }
+
+    fn find_stmt_in_body<'a>(
+        items: &'a [BlockItem],
+        pred: &dyn Fn(&Stmt) -> bool,
+    ) -> Option<&'a Stmt> {
+        items.iter().find_map(|item| match item {
+            BlockItem::Stmt(s) => find_stmt(s, pred),
+            BlockItem::Decl(_) => None,
+        })
+    }
+
+    /// `T_VerticalDoor`'s `door->sector->specialdata = NULL;` (run once
+    /// the door finishes closing, clearing the sector's back-reference to
+    /// it) needs `None`, not a bare `NULL` passthrough -- `specialdata`
+    /// maps to `Option<Handle<Thinker>>`. Same real-AST-extraction
+    /// approach as the negated-`--x` test above: pulls the one real
+    /// statement out of `T_VerticalDoor` without attempting the whole
+    /// function.
+    #[test]
+    fn test_null_to_none_against_real_t_vertical_door() {
+        let path = corpus_dir().join("p_doors.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_doors.c should parse");
+        let f = find_function_def(&unit.items, "T_VerticalDoor").expect("T_VerticalDoor not found");
+        let is_specialdata_null_assign = |s: &Stmt| {
+            matches!(s, Stmt::Expr(Some(Expr::Assign { lhs, rhs, .. }))
+                if matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "specialdata")
+                && matches!(rhs.as_ref(), Expr::Ident(n) if n == "NULL"))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_specialdata_null_assign),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `specialdata = NULL;` statement somewhere in T_VerticalDoor");
+        let Stmt::Expr(Some(e)) = stmt else {
+            unreachable!("guarded by is_specialdata_null_assign")
+        };
+
+        let self_field_types = field_types(&[("sector", "SectorId")]);
+        let no_extra_cross_refs = HashMap::new();
+        let ctx = FnBodyContext {
+            self_param: "door",
+            self_field_types: &self_field_types,
+            extra_cross_ref_idents: &no_extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+        };
+        let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
+        assert_eq!(rendered, "world[door.sector].specialdata = None");
+    }
+
+    /// `T_VerticalDoor`'s `P_RemoveThinker(&door->thinker);` -- a tick
+    /// function removing itself, run right alongside the `specialdata =
+    /// NULL;` reset tested above. Confirms `is_self_removal_call`
+    /// recognizes the real shape and `render_expr_stmt` renders it as
+    /// `arena.remove(handle)`, using the fixed `handle`/`arena` names
+    /// this renderer reserves for a tick function's own removal context
+    /// (not yet threaded through `render_fn`'s generated signature --
+    /// see docs/03_TRANSPILER.md).
+    #[test]
+    fn test_self_removal_against_real_t_vertical_door() {
+        let path = corpus_dir().join("p_doors.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_doors.c should parse");
+        let f = find_function_def(&unit.items, "T_VerticalDoor").expect("T_VerticalDoor not found");
+        let is_self_removal_stmt =
+            |s: &Stmt| matches!(s, Stmt::Expr(Some(e)) if is_self_removal_call(e, "door"));
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_self_removal_stmt),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `P_RemoveThinker(&door->thinker);` statement in T_VerticalDoor");
+        let Stmt::Expr(Some(e)) = stmt else {
+            unreachable!("guarded by is_self_removal_stmt")
+        };
+
+        let no_self_fields = HashMap::new();
+        let no_extra_cross_refs = HashMap::new();
+        let ctx = FnBodyContext {
+            self_param: "door",
+            self_field_types: &no_self_fields,
+            extra_cross_ref_idents: &no_extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+        };
+        let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
+        assert_eq!(rendered, "arena.remove(handle)");
     }
 }
