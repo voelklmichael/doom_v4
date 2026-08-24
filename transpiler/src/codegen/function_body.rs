@@ -50,6 +50,7 @@
 //! only because C's single-threaded, synchronous execution means nothing
 //! ever observes the value mid-construction.
 
+use crate::codegen::struct_fields::rust_field_name;
 use crate::parser::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, FunctionDef,
     IncDecOp, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
@@ -86,6 +87,16 @@ struct FnBodyContext<'a> {
     /// dereference, just a name for fields being built up one `let` at a
     /// time. Empty for ordinary tick functions.
     ctor_var: &'a str,
+    /// When non-empty, a *bare* `ctor_var` reference (not `ctor_var->
+    /// field`) resolves to this name instead of erroring -- used only
+    /// once the constructed value has actually been inserted into its
+    /// `Arena` and bound to a `let handle = ...;` local, for rendering a
+    /// back-reference statement (`sec->specialdata = door;`) that comes
+    /// *after* the insert in the generated output. Empty everywhere else,
+    /// including while a constructor's own field expressions are still
+    /// being rendered (where a bare `ctor_var` reference would be a bug,
+    /// not a back-reference -- see `render_spawn_fn`).
+    ctor_var_handle_name: &'a str,
 }
 
 fn indent(depth: usize) -> String {
@@ -162,6 +173,12 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
     match e {
         Expr::IntLiteral(s) => Ok((s.clone(), false)),
         Expr::Ident(name) => {
+            if !ctx.ctor_var_handle_name.is_empty()
+                && !ctx.ctor_var.is_empty()
+                && name == ctx.ctor_var
+            {
+                return Ok((ctx.ctor_var_handle_name.to_string(), false));
+            }
             let is_crossref = ctx
                 .extra_cross_ref_idents
                 .get(name.as_str())
@@ -172,7 +189,7 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if !ctx.ctor_var.is_empty()
                 && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
             {
-                return Ok((field.clone(), false));
+                return Ok((rust_field_name(field)?, false));
             }
             let (base_text, base_is_crossref) = render_expr(base, ctx)?;
             let base_text = if base_is_crossref {
@@ -462,6 +479,24 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     if let Expr::Assign { op, lhs, rhs } = e {
         let (lhs_text, _) = render_expr(lhs, ctx)?;
         let (rhs_text, _) = render_expr(rhs, ctx)?;
+        // `sector_t.specialdata`/`line_t.specialdata` map to
+        // `Option<Handle<Thinker>>` (struct_fields.rs's own name-based
+        // special case -- it's checked for truthiness/reset to `NULL`
+        // corpus-wide, not dereferenced unconditionally), so a
+        // constructor's back-reference assignment to it (`sec->
+        // specialdata = door;`, only reachable once `ctor_var_handle_name`
+        // is active -- see module docs) needs the same `Some(..)`
+        // wrapping every other `Option`-typed field gets from its own
+        // corpus initializer, even though this renderer has no general
+        // per-field-type awareness beyond this one matching special case.
+        let needs_option_wrap = !ctx.ctor_var_handle_name.is_empty()
+            && matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "specialdata")
+            && matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.ctor_var);
+        let rhs_text = if needs_option_wrap {
+            format!("Some({rhs_text})")
+        } else {
+            rhs_text
+        };
         Ok(format!("{lhs_text} {} {rhs_text}", render_assign_op(*op)))
     } else {
         Ok(render_expr(e, ctx)?.0)
@@ -533,6 +568,7 @@ pub fn render_fn(
         self_field_types,
         extra_cross_ref_idents: &no_extra_cross_refs,
         ctor_var: "",
+        ctor_var_handle_name: "",
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     Ok(format!(
@@ -617,6 +653,27 @@ fn ctor_field_assign<'a>(s: &'a Stmt, ctor_var: &str) -> Option<(&'a str, &'a Ex
     }
 }
 
+/// `other->field = var;` -- assigning the constructed value itself (not
+/// one of *its* fields) to some field of a different, already-existing
+/// object, e.g. `p_doors.c`'s `sec->specialdata = door;` (the sector's
+/// own back-reference to the mover thinker currently active on it). Only
+/// resolvable once `var` has become a real `Handle<Thinker>`, so
+/// `render_spawn_fn` renders the whole function in two phases whenever
+/// this appears anywhere in the body: every constructor field first, then
+/// the `Arena::insert` call bound to `let handle = ...;`, then every
+/// "other" statement (this one included) rendered with a bare `var`
+/// resolving to `handle` (`FnBodyContext::ctor_var_handle_name`).
+fn is_ctor_var_backreference(s: &Stmt, ctor_var: &str) -> bool {
+    matches!(s, Stmt::Expr(Some(Expr::Assign { op: AssignOp::Assign, rhs, .. }))
+        if matches!(rhs.as_ref(), Expr::Ident(n) if n == ctor_var))
+}
+
+fn body_has_backreference(items: &[BlockItem], ctor_var: &str) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item, BlockItem::Stmt(s) if is_ctor_var_backreference(s, ctor_var)))
+}
+
 /// `if (cond) { var->field = then_val; } else { var->field = else_val; }`
 /// -- both branches assigning the *same* field, with no `else if` chain
 /// (each branch a single plain statement, not a further nested `If`).
@@ -661,8 +718,31 @@ fn count_ctor_field_assigns(
     }
 }
 
+/// Like `ctor_field_assign`, but for *any* assignment operator, not just
+/// plain `=` -- used only for the `mut` pre-scan, since a field can be
+/// unconditionally refined by a compound assignment right after its own
+/// initial value (`P_SpawnDoorRaiseIn5Mins`'s `door->topheight =
+/// P_FindLowestCeilingSurrounding(sec); door->topheight -= 4*FRACUNIT;`),
+/// which still needs `let mut` even though `ctor_field_assign` itself
+/// (rightly) never treats a compound assignment as a field's *initial*
+/// value.
+fn ctor_field_assign_target<'a>(s: &'a Stmt, ctor_var: &str) -> Option<&'a str> {
+    let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s else {
+        return None;
+    };
+    let Expr::Member {
+        base,
+        field,
+        arrow: true,
+    } = lhs.as_ref()
+    else {
+        return None;
+    };
+    matches!(base.as_ref(), Expr::Ident(n) if n == ctor_var).then_some(field.as_str())
+}
+
 fn count_ctor_field_assigns_stmt(s: &Stmt, ctor_var: &str, counts: &mut HashMap<String, usize>) {
-    if let Some((field, _)) = ctor_field_assign(s, ctor_var) {
+    if let Some(field) = ctor_field_assign_target(s, ctor_var) {
         *counts.entry(field.to_string()).or_insert(0) += 1;
         return;
     }
@@ -773,11 +853,22 @@ fn stmt_uses_bare_ctor_ident(s: &Stmt, ctor_var: &str) -> bool {
 ///
 /// `ctor_rust_type` names both the constructed struct and its `Thinker`
 /// variant (true for every case seen so far -- `FireFlicker`,
-/// `LightFlash`, `Strobe`, `Glow`). `param_cross_ref_types` gives the
-/// function's own parameters' Rust types (e.g. `{"sector": "SectorId"}`),
-/// needed both to render the function's own signature and to resolve a
-/// parameter used as a cross-reference in a field's own value expression
-/// (`sector->lightlevel`, just like a tick function's `self` fields).
+/// `LightFlash`, `Strobe`, `Glow`, `VerticalDoor`). `param_cross_ref_types`
+/// gives the function's own parameters' Rust types (e.g. `{"sector":
+/// "SectorId"}`), needed both to render the function's own signature and
+/// to resolve a parameter used as a cross-reference in a field's own
+/// value expression (`sector->lightlevel`, just like a tick function's
+/// `self` fields). `ctor_field_types` is the constructed struct's own
+/// `MappedField` list (the same one `struct_fields.rs` already produces),
+/// used *only* to check every one of its fields actually got a value --
+/// C can leave a `Z_Malloc`'d field's value as whatever garbage the
+/// allocator happened to return and simply never read it back
+/// (`P_SpawnDoorCloseIn30` genuinely never sets `topheight`/`topwait`,
+/// unlike its sibling `P_SpawnDoorRaiseIn5Mins`), but Rust's struct
+/// literal has no equivalent -- every field needs a real value, so a
+/// function missing one errs loudly here rather than emitting an
+/// incomplete literal that would only fail much later, confusingly, when
+/// the generated output is actually compiled.
 ///
 /// **Scope**: only functions matching this exact shape -- one local
 /// `Foo* var;`, allocated via `Z_Malloc`, immediately `P_AddThinker`'d,
@@ -795,6 +886,7 @@ pub fn render_spawn_fn(
     fn_name: &str,
     ctor_rust_type: &str,
     param_cross_ref_types: &HashMap<String, String>,
+    ctor_field_types: &HashMap<String, String>,
 ) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
     let f = find_function_def(&unit.items, fn_name)
@@ -848,10 +940,25 @@ pub fn render_spawn_fn(
         self_field_types: &HashMap::new(),
         extra_cross_ref_idents: param_cross_ref_types,
         ctor_var: &ctor_var,
+        ctor_var_handle_name: "",
     };
 
     let mut reassign_counts: HashMap<String, usize> = HashMap::new();
     count_ctor_field_assigns(&f.body.items, &ctor_var, &mut reassign_counts);
+
+    // A back-reference (`sec->specialdata = door;`) needs the constructed
+    // value's real `Handle` before it can be rendered at all, so its
+    // presence anywhere in the body switches this whole function to a
+    // two-phase render: every constructor field first (regardless of
+    // where its assignment fell in the original source, same reordering
+    // argument as always), then the `Arena::insert` call bound to `let
+    // handle = ...;`, then every "other" statement (queued into
+    // `pending_other` below) rendered afterward with a bare `ctor_var`
+    // resolving to `handle`. Without a back-reference, "other" statements
+    // render immediately, interleaved in original source order exactly
+    // as before -- this mode is unchanged from every earlier spawn
+    // function this module already handles.
+    let has_backreference = body_has_backreference(&f.body.items, &ctor_var);
 
     // Each `var->field = expr;` becomes its own `let field = expr;` (in
     // original source order), not a flat struct-literal entry directly:
@@ -869,6 +976,7 @@ pub fn render_spawn_fn(
     // `flash->field` reference to that field's own local either way.
     let mut lines: Vec<String> = Vec::new();
     let mut ctor_field_names: Vec<String> = Vec::new();
+    let mut pending_other: Vec<&Stmt> = Vec::new();
     for item in &f.body.items {
         let BlockItem::Stmt(s) = item else { continue };
         if is_malloc_assign(s, &ctor_var)
@@ -878,7 +986,8 @@ pub fn render_spawn_fn(
             continue;
         }
         if let Some((field, then_rhs, else_rhs)) = if_else_ctor_field_assign(s, &ctor_var) {
-            if ctor_field_names.iter().any(|f| f == field) {
+            let field = rust_field_name(field)?;
+            if ctor_field_names.contains(&field) {
                 return Err(format!(
                     "{fn_name}: field `{field}` already has an unconditional value; an if/else fully re-deciding it too isn't supported yet"
                 ));
@@ -892,37 +1001,79 @@ pub fn render_spawn_fn(
             lines.push(format!(
                 "    let {field} = if {cond_text} {{ {then_text} }} else {{ {else_text} }};"
             ));
-            ctor_field_names.push(field.to_string());
+            ctor_field_names.push(field);
             continue;
         }
         if let Some((field, rhs)) = ctor_field_assign(s, &ctor_var) {
+            let field = rust_field_name(field)?;
             let (rhs_text, _) = render_expr(rhs, &ctx)?;
             // `flick->sector = sector;`-style passthroughs need no `let`
             // at all -- the field's shorthand in the final literal
             // already resolves to the same outer binding.
             if rhs_text != field {
-                let mutability = if reassign_counts.get(field).copied().unwrap_or(0) > 1 {
+                let mutability = if reassign_counts.get(&field).copied().unwrap_or(0) > 1 {
                     "mut "
                 } else {
                     ""
                 };
                 lines.push(format!("    let {mutability}{field} = {rhs_text};"));
             }
-            ctor_field_names.push(field.to_string());
+            ctor_field_names.push(field);
             continue;
         }
-        if stmt_uses_bare_ctor_ident(s, &ctor_var) {
+        if ctor_field_assign_target(s, &ctor_var).is_some() {
+            // A *compound* assignment refining an already-`let`-bound
+            // field right after its own initial value
+            // (`P_SpawnDoorRaiseIn5Mins`'s `door->topheight -=
+            // 4*FRACUNIT;` -- `ctor_field_assign` above only matches
+            // plain `=`, so reaching here means this is exactly that
+            // case). Still part of *constructing* the value, so it's
+            // rendered inline via the ordinary path right here, never
+            // deferred to `pending_other` even when `has_backreference`
+            // -- deferring it would insert the pre-refinement value.
+            lines.extend(render_stmt(s, &ctx, 1)?);
+            continue;
+        }
+        if stmt_uses_bare_ctor_ident(s, &ctor_var) && !is_ctor_var_backreference(s, &ctor_var) {
             return Err(format!(
                 "{fn_name}: a statement referencing the constructed value in an unsupported way: {s:?}"
             ));
         }
-        lines.extend(render_stmt(s, &ctx, 1)?);
+        if has_backreference {
+            pending_other.push(s);
+        } else {
+            lines.extend(render_stmt(s, &ctx, 1)?);
+        }
     }
 
-    lines.push(format!(
-        "    thinkers.insert(Thinker::{ctor_rust_type}({ctor_rust_type} {{ {} }}));",
+    let missing_fields: Vec<&str> = ctor_field_types
+        .keys()
+        .map(String::as_str)
+        .filter(|f| !ctor_field_names.iter().any(|n| n == f))
+        .collect();
+    if !missing_fields.is_empty() {
+        return Err(format!(
+            "{fn_name}: never assigns {ctor_rust_type}'s field(s) {}, so the constructed literal would be incomplete",
+            missing_fields.join(", ")
+        ));
+    }
+
+    let insert_expr = format!(
+        "Thinker::{ctor_rust_type}({ctor_rust_type} {{ {} }})",
         ctor_field_names.join(", ")
-    ));
+    );
+    if has_backreference {
+        lines.push(format!("    let handle = thinkers.insert({insert_expr});"));
+        let ctx_after = FnBodyContext {
+            ctor_var_handle_name: "handle",
+            ..ctx
+        };
+        for s in pending_other {
+            lines.extend(render_stmt(s, &ctx_after, 1)?);
+        }
+    } else {
+        lines.push(format!("    thinkers.insert({insert_expr});"));
+    }
     Ok(format!(
         "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
         rendered_params.join(", "),
@@ -1100,6 +1251,13 @@ pub fn T_Glow(g: &mut Glow, world: &mut World) {
             .collect()
     }
 
+    fn field_types(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
     fn test_p_spawn_fire_flicker_renders_exactly() {
         let rendered = render_spawn_fn(
@@ -1108,6 +1266,12 @@ pub fn T_Glow(g: &mut Glow, world: &mut World) {
             "P_SpawnFireFlicker",
             "FireFlicker",
             &sector_param(),
+            &field_types(&[
+                ("sector", "SectorId"),
+                ("count", "i32"),
+                ("maxlight", "i32"),
+                ("minlight", "i32"),
+            ]),
         )
         .expect("should render cleanly");
         let expected = "\
@@ -1134,6 +1298,14 @@ pub fn P_SpawnFireFlicker(sector: SectorId, world: &mut World, thinkers: &mut Ar
             "P_SpawnLightFlash",
             "LightFlash",
             &sector_param(),
+            &field_types(&[
+                ("sector", "SectorId"),
+                ("count", "i32"),
+                ("maxlight", "i32"),
+                ("minlight", "i32"),
+                ("maxtime", "i32"),
+                ("mintime", "i32"),
+            ]),
         )
         .expect("should render cleanly");
         let expected = "\
@@ -1161,6 +1333,12 @@ pub fn P_SpawnLightFlash(sector: SectorId, world: &mut World, thinkers: &mut Are
             "P_SpawnGlowingLight",
             "Glow",
             &sector_param(),
+            &field_types(&[
+                ("sector", "SectorId"),
+                ("minlight", "i32"),
+                ("maxlight", "i32"),
+                ("direction", "i32"),
+            ]),
         )
         .expect("should render cleanly");
         let expected = "\
@@ -1196,6 +1374,14 @@ pub fn P_SpawnGlowingLight(sector: SectorId, world: &mut World, thinkers: &mut A
             "P_SpawnStrobeFlash",
             "Strobe",
             &params,
+            &field_types(&[
+                ("sector", "SectorId"),
+                ("count", "i32"),
+                ("minlight", "i32"),
+                ("maxlight", "i32"),
+                ("darktime", "i32"),
+                ("brighttime", "i32"),
+            ]),
         )
         .expect("should render cleanly");
         let expected = "\
@@ -1210,6 +1396,101 @@ pub fn P_SpawnStrobeFlash(sector: SectorId, fastOrSlow: i32, inSync: i32, world:
     world[sector].special = 0;
     let count = if inSync == 0 { (P_Random() & 7) + 1 } else { 1 };
     thinkers.insert(Thinker::Strobe(Strobe { sector, darktime, brighttime, maxlight, minlight, count }));
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// The constructor back-reference idiom (`p_doors.c`'s door
+    /// spawners): `sec->specialdata = door;` needs `door`'s real
+    /// `Handle<Thinker>`, so the whole function renders in two phases --
+    /// every field first, then the `insert` bound to `let handle = ...;`,
+    /// then the back-reference (and the unrelated `sec->special = 0;`
+    /// alongside it) rendered afterward. Also exercises `r#type` (a
+    /// keyword-colliding field name) and `Option`-wrapping `specialdata`'s
+    /// own value (`Some(handle)`, not a bare `handle` -- it maps to
+    /// `Option<Handle<Thinker>>`, per `struct_fields.rs`'s own name-based
+    /// special case for that field).
+    fn vldoor_field_types() -> HashMap<String, String> {
+        field_types(&[
+            ("sector", "SectorId"),
+            ("r#type", "i32"),
+            ("topheight", "FixedT"),
+            ("speed", "FixedT"),
+            ("direction", "i32"),
+            ("topwait", "i32"),
+            ("topcountdown", "i32"),
+        ])
+    }
+
+    /// `P_SpawnDoorCloseIn30` genuinely never sets `topheight`/`topwait`
+    /// in the original C (left as whatever `Z_Malloc` happened to
+    /// return) -- fine for C, where nothing else reads them for this
+    /// particular door variant, but Rust's struct literal has no
+    /// equivalent for "leave it uninitialized." Confirms `render_spawn_fn`
+    /// catches this itself, loudly, rather than emitting an incomplete
+    /// literal that would only fail later, confusingly, when the
+    /// generated output is compiled.
+    #[test]
+    fn test_p_spawn_door_close_in_30_detects_missing_fields() {
+        let params: HashMap<String, String> = [("sec".to_string(), "SectorId".to_string())]
+            .into_iter()
+            .collect();
+        let err = render_spawn_fn(
+            &corpus_dir(),
+            "p_doors.c",
+            "P_SpawnDoorCloseIn30",
+            "VerticalDoor",
+            &params,
+            &vldoor_field_types(),
+        )
+        .expect_err("should detect the incomplete literal");
+        assert!(err.contains("topheight"), "expected `topheight` in: {err}");
+        assert!(err.contains("topwait"), "expected `topwait` in: {err}");
+    }
+
+    /// The constructor back-reference idiom (`p_doors.c`'s door
+    /// spawners): `sec->specialdata = door;` needs `door`'s real
+    /// `Handle<Thinker>`, so the whole function renders in two phases --
+    /// every field first, then the `insert` bound to `let handle = ...;`,
+    /// then the back-reference (and the unrelated `sec->special = 0;`
+    /// alongside it) rendered afterward. Also exercises `r#type` (a
+    /// keyword-colliding field name); `Option`-wrapping `specialdata`'s
+    /// own value (`Some(handle)`, not a bare `handle` -- it maps to
+    /// `Option<Handle<Thinker>>`); and `topheight` being refined by a
+    /// *compound* assignment right after its own initial value
+    /// (`door->topheight -= 4*FRACUNIT;`) -- which must render inline,
+    /// *before* the `insert`, not deferred alongside the back-reference,
+    /// or the inserted struct would carry the pre-refinement value.
+    #[test]
+    fn test_p_spawn_door_raise_in_5_mins_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("sec".to_string(), "SectorId".to_string()),
+            ("secnum".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rendered = render_spawn_fn(
+            &corpus_dir(),
+            "p_doors.c",
+            "P_SpawnDoorRaiseIn5Mins",
+            "VerticalDoor",
+            &params,
+            &vldoor_field_types(),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnDoorRaiseIn5Mins(sec: SectorId, secnum: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let sector = sec;
+    let direction = 2;
+    let r#type = raiseIn5Mins;
+    let speed = VDOORSPEED;
+    let mut topheight = P_FindLowestCeilingSurrounding(sec);
+    topheight -= 4 * FRACUNIT;
+    let topwait = VDOORWAIT;
+    let topcountdown = 5 * 60 * 35;
+    let handle = thinkers.insert(Thinker::VerticalDoor(VerticalDoor { sector, direction, r#type, speed, topheight, topwait, topcountdown }));
+    world[sec].specialdata = Some(handle);
+    world[sec].special = 0;
 }";
         assert_eq!(rendered, expected);
     }

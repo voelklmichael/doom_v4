@@ -242,7 +242,7 @@ const RUST_NON_ESCAPABLE_KEYWORDS: &[&str] = &["crate", "self", "super", "Self",
 /// or `Err` if it collides with one of the four keywords raw-identifier
 /// syntax can't escape at all -- fails loudly rather than emitting
 /// something that won't compile.
-fn rust_field_name(name: &str) -> Result<String, String> {
+pub(crate) fn rust_field_name(name: &str) -> Result<String, String> {
     if RUST_NON_ESCAPABLE_KEYWORDS.contains(&name) {
         return Err(format!(
             "field name `{name}` collides with a Rust keyword that can't be raw-identifier-escaped"
