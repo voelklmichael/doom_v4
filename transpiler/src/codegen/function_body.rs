@@ -1774,12 +1774,23 @@ pub fn P_SpawnStrobeFlash(sector: SectorId, fastOrSlow: i32, inSync: i32, world:
 
     /// `P_SpawnDoorCloseIn30` genuinely never sets `topheight`/`topwait`
     /// in the original C (left as whatever `Z_Malloc` happened to
-    /// return) -- fine for C, where nothing else reads them for this
-    /// particular door variant, but Rust's struct literal has no
-    /// equivalent for "leave it uninitialized." Confirms `render_spawn_fn`
-    /// catches this itself, loudly, rather than emitting an incomplete
-    /// literal that would only fail later, confusingly, when the
-    /// generated output is compiled.
+    /// return). Confirms `render_spawn_fn` catches this itself, loudly,
+    /// rather than emitting an incomplete literal that would only fail
+    /// later, confusingly, when the generated output is compiled.
+    ///
+    /// **This rejection is permanent, not a placeholder**: traced against
+    /// the now-fully-translated `T_VerticalDoor`, a door spawned this way
+    /// (`direction = 0`, `type = normal`) *can* reach code that reads
+    /// `topheight` -- if crushed while closing, `type == normal` isn't
+    /// `blazeClose`/`close` ("DO NOT GO BACK UP!", the corpus's own
+    /// comment on that exclusion), so it reverses to `direction = 1` and
+    /// the next tick reads `door->topheight` as `T_MovePlane`'s
+    /// destination. `Z_Malloc` (`z_zone.c`) never zeroes memory (read in
+    /// full, not assumed) -- so this is genuine reachable undefined
+    /// behavior in the *original* C, not a translation gap: there is no
+    /// well-defined C value to be faithful to, so no Rust default would
+    /// be honest either. Refusing to guess is the correct answer here,
+    /// not an incomplete one.
     #[test]
     fn test_p_spawn_door_close_in_30_detects_missing_fields() {
         let params: HashMap<String, String> = [("sec".to_string(), "SectorId".to_string())]
