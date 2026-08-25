@@ -68,6 +68,7 @@ fn is_cross_ref(rust_type: &str) -> bool {
     CROSS_REF_TYPES.contains(&rust_type)
 }
 
+#[derive(Clone, Copy)]
 struct FnBodyContext<'a> {
     self_param: &'a str,
     self_field_types: &'a HashMap<String, String>,
@@ -97,6 +98,20 @@ struct FnBodyContext<'a> {
     /// being rendered (where a bare `ctor_var` reference would be a bug,
     /// not a back-reference -- see `render_spawn_fn`).
     ctor_var_handle_name: &'a str,
+    /// Set only by `render_trigger_fn`, for a trigger loop that
+    /// constructs its thinker *inline* (`EV_DoCeiling`'s own `while`
+    /// body does `Z_Malloc`/`P_AddThinker`/field-fill-in directly,
+    /// unlike `EV_StartLightStrobing`'s call out to a separate
+    /// `P_Spawn*` function) -- the constructor's own local variable
+    /// name, its `Thinker` variant/struct name, and its field-types map,
+    /// exactly what `render_spawn_fn` needs, just supplied by the
+    /// enclosing trigger instead of self-discovered from a top-level
+    /// `Decl` (the local is typically declared once, outside the loop
+    /// that actually constructs it). `render_compound_items` watches for
+    /// this and switches into `render_ctor_body` partway through
+    /// whichever block actually contains the `Z_Malloc` call. `None`
+    /// everywhere else.
+    embedded_ctor: Option<(&'a str, &'a str, &'a HashMap<String, String>)>,
 }
 
 fn indent(depth: usize) -> String {
@@ -781,6 +796,38 @@ fn render_compound_items(
     ctx: &FnBodyContext,
     depth: usize,
 ) -> Result<Vec<String>, String> {
+    // A trigger with an inline constructor (`render_trigger_fn`'s own
+    // `embedded_ctor`, e.g. `EV_DoCeiling`) watches every block it
+    // renders for the `Z_Malloc` call that starts its known constructor
+    // local's build-up -- whichever block actually contains it (a
+    // `while` loop's own body, for the one real example so far) hands
+    // everything from that point onward to `render_ctor_body` wholesale,
+    // the same "process my whole remaining scope" behavior
+    // `render_spawn_fn` already has for a full function.
+    if let Some((ctor_var, ctor_rust_type, ctor_field_types)) = ctx.embedded_ctor
+        && let Some(idx) = items
+            .iter()
+            .position(|item| matches!(item, BlockItem::Stmt(s) if is_malloc_assign(s, ctor_var)))
+    {
+        let mut out = Vec::new();
+        for item in &items[..idx] {
+            match item {
+                BlockItem::Decl(d) => out.extend(render_decl(d, ctx, depth)?),
+                BlockItem::Stmt(s) => out.extend(render_stmt(s, ctx, depth)?),
+            }
+        }
+        out.extend(render_ctor_body(
+            &items[idx..],
+            ctor_var,
+            ctor_rust_type,
+            ctor_field_types,
+            ctx,
+            depth,
+            ctor_var,
+        )?);
+        return Ok(out);
+    }
+
     let mut out = Vec::new();
     for item in items {
         match item {
@@ -842,6 +889,7 @@ pub fn render_fn(
         extra_cross_ref_idents: &no_extra_cross_refs,
         ctor_var: "",
         ctor_var_handle_name: "",
+        embedded_ctor: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     // Only a tick function that actually removes itself somewhere in its
@@ -1268,20 +1316,69 @@ pub fn render_spawn_fn(
     let ctor_var = ctor_var
         .ok_or_else(|| format!("{fn_name}: no constructor-shaped local (`Foo* x;`) found"))?;
 
-    let ctx = FnBodyContext {
+    let base_ctx = FnBodyContext {
         self_param: "",
         self_field_types: &HashMap::new(),
         extra_cross_ref_idents: param_cross_ref_types,
-        ctor_var: &ctor_var,
+        ctor_var: "",
         ctor_var_handle_name: "",
+        embedded_ctor: None,
+    };
+    let lines = render_ctor_body(
+        &f.body.items,
+        &ctor_var,
+        ctor_rust_type,
+        ctor_field_types,
+        &base_ctx,
+        1,
+        fn_name,
+    )?;
+    Ok(format!(
+        "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
+        rendered_params.join(", "),
+        lines.join("\n")
+    ))
+}
+
+/// Renders a `Z_Malloc`+`P_AddThinker`+field-fill-in constructor
+/// sequence: `render_spawn_fn`'s own core logic, generalized so it can
+/// also run *embedded* inside a larger function (`render_trigger_fn`'s
+/// `EV_DoCeiling`-style triggers that build their thinker inline,
+/// mid-loop, rather than delegating to a separate `P_Spawn*` function --
+/// see `render_compound_items`, which detects this and hands it exactly
+/// the slice starting at the `Z_Malloc` call). `items` is consumed in
+/// full, matching `render_spawn_fn`'s own "process my whole scope"
+/// behavior -- there's no "natural end" heuristic, since in every real
+/// example the constructor's own trailing statements (e.g. `EV_DoCeiling`'s
+/// `P_AddActiveCeiling(ceiling);`) simply run to the end of whatever
+/// block contains them. `base_ctx` supplies everything about the
+/// *enclosing* function (its own parameters/locals) that field
+/// expressions may need to resolve (`EV_DoCeiling`'s `ceiling->sector =
+/// sec;` reads the trigger loop's own `sec` local) -- this function
+/// layers its own `ctor_var` on top via `FnBodyContext: Copy`'s struct-
+/// update syntax, rather than building a context from scratch.
+fn render_ctor_body(
+    items: &[BlockItem],
+    ctor_var: &str,
+    ctor_rust_type: &str,
+    ctor_field_types: &HashMap<String, String>,
+    base_ctx: &FnBodyContext,
+    depth: usize,
+    fn_name: &str,
+) -> Result<Vec<String>, String> {
+    let ctx = FnBodyContext {
+        ctor_var,
+        ctor_var_handle_name: "",
+        embedded_ctor: None,
+        ..*base_ctx
     };
 
     let mut reassign_counts: HashMap<String, usize> = HashMap::new();
-    count_ctor_field_assigns(&f.body.items, &ctor_var, &mut reassign_counts);
+    count_ctor_field_assigns(items, ctor_var, &mut reassign_counts);
 
     // A back-reference (`sec->specialdata = door;`) needs the constructed
     // value's real `Handle` before it can be rendered at all, so its
-    // presence anywhere in the body switches this whole function to a
+    // presence anywhere in the body switches this whole scope to a
     // two-phase render: every constructor field first (regardless of
     // where its assignment fell in the original source, same reordering
     // argument as always), then the `Arena::insert` call bound to `let
@@ -1291,7 +1388,7 @@ pub fn render_spawn_fn(
     // render immediately, interleaved in original source order exactly
     // as before -- this mode is unchanged from every earlier spawn
     // function this module already handles.
-    let has_backreference = body_has_backreference(&f.body.items, &ctor_var);
+    let has_backreference = body_has_backreference(items, ctor_var);
 
     // Each `var->field = expr;` becomes its own `let field = expr;` (in
     // original source order), not a flat struct-literal entry directly:
@@ -1310,15 +1407,15 @@ pub fn render_spawn_fn(
     let mut lines: Vec<String> = Vec::new();
     let mut ctor_field_names: Vec<String> = Vec::new();
     let mut pending_other: Vec<&Stmt> = Vec::new();
-    for item in &f.body.items {
+    for item in items {
         let BlockItem::Stmt(s) = item else { continue };
-        if is_malloc_assign(s, &ctor_var)
+        if is_malloc_assign(s, ctor_var)
             || is_add_thinker_call(s)
-            || is_function_pointer_assign(s, &ctor_var)
+            || is_function_pointer_assign(s, ctor_var)
         {
             continue;
         }
-        if let Some((field, then_rhs, else_rhs)) = if_else_ctor_field_assign(s, &ctor_var) {
+        if let Some((field, then_rhs, else_rhs)) = if_else_ctor_field_assign(s, ctor_var) {
             let field = rust_field_name(field)?;
             if ctor_field_names.contains(&field) {
                 return Err(format!(
@@ -1332,12 +1429,13 @@ pub fn render_spawn_fn(
             let (then_text, _) = render_expr(then_rhs, &ctx)?;
             let (else_text, _) = render_expr(else_rhs, &ctx)?;
             lines.push(format!(
-                "    let {field} = if {cond_text} {{ {then_text} }} else {{ {else_text} }};"
+                "{}let {field} = if {cond_text} {{ {then_text} }} else {{ {else_text} }};",
+                indent(depth)
             ));
             ctor_field_names.push(field);
             continue;
         }
-        if let Some((field, rhs)) = ctor_field_assign(s, &ctor_var) {
+        if let Some((field, rhs)) = ctor_field_assign(s, ctor_var) {
             let field = rust_field_name(field)?;
             let (rhs_text, _) = render_expr(rhs, &ctx)?;
             // `flick->sector = sector;`-style passthroughs need no `let`
@@ -1349,12 +1447,15 @@ pub fn render_spawn_fn(
                 } else {
                     ""
                 };
-                lines.push(format!("    let {mutability}{field} = {rhs_text};"));
+                lines.push(format!(
+                    "{}let {mutability}{field} = {rhs_text};",
+                    indent(depth)
+                ));
             }
             ctor_field_names.push(field);
             continue;
         }
-        if ctor_field_assign_target(s, &ctor_var).is_some() {
+        if ctor_field_assign_target(s, ctor_var).is_some() {
             // A *compound* assignment refining an already-`let`-bound
             // field right after its own initial value
             // (`P_SpawnDoorRaiseIn5Mins`'s `door->topheight -=
@@ -1364,10 +1465,19 @@ pub fn render_spawn_fn(
             // rendered inline via the ordinary path right here, never
             // deferred to `pending_other` even when `has_backreference`
             // -- deferring it would insert the pre-refinement value.
-            lines.extend(render_stmt(s, &ctx, 1)?);
+            lines.extend(render_stmt(s, &ctx, depth)?);
             continue;
         }
-        if stmt_uses_bare_ctor_ident(s, &ctor_var) && !is_ctor_var_backreference(s, &ctor_var) {
+        // Once `has_backreference` is true, deferring is safe for *any*
+        // statement, whatever shape -- `ctor_var_handle_name` resolves
+        // `ctor_var` correctly wherever it appears once rendered with
+        // `ctx_after`, not just in the specific back-reference-assignment
+        // shape (`EV_DoCeiling`'s own `P_AddActiveCeiling(ceiling);`
+        // passes `ctor_var` as a bare call argument, a different shape
+        // again). Without a back-reference, there's no `handle` binding
+        // to resolve to at all, so a bare `ctor_var` reference there is
+        // still rejected loudly rather than silently mistranslated.
+        if !has_backreference && stmt_uses_bare_ctor_ident(s, ctor_var) {
             return Err(format!(
                 "{fn_name}: a statement referencing the constructed value in an unsupported way: {s:?}"
             ));
@@ -1375,7 +1485,7 @@ pub fn render_spawn_fn(
         if has_backreference {
             pending_other.push(s);
         } else {
-            lines.extend(render_stmt(s, &ctx, 1)?);
+            lines.extend(render_stmt(s, &ctx, depth)?);
         }
     }
 
@@ -1396,22 +1506,21 @@ pub fn render_spawn_fn(
         ctor_field_names.join(", ")
     );
     if has_backreference {
-        lines.push(format!("    let handle = thinkers.insert({insert_expr});"));
+        lines.push(format!(
+            "{}let handle = thinkers.insert({insert_expr});",
+            indent(depth)
+        ));
         let ctx_after = FnBodyContext {
             ctor_var_handle_name: "handle",
             ..ctx
         };
         for s in pending_other {
-            lines.extend(render_stmt(s, &ctx_after, 1)?);
+            lines.extend(render_stmt(s, &ctx_after, depth)?);
         }
     } else {
-        lines.push(format!("    thinkers.insert({insert_expr});"));
+        lines.push(format!("{}thinkers.insert({insert_expr});", indent(depth)));
     }
-    Ok(format!(
-        "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
-        rendered_params.join(", "),
-        lines.join("\n")
-    ))
+    Ok(lines)
 }
 
 /// Renders a "trigger" function -- a third kind of body, alongside a
@@ -1432,12 +1541,31 @@ pub fn render_spawn_fn(
 /// exact idiom) -- merged into `param_types` for `FnBodyContext::
 /// extra_cross_ref_idents`, since both are just "this identifier's own
 /// declared type," regardless of whether it's a parameter or a local.
+/// `embedded_ctor` is `Some((ctor_var, ctor_rust_type, ctor_field_types))`
+/// for a trigger that builds its own thinker *inline*, mid-loop
+/// (`EV_DoCeiling`'s own `while` body does `Z_Malloc`/`P_AddThinker`/
+/// field-fill-in directly, unlike `EV_StartLightStrobing`'s call out to a
+/// separate `P_Spawn*` function) -- `render_compound_items` watches for
+/// this via `FnBodyContext::embedded_ctor` and switches into
+/// `render_ctor_body` partway through whichever block actually contains
+/// the `Z_Malloc` call. `ctor_var` is supplied here rather than self-
+/// discovered the way `render_spawn_fn` does, since the local is
+/// typically declared once at the top of the function, not right before
+/// the loop that actually constructs it.
+///
+/// `return_type` renders as the function's own `-> T` when `Some`
+/// (`EV_DoCeiling`/`EV_DoFloor`-style triggers return `int`, whether a
+/// sector was actually activated) -- `Stmt::Return` itself already
+/// renders generically via `render_stmt`, so this is only about the
+/// signature.
 pub fn render_trigger_fn(
     corpus_dir: &Path,
     file: &str,
     fn_name: &str,
     param_types: &HashMap<String, String>,
     local_var_types: &HashMap<String, String>,
+    embedded_ctor: Option<(&str, &str, &HashMap<String, String>)>,
+    return_type: Option<&str>,
 ) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
     let f = find_function_def(&unit.items, fn_name)
@@ -1453,11 +1581,13 @@ pub fn render_trigger_fn(
         extra_cross_ref_idents: &all_cross_refs,
         ctor_var: "",
         ctor_var_handle_name: "",
+        embedded_ctor,
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
     Ok(format!(
-        "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
+        "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>){return_arrow} {{\n{}\n}}",
         rendered_params.join(", "),
         body_lines.join("\n")
     ))
@@ -1913,6 +2043,8 @@ pub fn P_SpawnDoorRaiseIn5Mins(sec: SectorId, secnum: i32, world: &mut World, th
             "EV_StartLightStrobing",
             &params,
             &locals,
+            None,
+            None,
         )
         .expect("should render cleanly");
         let expected = "\
@@ -1975,6 +2107,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            embedded_ctor: None,
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -2055,6 +2188,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            embedded_ctor: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -2096,6 +2230,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            embedded_ctor: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -2169,6 +2304,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            embedded_ctor: None,
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
