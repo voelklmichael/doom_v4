@@ -139,6 +139,34 @@ struct FnBodyContext<'a> {
     /// through whichever block actually contains the `Z_Malloc` call.
     /// `None` everywhere else.
     embedded_ctor: Option<CtorSpec<'a>>,
+    /// Set only inside `render_existing_thinker_mutation`'s own block
+    /// (`EV_VerticalDoor`'s "reuse an already-active mover" branch) --
+    /// unlike `self_param`/`ctor_var` (both a bare, already-real local
+    /// binding, resolved with a plain `.field` access), a reference to
+    /// `mutating_handle.var` needs a *fresh* `thinkers.get(..)`/
+    /// `thinkers.get_mut(..)` call at each point of use, not one hoisted
+    /// binding held across the whole block -- see its own doc comment
+    /// for why a hoisted `&mut` binding doesn't work here. `None`
+    /// everywhere else.
+    mutating_handle: Option<MutatingHandle<'a>>,
+}
+
+/// Everything needed to resolve a reference to an *existing* thinker's
+/// own field, looked up fresh via `Handle` at each point of use rather
+/// than through one hoisted binding -- see `FnBodyContext::
+/// mutating_handle` and `render_existing_thinker_mutation`.
+#[derive(Clone, Copy)]
+struct MutatingHandle<'a> {
+    /// The local name a `X->field` reference resolves through (`door`).
+    var: &'a str,
+    /// The `Thinker` variant/struct name to match out (`VerticalDoor`).
+    rust_type: &'a str,
+    /// Already-rendered text producing the `Handle<Thinker>` itself
+    /// (`world[sec].specialdata.unwrap()`) -- computed once by
+    /// `render_existing_thinker_mutation` and reused verbatim at every
+    /// point of use, rather than re-rendering the original base
+    /// expression each time.
+    handle_expr: &'a str,
 }
 
 /// Everything needed to construct a value via `render_ctor_body` (see its
@@ -292,6 +320,30 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `door->field` *read*, inside `render_existing_thinker_mutation`'s
+        // own block (`ctx.mutating_handle` set) -- a fresh `thinkers.
+        // get(..)` call at this exact point (not a hoisted `&` binding,
+        // for the same borrow-conflict reason `render_expr_stmt`'s own
+        // write-side special case explains). The `_ => unreachable!()`
+        // arm is genuinely safe: this sector's `specialdata` was already
+        // proven `Some` right before this block was entered, and by
+        // construction only ever holds the variant this same trigger
+        // itself builds.
+        Expr::Member { base, field, .. } if matches!(ctx.mutating_handle, Some(mh) if matches!(base.as_ref(), Expr::Ident(n) if n == mh.var)) =>
+        {
+            let mh = ctx.mutating_handle.expect("guarded above");
+            Ok((
+                format!(
+                    "match thinkers.get({}) {{ Some(Thinker::{}({})) => {}.{}, _ => unreachable!() }}",
+                    mh.handle_expr,
+                    mh.rust_type,
+                    mh.var,
+                    mh.var,
+                    rust_field_name(field)?
+                ),
+                false,
+            ))
+        }
         // `p->field` -- `p`'s own declared type is `Option<PlayerId>`
         // (`EV_DoLockedDoor`'s own `player_t*` local, always immediately
         // null-checked right beside every real dereference in the
@@ -337,6 +389,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 format!("{base_text}.{}", rust_field_name(field)?),
                 is_crossref,
             ))
+        }
+        // `sec-sectors` (`EV_VerticalDoor`'s own `secnum = sec-sectors;`)
+        // -- real pointer-arithmetic C idiom for "the index of this
+        // pointer within the array it came from," which is exactly what
+        // a `SectorId` already *is* under this project's own memory-
+        // model decision (a plain index, not a real pointer), so this
+        // needs no arithmetic at all, just unwrapping the newtype's own
+        // field -- confirmed this is what the expression actually
+        // computes (not assumed), same rigor as every other pointer-
+        // idiom special case in this module.
+        Expr::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } if matches!(rhs.as_ref(), Expr::Ident(n) if n == "sectors") => {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            Ok((format!("{lhs_text}.0 as i32"), false))
         }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
@@ -480,6 +549,24 @@ fn parenthesize_if_needed(
     }
 }
 
+/// Whether `expr` renders to an `Option<_>`-typed Rust value -- a bare
+/// local declared `Option<PlayerId>` (`p`), or a direct `thing->player`
+/// dereference (matching `render_expr`'s own `Expr::Member` special case
+/// for it). Narrowly by-name/by-shape, the same way `specialdata`'s own
+/// `Option`-awareness is, not a general type-inference pass.
+fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
+    match expr {
+        Expr::Ident(n) => {
+            ctx.extra_cross_ref_idents
+                .get(n.as_str())
+                .map(String::as_str)
+                == Some("Option<PlayerId>")
+        }
+        Expr::Member { field, .. } if field == "player" => true,
+        _ => false,
+    }
+}
+
 /// Renders `cond` as a plain boolean-valued Rust expression -- a
 /// comparison/logical `Binary` passes straight through (already `bool`-
 /// valued); `!x` on a plain (non-`bool`) C value is C's truthiness test,
@@ -494,17 +581,18 @@ fn parenthesize_if_needed(
 fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     match cond {
         Expr::Binary { op, .. } if is_comparison_or_logical(*op) => Ok(render_expr(cond, ctx)?.0),
-        // `!p` -- an `Option<PlayerId>`-typed local (`EV_DoLockedDoor`'s
-        // own `player_t*`), needing `.is_none()` rather than the `== 0`
+        // `!p` (an `Option<PlayerId>`-typed local, `EV_DoLockedDoor`'s own
+        // `player_t*`) or `!thing->player` (`EV_VerticalDoor`'s own
+        // re-check further down, reading the same `Handle<Thinker>`-
+        // dereferencing `Expr::Member` special case above) -- both
+        // `Option`-valued, needing `.is_none()` rather than the `== 0`
         // every other (plain `int`) negated value gets, the same
         // Option-awareness `specialdata` already gets below, just for a
-        // bare local instead of a field.
+        // bare local/direct dereference instead of a struct field.
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
-        } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")) => {
-            Ok(format!("{}.is_none()", render_expr(expr, ctx)?.0))
-        }
+        } if is_option_valued(expr, ctx) => Ok(format!("{}.is_none()", render_expr(expr, ctx)?.0)),
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -642,6 +730,126 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
     Ok(lines)
 }
 
+/// `if (X->specialdata) { CTOR_VAR = X->specialdata; ...uses of
+/// CTOR_VAR->field...; }` -- `EV_VerticalDoor`'s own "reuse and mutate
+/// an already-active mover instead of building a new one" branch, the
+/// one shape in the corpus so far where a trigger looks up an *existing*
+/// thinker via `Handle` rather than always constructing a new one.
+/// Detected only when the block's very first statement assigns
+/// `X->specialdata` straight into the embedded constructor's own
+/// `ctor_var`, and `X` matches the `if`'s own condition -- narrow on
+/// purpose, the same "hand-match the one real shape" style as
+/// `sides[i].sector`, not a general "does this block start by
+/// unwrapping a `specialdata`" mechanism. Returns the crossref base
+/// expr (`X`) and every statement in the block *after* that first one.
+fn existing_thinker_mutation_shape<'a>(
+    cond: &'a Expr,
+    then_branch: &'a Stmt,
+    ctor_var: &str,
+) -> Option<(&'a Expr, &'a [BlockItem])> {
+    let Expr::Member {
+        base: cond_base,
+        field: cond_field,
+        ..
+    } = cond
+    else {
+        return None;
+    };
+    if cond_field != "specialdata" {
+        return None;
+    }
+    let Expr::Ident(cond_name) = cond_base.as_ref() else {
+        return None;
+    };
+    let Stmt::Compound(c) = then_branch else {
+        return None;
+    };
+    let [first, rest @ ..] = c.items.as_slice() else {
+        return None;
+    };
+    let BlockItem::Stmt(Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    }))) = first
+    else {
+        return None;
+    };
+    if !matches!(lhs.as_ref(), Expr::Ident(n) if n == ctor_var) {
+        return None;
+    }
+    let Expr::Member {
+        base: rhs_base,
+        field: rhs_field,
+        ..
+    } = rhs.as_ref()
+    else {
+        return None;
+    };
+    if rhs_field != "specialdata" || !matches!(rhs_base.as_ref(), Expr::Ident(n) if n == cond_name)
+    {
+        return None;
+    }
+    Some((cond_base, rest))
+}
+
+/// Renders the block `existing_thinker_mutation_shape` matched: the
+/// `if`'s own condition (reusing the ordinary `specialdata.is_some()`
+/// truthiness rendering), then every remaining statement rendered with
+/// `FnBodyContext::mutating_handle` set so each `CTOR_VAR->field`
+/// reference (read *or* write) gets its own fresh `thinkers.get(..)`/
+/// `get_mut(..)` call at exactly that point.
+///
+/// **Deliberately NOT a single hoisted `let Thinker::Variant(door) =
+/// thinkers.get_mut(..).unwrap() else { unreachable!() };` binding held
+/// across the whole block**, even though that's what a tick function's
+/// own `self`-typed receiver already does (`T_VerticalDoor`'s `door.
+/// field`) -- tried first, and confirmed a real borrow-checker rejection
+/// by actually compiling it with `rustc`: `EV_VerticalDoor`'s own block
+/// reads `door->direction`, then (in one branch) calls `thing->player`
+/// -- itself a *second*, unrelated `thinkers.get(..)` borrow -- before
+/// writing `door->direction` again. A hoisted `&mut` binding stays alive
+/// across that whole span (Rust can't shrink its lifetime past the later
+/// write), so the intervening immutable borrow doesn't type-check. Fresh
+/// per-access borrows, each scoped to just one statement, avoid this
+/// outright and remain correct for any future control flow between
+/// reads/writes, not just this one shape.
+fn render_existing_thinker_mutation(
+    base: &Expr,
+    rest: &[BlockItem],
+    spec: &CtorSpec,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let (base_text, base_is_crossref) = render_expr(base, ctx)?;
+    let base_text = if base_is_crossref {
+        format!("world[{base_text}]")
+    } else {
+        base_text
+    };
+    let handle_expr = format!("{base_text}.specialdata.unwrap()");
+    let mut lines = vec![format!(
+        "{}if {base_text}.specialdata.is_some() {{",
+        indent(depth)
+    )];
+    let inner_ctx = FnBodyContext {
+        mutating_handle: Some(MutatingHandle {
+            var: spec.ctor_var,
+            rust_type: spec.ctor_rust_type,
+            handle_expr: &handle_expr,
+        }),
+        ..*ctx
+    };
+    for item in rest {
+        match item {
+            BlockItem::Decl(d) => lines.extend(render_decl(d, &inner_ctx, depth + 1)?),
+            BlockItem::Stmt(st) => lines.extend(render_stmt(st, &inner_ctx, depth + 1)?),
+        }
+    }
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
+}
+
 fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String>, String> {
     match s {
         Stmt::Expr(Some(e)) => Ok(vec![format!(
@@ -660,6 +868,13 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             then_branch,
             else_branch,
         } => {
+            if else_branch.is_none()
+                && let Some(spec) = ctx.embedded_ctor
+                && let Some((base, rest)) =
+                    existing_thinker_mutation_shape(cond, then_branch, spec.ctor_var)
+            {
+                return render_existing_thinker_mutation(base, rest, &spec, ctx, depth);
+            }
             let (hoisted, cond_text) = render_condition(cond, ctx, depth)?;
             let mut lines = hoisted;
             lines.push(format!("{}if {cond_text} {{", indent(depth)));
@@ -931,6 +1146,37 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         return Ok("arena.remove(handle)".to_string());
     }
     if let Expr::Assign { op, lhs, rhs } = e {
+        // `door->field = expr;`, inside `render_existing_thinker_mutation`'s
+        // own block (`ctx.mutating_handle` set) -- a *write* through a
+        // `Handle<Thinker>` needs its own fresh `thinkers.get_mut(..)`
+        // call at exactly this point, wrapped in its own `if let`, rather
+        // than reusing a single hoisted `&mut` binding for the whole
+        // block: holding one across the block would keep `thinkers`
+        // mutably borrowed even where a *different* statement in between
+        // needs its own (immutable) borrow of `thinkers` (`EV_VerticalDoor`'s
+        // own `if (!thing->player) return;`, sitting between the read of
+        // `door->direction` and the write to it) -- confirmed as a real
+        // borrow-checker rejection, not a hypothetical, by actually
+        // compiling the hoisted-binding version with `rustc` first.
+        // Intercepted here, before the general `render_expr(lhs, ..)`
+        // call below, since that would otherwise render `lhs` as a
+        // *read* (an un-assignable match expression).
+        if *op == AssignOp::Assign
+            && let Expr::Member {
+                base,
+                field: lhs_field,
+                ..
+            } = lhs.as_ref()
+            && let Some(mh) = ctx.mutating_handle
+            && matches!(base.as_ref(), Expr::Ident(n) if n == mh.var)
+        {
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            return Ok(format!(
+                "if let Some(Thinker::{}({})) = thinkers.get_mut({}) {{ {}.{field} = {rhs_text}; }}",
+                mh.rust_type, mh.var, mh.handle_expr, mh.var
+            ));
+        }
         let (lhs_text, _) = render_expr(lhs, ctx)?;
         let (rhs_text, _) = render_expr(rhs, ctx)?;
         // `sector_t.specialdata`/`line_t.specialdata` map to
@@ -1062,6 +1308,7 @@ pub fn render_fn(
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
+        mutating_handle: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     // Only a tick function that actually removes itself somewhere in its
@@ -1548,6 +1795,7 @@ pub fn render_spawn_fn(
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
+        mutating_handle: None,
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -1898,6 +2146,7 @@ pub fn render_trigger_fn(
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
         embedded_ctor,
+        mutating_handle: None,
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -2425,6 +2674,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_var_handle_name: "",
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
+            mutating_handle: None,
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -2507,6 +2757,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_var_handle_name: "",
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
+            mutating_handle: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -2550,6 +2801,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_var_handle_name: "",
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
+            mutating_handle: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -2625,6 +2877,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_var_handle_name: "",
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
+            mutating_handle: None,
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -3541,6 +3794,186 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
         _ => {}
     }
     return EV_DoDoor(line, r#type);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_VerticalDoor` (`p_doors.c`) -- the function that motivated
+    /// surveying this whole area: reuses `EV_DoLockedDoor`'s
+    /// `thing->player`/`Option<PlayerId>` infrastructure verbatim for its
+    /// own three-lock-check preamble (confirmed identical shape, just
+    /// different local/message names), reuses `EV_DoPlat`'s `sides[i].
+    /// sector` chain for `sec = sides[line->sidenum[side^1]].sector;`,
+    /// and adds three more pieces: (1) `secnum = sec-sectors;` -- real
+    /// pointer arithmetic (computed but genuinely never read again,
+    /// confirmed by grep, though translated honestly rather than
+    /// dropped): since a `SectorId` already *is* "the index of this
+    /// pointer," this needs no arithmetic at all, just `sec.0 as i32`.
+    /// (2) The function's own core new capability -- `if (sec->
+    /// specialdata) { door = sec->specialdata; ...door->field...; }`,
+    /// reusing an *existing* thinker instead of always constructing a
+    /// new one. `existing_thinker_mutation_shape` detects this exact
+    /// assignment-from-specialdata shape (narrowly, the same "hand-match
+    /// the one real corpus shape" style as everywhere else in this
+    /// module); `render_existing_thinker_mutation` renders every
+    /// remaining statement in the block with `FnBodyContext::
+    /// mutating_handle` set, so each `door->field` reference (read or
+    /// write) gets its own *fresh* `thinkers.get`/`get_mut` call.
+    /// **Deliberately not a single hoisted `let Thinker::VerticalDoor
+    /// (door) = thinkers.get_mut(..).unwrap() else { unreachable!() };`
+    /// binding** (the obvious first design, matching how a tick
+    /// function's own `self` receiver already works) -- tried first, and
+    /// rejected by `rustc` itself, not by inspection: this exact block
+    /// reads `door->direction`, then (in the `else` branch) calls
+    /// `thing->player` -- a *second*, unrelated `thinkers.get(..)` call
+    /// -- before writing `door->direction` again, and a hoisted `&mut`
+    /// binding must stay borrowed across that whole span, conflicting
+    /// with the intervening immutable borrow. Fresh per-access borrows
+    /// sidestep this outright. (3) `S_StartSound` is called both with a
+    /// real `&SoundOrg` (the "for proper sound" switch) and with `NULL`
+    /// -> `None` (the lock-check preamble) *within this one function* --
+    /// a real, newly-surfaced gap this renderer doesn't resolve (no
+    /// cross-function awareness of `S_StartSound`'s own real parameter
+    /// type to know whether the real-reference call sites need `Some(..)`
+    /// wrapping too), verified compiling only by giving the scratch
+    /// stub's own `S_StartSound` a deliberately generic signature -- left
+    /// as a documented, out-of-scope limitation (see docs/03_TRANSPILER.md),
+    /// not fixed here. `r#type`/`topcountdown` need `field_defaults`
+    /// (switch-only and never-touched respectively, same reasoning as
+    /// every earlier trigger-with-inline-constructor). Verified compiling
+    /// the complete function with `rustc` directly (hand-written `World`/
+    /// `Sector`/`Side`/`Line`/`Player`/`Mobj`/`VerticalDoor`/`Thinker`/
+    /// `Arena`/`Handle` stand-ins), zero errors.
+    #[test]
+    fn test_ev_vertical_door_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("line".to_string(), "LineId".to_string()),
+            ("thing".to_string(), "Handle<Thinker>".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [
+            ("player".to_string(), "Option<PlayerId>".to_string()),
+            ("sec".to_string(), "SectorId".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let ctor_field_types = vldoor_field_types();
+        let field_defaults = field_types(&[("r#type", "normal"), ("topcountdown", "0")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_doors.c",
+            "EV_VerticalDoor",
+            &params,
+            &locals,
+            Some(CtorSpec {
+                ctor_var: "door",
+                ctor_rust_type: "VerticalDoor",
+                ctor_field_types: &ctor_field_types,
+                field_defaults: &field_defaults,
+            }),
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut player;
+    let mut secnum;
+    let mut sec;
+    let mut side;
+    side = 0;
+    player = match thinkers.get(thing) { Some(Thinker::Mobj(m)) => m.player, _ => None };
+    match world[line].special {
+        26 | 32 => {
+            if player.is_none() {
+                return;
+            }
+            if !world[player.unwrap()].cards[it_bluecard] && !world[player.unwrap()].cards[it_blueskull] {
+                world[player.unwrap()].message = PD_BLUEK;
+                S_StartSound(None, sfx_oof);
+                return;
+            }
+        }
+        27 | 34 => {
+            if player.is_none() {
+                return;
+            }
+            if !world[player.unwrap()].cards[it_yellowcard] && !world[player.unwrap()].cards[it_yellowskull] {
+                world[player.unwrap()].message = PD_YELLOWK;
+                S_StartSound(None, sfx_oof);
+                return;
+            }
+        }
+        28 | 33 => {
+            if player.is_none() {
+                return;
+            }
+            if !world[player.unwrap()].cards[it_redcard] && !world[player.unwrap()].cards[it_redskull] {
+                world[player.unwrap()].message = PD_REDK;
+                S_StartSound(None, sfx_oof);
+                return;
+            }
+        }
+        _ => {}
+    }
+    sec = world[SideId(world[line].sidenum[side ^ 1] as u32)].sector;
+    secnum = sec.0 as i32;
+    if world[sec].specialdata.is_some() {
+        match world[line].special {
+            1 | 26 | 27 | 28 | 117 => {
+                if match thinkers.get(world[sec].specialdata.unwrap()) { Some(Thinker::VerticalDoor(door)) => door.direction, _ => unreachable!() } == -1 {
+                    if let Some(Thinker::VerticalDoor(door)) = thinkers.get_mut(world[sec].specialdata.unwrap()) { door.direction = 1; };
+                } else {
+                    if match thinkers.get(thing) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_none() {
+                        return;
+                    }
+                    if let Some(Thinker::VerticalDoor(door)) = thinkers.get_mut(world[sec].specialdata.unwrap()) { door.direction = -1; };
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+    match world[line].special {
+        117 | 118 => {
+            S_StartSound(&world[sec].soundorg, sfx_bdopn);
+        }
+        1 | 31 => {
+            S_StartSound(&world[sec].soundorg, sfx_doropn);
+        }
+        _ => {
+            S_StartSound(&world[sec].soundorg, sfx_doropn);
+        }
+    }
+    let sector = sec;
+    let direction = 1;
+    let mut speed = VDOORSPEED;
+    let topwait = VDOORWAIT;
+    let mut r#type = normal;
+    match world[line].special {
+        1 | 26 | 27 | 28 => {
+            r#type = normal;
+        }
+        31 | 32 | 33 | 34 => {
+            r#type = open;
+            world[line].special = 0;
+        }
+        117 => {
+            r#type = blazeRaise;
+            speed = VDOORSPEED * 4;
+        }
+        118 => {
+            r#type = blazeOpen;
+            world[line].special = 0;
+            speed = VDOORSPEED * 4;
+        }
+        _ => {}
+    }
+    let mut topheight = P_FindLowestCeilingSurrounding(sec);
+    topheight -= 4 * FRACUNIT;
+    let topcountdown = 0;
+    let handle = thinkers.insert(Thinker::VerticalDoor(VerticalDoor { sector, direction, speed, topwait, r#type, topheight, topcountdown }));
+    world[sec].specialdata = Some(handle);
 }";
         assert_eq!(rendered, expected);
     }
