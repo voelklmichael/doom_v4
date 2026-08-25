@@ -10,12 +10,18 @@
 //! somewhere, a level's actual storage, indexed by the same `*Id`
 //! newtypes `runtime::geometry` already defines.
 //!
-//! Minimal on purpose: only `sectors`/`sides` exist so far, since no
-//! translated function body has needed anything else yet. More fields
-//! join the same way every other table in this codebase grew -- a real
-//! body needs it, not speculatively ahead of that. `sides` joined once
-//! `EV_DoPlat`'s own `sides[line->sidenum[0]].sector` needed somewhere to
-//! resolve a bare (non-`&`) `sides[i]` index read into.
+//! Minimal on purpose: only `sectors`/`sides`/`players` exist so far,
+//! since no translated function body has needed anything else yet. More
+//! fields join the same way every other table in this codebase grew -- a
+//! real body needs it, not speculatively ahead of that. `sides` joined
+//! once `EV_DoPlat`'s own `sides[line->sidenum[0]].sector` needed
+//! somewhere to resolve a bare (non-`&`) `sides[i]` index read into.
+//! `players` joined once `EV_DoLockedDoor`'s own `p->cards[..]`/`p->
+//! message` (a `player_t*` local, unwrapped at the point of use from its
+//! `Option<PlayerId>`) needed somewhere to resolve a `PlayerId` into --
+//! `[Player; MAXPLAYERS]`, not `Vec`, matching `runtime/player.rs`'s own
+//! already-documented design (a plain, fixed-size, never-resized array,
+//! unlike `sectors`/`sides`' genuinely per-level-sized tables).
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -31,6 +37,7 @@ pub fn render_world_struct() -> String {
 pub struct World {
     pub sectors: Vec<Sector>,
     pub sides: Vec<Side>,
+    pub players: [Player; MAXPLAYERS],
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -57,6 +64,19 @@ impl std::ops::IndexMut<SideId> for World {
     fn index_mut(&mut self, id: SideId) -> &mut Side {
         &mut self.sides[id.0 as usize]
     }
+}
+
+impl std::ops::Index<PlayerId> for World {
+    type Output = Player;
+    fn index(&self, id: PlayerId) -> &Player {
+        &self.players[id.0 as usize]
+    }
+}
+
+impl std::ops::IndexMut<PlayerId> for World {
+    fn index_mut(&mut self, id: PlayerId) -> &mut Player {
+        &mut self.players[id.0 as usize]
+    }
 }"
     .to_string()
 }
@@ -71,9 +91,12 @@ mod tests {
         assert!(rendered.starts_with("pub struct World {"));
         assert!(rendered.contains("pub sectors: Vec<Sector>,"));
         assert!(rendered.contains("pub sides: Vec<Side>,"));
+        assert!(rendered.contains("pub players: [Player; MAXPLAYERS],"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SideId> for World"));
+        assert!(rendered.contains("impl std::ops::Index<PlayerId> for World"));
+        assert!(rendered.contains("impl std::ops::IndexMut<PlayerId> for World"));
     }
 }

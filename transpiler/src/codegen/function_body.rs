@@ -237,6 +237,16 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             {
                 return Ok((ctx.ctor_var_handle_name.to_string(), false));
             }
+            // `NULL` used as a plain value (not just the specialdata-
+            // assignment shape `render_expr_stmt` already special-cases)
+            // -- `S_StartSound(NULL, sfx_oof)`'s "no origin, play
+            // globally" call, e.g. -- always means "no value" under this
+            // project's own no-real-pointers memory model, so it's always
+            // `None` wherever it appears as a value, not just on the RHS
+            // of a `specialdata = ` assignment.
+            if name == "NULL" {
+                return Ok(("None".to_string(), false));
+            }
             let is_crossref = ctx
                 .extra_cross_ref_idents
                 .get(name.as_str())
@@ -258,6 +268,48 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].sector"), true))
+        }
+        // `thing->player` -- `thing`'s own declared type is
+        // `Handle<Thinker>` (a live thinker passed in, unlike
+        // `SectorId`/etc. this isn't itself `World`-indexed, it needs a
+        // real `Arena` lookup), and `Thinker` is a closed enum over ten
+        // different thinker shapes, only one of which (`Mobj`) has a
+        // `.player` field at all -- hand-matched narrowly, the same "no
+        // general lookup ahead of evidence" reasoning as `sides[i].
+        // sector`, rather than a general enum-variant-field mechanism no
+        // second caller has needed yet.
+        Expr::Member { base, field, .. }
+            if field == "player"
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>")) =>
+        {
+            let Expr::Ident(name) = base.as_ref() else {
+                unreachable!("guarded above")
+            };
+            Ok((
+                format!(
+                    "match thinkers.get({name}) {{ Some(Thinker::Mobj(m)) => m.player, _ => None }}"
+                ),
+                false,
+            ))
+        }
+        // `p->field` -- `p`'s own declared type is `Option<PlayerId>`
+        // (`EV_DoLockedDoor`'s own `player_t*` local, always immediately
+        // null-checked right beside every real dereference in the
+        // corpus). `.unwrap()` at the point of use, rather than
+        // reshaping the whole function around a narrowed/shadowed
+        // binding -- every real caller already guards each dereference
+        // with its own `if (!p) return ...;` right next to it, so this
+        // stays a close, simple translation of that same defensive style
+        // rather than a fancier one nothing here needs yet.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")) =>
+        {
+            let Expr::Ident(name) = base.as_ref() else {
+                unreachable!("guarded above")
+            };
+            Ok((
+                format!("world[{name}.unwrap()].{}", rust_field_name(field)?),
+                false,
+            ))
         }
         Expr::Member { base, field, .. } => {
             if !ctx.ctor_var.is_empty()
@@ -442,18 +494,28 @@ fn parenthesize_if_needed(
 fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     match cond {
         Expr::Binary { op, .. } if is_comparison_or_logical(*op) => Ok(render_expr(cond, ctx)?.0),
+        // `!p` -- an `Option<PlayerId>`-typed local (`EV_DoLockedDoor`'s
+        // own `player_t*`), needing `.is_none()` rather than the `== 0`
+        // every other (plain `int`) negated value gets, the same
+        // Option-awareness `specialdata` already gets below, just for a
+        // bare local instead of a field.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")) => {
+            Ok(format!("{}.is_none()", render_expr(expr, ctx)?.0))
+        }
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
         } => Ok(format!("{} == 0", render_expr(expr, ctx)?.0)),
         // A bare value used for truthiness (not a comparison/negation) --
         // C's `if (x)` tests non-zero/non-null. `specialdata` is the one
-        // corpus field known to be `Option`-typed (`struct_fields.rs`'s
+        // corpus *field* known to be `Option`-typed (`struct_fields.rs`'s
         // own name-based special case, reused by `render_expr_stmt`'s
         // `Some(..)`-wrapping too), so a bare reference to it needs
         // `.is_some()`, not the `== 0` truthiness every other (plain
-        // `int`) value gets -- nothing else this renderer handles is
-        // `Option`-typed yet.
+        // `int`) value gets.
         Expr::Member { field, .. } if field == "specialdata" => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
@@ -3368,6 +3430,117 @@ pub fn EV_DoPlat(line: LineId, r#type: i32, amount: i32, world: &mut World, thin
         P_AddActivePlat(handle);
     }
     return rtn;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_DoLockedDoor` (`p_doors.c`) -- a plain trigger (no embedded
+    /// constructor at all, it only early-returns or delegates to the
+    /// already-translated `EV_DoDoor`), but the first function needing
+    /// three genuinely new capabilities, all narrowly scoped to exactly
+    /// what this function's own body needs. (1) `thing->player`: `thing`'s
+    /// own declared type is `Handle<Thinker>` (a live thinker passed in,
+    /// surveyed as the harder blocker for both this function and
+    /// `EV_VerticalDoor`), needing a real `Arena` lookup plus picking out
+    /// the one variant (`Mobj`) with a `.player` field at all, out of
+    /// `Thinker`'s ten. Hand-matched narrowly (only `Mobj` reached this
+    /// way so far), not a general enum-variant-field lookup mechanism.
+    /// (2) `p->cards[..]`/`p->message`: `p`'s own declared type is
+    /// `Option<PlayerId>` (a `player_t*` local) -- rather than
+    /// reshaping the function around a narrowed/shadowed binding once
+    /// null-checked (real `let-else` unwrapping), every dereference is
+    /// `.unwrap()`-ed at its own point of use, since the corpus itself
+    /// already guards each one with its own adjacent `if (!p) return
+    /// ...;` (redundant after the first, since `p` can't become "null"
+    /// again -- rendered as-is anyway, a close translation of the
+    /// original's own defensive redundancy rather than a new "prove and
+    /// elide dead code" feature this one function doesn't need). (3)
+    /// `!p` (bare `Option`-typed local truthiness) needed
+    /// `render_bool_expr`'s own `Unary::Not` handling to become aware of
+    /// `Option<PlayerId>`, alongside the pre-existing `specialdata`-field
+    /// special case -- `.is_none()`, not the `== 0` every other negated
+    /// (plain `int`) value gets. `S_StartSound(NULL, sfx_oof)` (no sound
+    /// origin) surfaced a real, more general gap: `NULL` was only ever
+    /// converted to `None` in the one `specialdata = NULL;` assignment
+    /// shape `render_expr_stmt` already special-cased, not as a plain
+    /// value anywhere else -- generalized so `Expr::Ident("NULL")`
+    /// always renders `None`, matching this project's own no-real-
+    /// pointers memory model regardless of where it appears. `World`
+    /// gained a third real field, `players: [Player; MAXPLAYERS]` --
+    /// deliberately a fixed array, not `Vec`, matching `runtime/
+    /// player.rs`'s own already-documented design (`player_t
+    /// players[MAXPLAYERS]` is genuinely fixed-size, unlike `sectors`/
+    /// `sides`). `!player->cards[idx]` (used inside `&&`, not as a
+    /// whole `if`'s own top-level condition) needed no new code at all
+    /// -- it flows through `render_expr`'s already-generic `Unary::Not`
+    /// arm (plain `!`), not `render_bool_expr`'s specialized top-level
+    /// handling, and a real `bool` field negates correctly with Rust's
+    /// own `!` already. Verified compiling the complete function with
+    /// `rustc` directly (hand-written `World`/`Player`/`Mobj`/`Thinker`/
+    /// `Arena`/`Handle` stand-ins), zero errors.
+    #[test]
+    fn test_ev_do_locked_door_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("line".to_string(), "LineId".to_string()),
+            ("type".to_string(), "i32".to_string()),
+            ("thing".to_string(), "Handle<Thinker>".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("p".to_string(), "Option<PlayerId>".to_string())]
+            .into_iter()
+            .collect();
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_doors.c",
+            "EV_DoLockedDoor",
+            &params,
+            &locals,
+            None,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) -> i32 {
+    let mut p;
+    p = match thinkers.get(thing) { Some(Thinker::Mobj(m)) => m.player, _ => None };
+    if p.is_none() {
+        return 0;
+    }
+    match world[line].special {
+        99 | 133 => {
+            if p.is_none() {
+                return 0;
+            }
+            if !world[p.unwrap()].cards[it_bluecard] && !world[p.unwrap()].cards[it_blueskull] {
+                world[p.unwrap()].message = PD_BLUEO;
+                S_StartSound(None, sfx_oof);
+                return 0;
+            }
+        }
+        134 | 135 => {
+            if p.is_none() {
+                return 0;
+            }
+            if !world[p.unwrap()].cards[it_redcard] && !world[p.unwrap()].cards[it_redskull] {
+                world[p.unwrap()].message = PD_REDO;
+                S_StartSound(None, sfx_oof);
+                return 0;
+            }
+        }
+        136 | 137 => {
+            if p.is_none() {
+                return 0;
+            }
+            if !world[p.unwrap()].cards[it_yellowcard] && !world[p.unwrap()].cards[it_yellowskull] {
+                world[p.unwrap()].message = PD_YELLOWO;
+                S_StartSound(None, sfx_oof);
+                return 0;
+            }
+        }
+        _ => {}
+    }
+    return EV_DoDoor(line, r#type);
 }";
         assert_eq!(rendered, expected);
     }
