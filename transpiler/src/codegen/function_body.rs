@@ -243,6 +243,22 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 .is_some_and(|t| is_cross_ref(t));
             Ok((rust_ident_name(name)?, is_crossref))
         }
+        // `sides[i].sector` -- `side_t.sector` (unlike its other four
+        // fields) is itself cross-reference-typed (`SectorId`), and the
+        // general fallback below only knows how to look up a field's own
+        // crossref-ness for `self_param`'s or `ctor_var`'s fields (both
+        // backed by an explicit field-types map), not an arbitrary
+        // `Expr::Index` result's fields -- there's no general struct-
+        // field-type registry yet, so this is hand-matched narrowly, the
+        // same way `&sectors[i]`/bare `sides[i]` are, rather than building
+        // one ahead of more evidence it's needed.
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].sector"), true))
+        }
         Expr::Member { base, field, .. } => {
             if !ctx.ctor_var.is_empty()
                 && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
@@ -300,6 +316,33 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             };
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SectorId({index_text} as u32)"), false))
+        }
+        // `sides[i]` (bare, no `&` -- unlike `&sectors[i]` above, the
+        // corpus reads this one as a plain value, immediately chaining a
+        // further `.field` off it: `sides[line->sidenum[0]].sector`,
+        // `EV_DoPlat`'s own idiom for "the sector on the other side of
+        // this line"). Same reasoning as `&sectors[i]`: `side_t*` already
+        // maps to `SideId` (a plain index), so this needs no real
+        // indexing operation, just wrapping the index -- but since
+        // nothing dereferences it via `&`, this returns `is_crossref:
+        // true` directly (unlike the `&`-prefixed form, whose caller
+        // already has its own dereference-free pointer semantics) so a
+        // chained `.field` access resolves through `world[...]` the same
+        // way any other cross-reference-typed value does.
+        Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides") => {
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("SideId({index_text} as u32)"), true))
+        }
+        // A plain fixed-size array *field* (`line->sidenum[0]`, `sidenum:
+        // [i16; 2]` -- struct_fields.rs's own single-dimension array
+        // support), not one of the special global cross-reference arrays
+        // matched above -- ordinary Rust indexing syntax needs nothing
+        // else, and the element itself isn't cross-reference-typed (no
+        // corpus example needing that yet).
+        Expr::Index { base, index } => {
+            let (base_text, _) = render_expr(base, ctx)?;
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("{base_text}[{index_text}]"), false))
         }
         Expr::Unary {
             op: UnaryOp::AddrOf,
@@ -1676,8 +1719,19 @@ fn render_ctor_body(
         }
     }
 
+    // Sorted, not raw `HashMap::keys()` order: `EV_DoCeiling` only ever
+    // had one field fall through to this default-filling loop
+    // (`olddirection`), so `HashMap`'s per-process-randomized iteration
+    // order was never actually observable in its output -- `EV_DoPlat`'s
+    // `count`/`oldstatus` (two fields, neither touched by its own
+    // `switch`) exposed this for real: an unsorted iteration would make
+    // the generated code's own field order (and therefore this whole
+    // renderer's output) nondeterministic across runs, not just
+    // differently-ordered-but-equally-valid.
     let mut still_missing: Vec<&str> = Vec::new();
-    for field in ctor_field_types.keys() {
+    let mut remaining_fields: Vec<&String> = ctor_field_types.keys().collect();
+    remaining_fields.sort();
+    for field in remaining_fields {
         if ctor_field_names.contains(field) {
             continue;
         }
@@ -3117,6 +3171,201 @@ pub fn EV_DoDoor(line: LineId, r#type: i32, world: &mut World, thinkers: &mut Ar
         let topcountdown = 0;
         let handle = thinkers.insert(Thinker::VerticalDoor(VerticalDoor { sector, r#type, topwait, speed, topheight, direction, topcountdown }));
         world[sec].specialdata = Some(handle);
+    }
+    return rtn;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_DoPlat` (`p_plats.c`) -- a third trigger-with-inline-
+    /// constructor, again reusing `EV_DoCeiling`'s whole machinery
+    /// unchanged, but needing two genuinely new expression-rendering
+    /// features and exposing a real nondeterminism bug. (1)
+    /// `sides[line->sidenum[0]].sector->floorpic` chains a bare (non-`&`)
+    /// global-array index (`sides[i]`, mirroring `&sectors[i]`'s existing
+    /// special case but without the address-of, so it returns
+    /// `is_crossref: true` directly rather than relying on a caller's own
+    /// dereference) into a cross-reference-typed field (`side_t.sector`,
+    /// hand-matched narrowly since there's no general struct-field-type
+    /// registry yet) into a further plain field read -- renders as double
+    /// `world[...]` indirection (`world[world[SideId(..)].sector].
+    /// floorpic`), which is exactly correct: `sides[i]` is a `SideId`
+    /// *value*, and `.sector` reads a *further* index out of it, so two
+    /// separate lookups are genuinely needed. `line->sidenum[0]` (the
+    /// index expression itself) needed a new, fully generic
+    /// `Expr::Index` fallback arm for a plain fixed-size array field
+    /// (`sidenum: [i16; 2]`) -- nothing before this needed indexing
+    /// *into* an ordinary field, only the two special global arrays.
+    /// `World` gained a second real field (`sides: Vec<Side>` +
+    /// `Index`/`IndexMut<SideId>`, mirroring `sectors` exactly) to give
+    /// the new `SideId` lookups somewhere to resolve to -- the same
+    /// "grows when a real body needs it" incremental pattern `sectors`
+    /// itself followed. (2) `plat->sector->specialdata = plat;` writes
+    /// *through* a constructor field the same way `EV_DoDoor`'s
+    /// `door->sector->soundorg` read through one -- already fixed for
+    /// free by that same `ctor_field_types` fix, no new code needed here.
+    /// **A real nondeterminism bug found while building this**: `count`
+    /// and `oldstatus` are both untouched by `EV_DoPlat`'s own `switch`
+    /// (needing `field_defaults` from the general completeness-check
+    /// fallback, not the switch-synthesis path), and that fallback
+    /// iterated `ctor_field_types.keys()` -- a `HashMap`, whose iteration
+    /// order is randomized per-process. `EV_DoCeiling` never exposed this
+    /// (`olddirection` was its only such field, so order was never
+    /// observable); with two fields here, an unsorted iteration would
+    /// make the renderer's own output nondeterministic across runs, not
+    /// just differently-but-validly ordered. Fixed by sorting the
+    /// remaining field names before that loop. `speed`/`high`/`wait`/
+    /// `status`/`low` are all switch-only, needing `field_defaults`
+    /// unconditionally per the same empirically-verified rule as
+    /// `EV_DoCeiling`; `count`/`oldstatus` are safe to default (confirmed
+    /// by tracing every read in `T_PlatRaise`/`P_ActivateInStasis`/
+    /// `EV_StopPlat`: both are always written before ever being read, the
+    /// same write-before-read safety as `EV_DoCeiling`'s `olddirection`).
+    /// Verified compiling the complete function with `rustc` directly
+    /// (hand-written `World`/`Sector`/`Side`/`Line`/`Plat`/`Arena`/
+    /// `Handle`/`FixedT` stand-ins), zero errors.
+    #[test]
+    fn test_ev_do_plat_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("line".to_string(), "LineId".to_string()),
+            ("type".to_string(), "i32".to_string()),
+            ("amount".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("sec".to_string(), "SectorId".to_string())]
+            .into_iter()
+            .collect();
+        let ctor_field_types = field_types(&[
+            ("sector", "SectorId"),
+            ("speed", "FixedT"),
+            ("low", "FixedT"),
+            ("high", "FixedT"),
+            ("wait", "i32"),
+            ("count", "i32"),
+            ("status", "i32"),
+            ("oldstatus", "i32"),
+            ("crush", "bool"),
+            ("tag", "i32"),
+            ("r#type", "i32"),
+        ]);
+        let field_defaults = field_types(&[
+            ("speed", "PLATSPEED"),
+            ("low", "world[sec].floorheight"),
+            ("high", "world[sec].ceilingheight"),
+            ("wait", "0"),
+            ("status", "0"),
+            ("count", "0"),
+            ("oldstatus", "0"),
+        ]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "EV_DoPlat",
+            &params,
+            &locals,
+            Some(CtorSpec {
+                ctor_var: "plat",
+                ctor_rust_type: "Plat",
+                ctor_field_types: &ctor_field_types,
+                field_defaults: &field_defaults,
+            }),
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_DoPlat(line: LineId, r#type: i32, amount: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> i32 {
+    let mut secnum;
+    let mut rtn;
+    let mut sec;
+    secnum = -1;
+    rtn = 0;
+    match r#type {
+        perpetualRaise => {
+            P_ActivateInStasis(world[line].tag);
+        }
+        _ => {
+        }
+    }
+    loop {
+        secnum = P_FindSectorFromLineTag(line, secnum);
+        if !(secnum >= 0) {
+            break;
+        }
+        sec = SectorId(secnum as u32);
+        if world[sec].specialdata.is_some() {
+            continue;
+        }
+        rtn = 1;
+        let sector = sec;
+        let crush = false;
+        let tag = world[line].tag;
+        let mut speed = PLATSPEED;
+        let mut high = world[sec].ceilingheight;
+        let mut wait = 0;
+        let mut status = 0;
+        let mut low = world[sec].floorheight;
+        match r#type {
+            raiseToNearestAndChange => {
+                speed = PLATSPEED / 2;
+                world[sec].floorpic = world[world[SideId(world[line].sidenum[0] as u32)].sector].floorpic;
+                high = P_FindNextHighestFloor(sec, world[sec].floorheight);
+                wait = 0;
+                status = up;
+                world[sec].special = 0;
+                S_StartSound(&world[sec].soundorg, sfx_stnmov);
+            }
+            raiseAndChange => {
+                speed = PLATSPEED / 2;
+                world[sec].floorpic = world[world[SideId(world[line].sidenum[0] as u32)].sector].floorpic;
+                high = world[sec].floorheight + amount * FRACUNIT;
+                wait = 0;
+                status = up;
+                S_StartSound(&world[sec].soundorg, sfx_stnmov);
+            }
+            downWaitUpStay => {
+                speed = PLATSPEED * 4;
+                low = P_FindLowestFloorSurrounding(sec);
+                if low > world[sec].floorheight {
+                    low = world[sec].floorheight;
+                }
+                high = world[sec].floorheight;
+                wait = 35 * PLATWAIT;
+                status = down;
+                S_StartSound(&world[sec].soundorg, sfx_pstart);
+            }
+            blazeDWUS => {
+                speed = PLATSPEED * 8;
+                low = P_FindLowestFloorSurrounding(sec);
+                if low > world[sec].floorheight {
+                    low = world[sec].floorheight;
+                }
+                high = world[sec].floorheight;
+                wait = 35 * PLATWAIT;
+                status = down;
+                S_StartSound(&world[sec].soundorg, sfx_pstart);
+            }
+            perpetualRaise => {
+                speed = PLATSPEED;
+                low = P_FindLowestFloorSurrounding(sec);
+                if low > world[sec].floorheight {
+                    low = world[sec].floorheight;
+                }
+                high = P_FindHighestFloorSurrounding(sec);
+                if high < world[sec].floorheight {
+                    high = world[sec].floorheight;
+                }
+                wait = 35 * PLATWAIT;
+                status = P_Random() & 1;
+                S_StartSound(&world[sec].soundorg, sfx_pstart);
+            }
+            _ => {}
+        }
+        let count = 0;
+        let oldstatus = 0;
+        let handle = thinkers.insert(Thinker::Plat(Plat { r#type, sector, crush, tag, speed, high, wait, status, low, count, oldstatus }));
+        world[sector].specialdata = Some(handle);
+        P_AddActivePlat(handle);
     }
     return rtn;
 }";
