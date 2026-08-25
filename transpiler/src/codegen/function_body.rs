@@ -116,6 +116,14 @@ struct FnBodyContext<'a> {
     /// being rendered (where a bare `ctor_var` reference would be a bug,
     /// not a back-reference -- see `render_spawn_fn`).
     ctor_var_handle_name: &'a str,
+    /// `ctor_var`'s own field-types map (mirrors `self_field_types`, just
+    /// for the constructor-in-progress rather than an already-existing
+    /// `self` value) -- lets `ctor_var->field` resolve its own
+    /// cross-reference-ness when that field is itself used as the *base*
+    /// of a further member access (`door->sector->soundorg`, once
+    /// `sector` is a plain `SectorId` local). Empty whenever `ctor_var`
+    /// is.
+    ctor_field_types: &'a HashMap<String, String>,
     /// Set only by `render_trigger_fn`, for a trigger loop that
     /// constructs its thinker *inline* (`EV_DoCeiling`'s own `while`
     /// body does `Z_Malloc`/`P_AddThinker`/field-fill-in directly,
@@ -239,7 +247,11 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if !ctx.ctor_var.is_empty()
                 && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
             {
-                return Ok((rust_field_name(field)?, false));
+                let is_crossref = ctx
+                    .ctor_field_types
+                    .get(field.as_str())
+                    .is_some_and(|t| is_cross_ref(t));
+                return Ok((rust_field_name(field)?, is_crossref));
             }
             let (base_text, base_is_crossref) = render_expr(base, ctx)?;
             let base_text = if base_is_crossref {
@@ -486,35 +498,43 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
             d.specifiers.type_specifiers
         ));
     }
-    let [decl] = d.declarators.as_slice() else {
-        return Err("render_decl: only a single declarator is supported so far".to_string());
-    };
-    if decl.initializer.is_some() {
-        return Err("render_decl: an initializer is not supported so far".to_string());
+    // `int secnum,rtn;` (`EV_DoDoor`'s own locals) declares more than one
+    // plain scalar off one `int`, sharing the same (absent) type
+    // annotation and initializer rules as the single-declarator case --
+    // handled by rendering each declarator through the same checks below,
+    // in source order, rather than requiring a caller to have already
+    // split it into separate `int` decls the way `EV_DoCeiling` happens
+    // to.
+    let mut lines = Vec::new();
+    for decl in &d.declarators {
+        if decl.initializer.is_some() {
+            return Err("render_decl: an initializer is not supported so far".to_string());
+        }
+        if !matches!(decl.declarator.direct, DirectDeclarator::Ident(_)) {
+            return Err(
+                "render_decl: only a plain (non-array, non-function) declarator is supported so far"
+                    .to_string(),
+            );
+        }
+        let name = declarator_name(&decl.declarator)
+            .ok_or_else(|| "render_decl: declarator has no plain name".to_string())?;
+        // A trigger's own top-level `Foo* var;` for its embedded constructor
+        // (`EV_DoCeiling`'s `ceiling_t* ceiling;`, declared once outside the
+        // loop that actually builds it -- see `FnBodyContext::embedded_ctor`)
+        // never becomes a real Rust binding at all: `render_ctor_body` gives
+        // each of the constructed value's own *fields* their own `let`
+        // instead, so `ceiling` itself is never assigned or read anywhere in
+        // the translated output. Emitting `let mut ceiling;` for it would be
+        // genuinely dead, uninferable code (Rust has nothing to infer its
+        // type from), so it's dropped here rather than rendered.
+        if let Some(spec) = ctx.embedded_ctor
+            && name == spec.ctor_var
+        {
+            continue;
+        }
+        lines.push(format!("{}let mut {name};", indent(depth)));
     }
-    if !matches!(decl.declarator.direct, DirectDeclarator::Ident(_)) {
-        return Err(
-            "render_decl: only a plain (non-array, non-function) declarator is supported so far"
-                .to_string(),
-        );
-    }
-    let name = declarator_name(&decl.declarator)
-        .ok_or_else(|| "render_decl: declarator has no plain name".to_string())?;
-    // A trigger's own top-level `Foo* var;` for its embedded constructor
-    // (`EV_DoCeiling`'s `ceiling_t* ceiling;`, declared once outside the
-    // loop that actually builds it -- see `FnBodyContext::embedded_ctor`)
-    // never becomes a real Rust binding at all: `render_ctor_body` gives
-    // each of the constructed value's own *fields* their own `let`
-    // instead, so `ceiling` itself is never assigned or read anywhere in
-    // the translated output. Emitting `let mut ceiling;` for it would be
-    // genuinely dead, uninferable code (Rust has nothing to infer its
-    // type from), so it's dropped here rather than rendered.
-    if let Some(spec) = ctx.embedded_ctor
-        && name == spec.ctor_var
-    {
-        return Ok(Vec::new());
-    }
-    Ok(vec![format!("{}let mut {name};", indent(depth))])
+    Ok(lines)
 }
 
 fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String>, String> {
@@ -935,6 +955,7 @@ pub fn render_fn(
         extra_cross_ref_idents: &no_extra_cross_refs,
         ctor_var: "",
         ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -1420,6 +1441,7 @@ pub fn render_spawn_fn(
         extra_cross_ref_idents: param_cross_ref_types,
         ctor_var: "",
         ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
     };
     let no_field_defaults = HashMap::new();
@@ -1483,6 +1505,7 @@ fn render_ctor_body(
     let ctx = FnBodyContext {
         ctor_var,
         ctor_var_handle_name: "",
+        ctor_field_types,
         embedded_ctor: None,
         ..*base_ctx
     };
@@ -1757,6 +1780,7 @@ pub fn render_trigger_fn(
         extra_cross_ref_idents: &all_cross_refs,
         ctor_var: "",
         ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
         embedded_ctor,
     };
 
@@ -2283,6 +2307,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
@@ -2364,6 +2389,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -2406,6 +2432,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -2480,6 +2507,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             extra_cross_ref_idents: &no_extra_cross_refs,
             ctor_var: "",
             ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
@@ -2952,6 +2980,143 @@ pub fn EV_DoCeiling(line: LineId, r#type: i32, world: &mut World, thinkers: &mut
         let handle = thinkers.insert(Thinker::Ceiling(Ceiling { sector, crush, topheight, bottomheight, direction, speed, tag, r#type, olddirection }));
         world[sec].specialdata = Some(handle);
         P_AddActiveCeiling(handle);
+    }
+    return rtn;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_DoDoor` (`p_doors.c`) -- the same trigger-with-inline-
+    /// constructor shape as `EV_DoCeiling`, reusing the whole
+    /// `collect_ctor_fields_in`/`field_defaults` machinery unchanged, but
+    /// surfacing two more real gaps neither prior function happened to
+    /// exercise: (1) `int secnum,rtn;` declares two locals off one `int`
+    /// specifier -- `render_decl` previously only accepted a single
+    /// declarator (every earlier function's locals each got their own
+    /// line), fixed by looping over `d.declarators` instead of
+    /// destructuring a one-element slice. (2) `door->sector->soundorg`
+    /// reads a cross-reference-typed constructor field (`sector:
+    /// SectorId`, set from `door->sector = sec;` earlier) back out and
+    /// dereferences *through* it -- the `Expr::Member` branch handling a
+    /// bare `ctor_var->field` read hard-coded `is_crossref: false`
+    /// unconditionally (it only ever needed to name the field's own
+    /// local before), so this rendered as the ill-typed `sector.soundorg`
+    /// instead of `world[sector].soundorg`. Fixed by adding
+    /// `FnBodyContext::ctor_field_types` (mirroring `self_field_types`)
+    /// and checking it the same way the general `Member` fallback already
+    /// checks `self_field_types`. Both bugs were real and previously
+    /// unexercised, not design gaps anticipated ahead of time. `speed` is
+    /// set once before the switch and reassigned inside two arms (making
+    /// it `mut` from the ordinary reassign-count path, not the new
+    /// switch-field-synthesis path, since it's already `let`-bound by the
+    /// time the switch is reached); `topheight`/`direction` are switch-
+    /// only and need `field_defaults`; `topcountdown` is never touched at
+    /// all in `EV_DoDoor` (only read when `door.direction` is `0` or `2`,
+    /// values `EV_DoDoor` never produces -- confirmed by tracing every
+    /// read in `T_VerticalDoor`), so it falls through to the general
+    /// completeness-check default exactly like `EV_DoCeiling`'s
+    /// `olddirection`. `door->type = type;` is a plain passthrough
+    /// (already-handled dedup: no `let` line, since the field name and
+    /// the already-in-scope parameter's rendered name are identical).
+    /// Verified compiling the complete function with `rustc` directly
+    /// (hand-written `World`/`Sector`/`VerticalDoor`/`Arena`/`Handle`/
+    /// `FixedT` stand-ins), zero errors.
+    #[test]
+    fn test_ev_do_door_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("line".to_string(), "LineId".to_string()),
+            ("type".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("sec".to_string(), "SectorId".to_string())]
+            .into_iter()
+            .collect();
+        let ctor_field_types = vldoor_field_types();
+        let field_defaults = field_types(&[
+            ("topheight", "world[sec].ceilingheight"),
+            ("direction", "0"),
+            ("topcountdown", "0"),
+        ]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_doors.c",
+            "EV_DoDoor",
+            &params,
+            &locals,
+            Some(CtorSpec {
+                ctor_var: "door",
+                ctor_rust_type: "VerticalDoor",
+                ctor_field_types: &ctor_field_types,
+                field_defaults: &field_defaults,
+            }),
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_DoDoor(line: LineId, r#type: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> i32 {
+    let mut secnum;
+    let mut rtn;
+    let mut sec;
+    secnum = -1;
+    rtn = 0;
+    loop {
+        secnum = P_FindSectorFromLineTag(line, secnum);
+        if !(secnum >= 0) {
+            break;
+        }
+        sec = SectorId(secnum as u32);
+        if world[sec].specialdata.is_some() {
+            continue;
+        }
+        rtn = 1;
+        let sector = sec;
+        let topwait = VDOORWAIT;
+        let mut speed = VDOORSPEED;
+        let mut topheight = world[sec].ceilingheight;
+        let mut direction = 0;
+        match r#type {
+            blazeClose => {
+                topheight = P_FindLowestCeilingSurrounding(sec);
+                topheight -= 4 * FRACUNIT;
+                direction = -1;
+                speed = VDOORSPEED * 4;
+                S_StartSound(&world[sector].soundorg, sfx_bdcls);
+            }
+            close => {
+                topheight = P_FindLowestCeilingSurrounding(sec);
+                topheight -= 4 * FRACUNIT;
+                direction = -1;
+                S_StartSound(&world[sector].soundorg, sfx_dorcls);
+            }
+            close30ThenOpen => {
+                topheight = world[sec].ceilingheight;
+                direction = -1;
+                S_StartSound(&world[sector].soundorg, sfx_dorcls);
+            }
+            blazeRaise | blazeOpen => {
+                direction = 1;
+                topheight = P_FindLowestCeilingSurrounding(sec);
+                topheight -= 4 * FRACUNIT;
+                speed = VDOORSPEED * 4;
+                if topheight != world[sec].ceilingheight {
+                    S_StartSound(&world[sector].soundorg, sfx_bdopn);
+                }
+            }
+            normal | open => {
+                direction = 1;
+                topheight = P_FindLowestCeilingSurrounding(sec);
+                topheight -= 4 * FRACUNIT;
+                if topheight != world[sec].ceilingheight {
+                    S_StartSound(&world[sector].soundorg, sfx_doropn);
+                }
+            }
+            _ => {
+            }
+        }
+        let topcountdown = 0;
+        let handle = thinkers.insert(Thinker::VerticalDoor(VerticalDoor { sector, r#type, topwait, speed, topheight, direction, topcountdown }));
+        world[sec].specialdata = Some(handle);
     }
     return rtn;
 }";
