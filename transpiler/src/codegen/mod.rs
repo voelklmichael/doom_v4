@@ -17,7 +17,7 @@ pub mod world;
 
 pub use action_fn::render_action_fn_enum;
 pub use enum_values::{compute_enum_values, fold_const_int, render_enum_consts};
-pub use function_body::{render_fn, render_spawn_fn, render_trigger_fn};
+pub use function_body::{CtorSpec, render_fn, render_spawn_fn, render_trigger_fn};
 pub use mobjinfo_data::{MobjinfoTable, build_constant_index, render_mobjinfo_table};
 pub use mod_tree::render_mod_declarations;
 pub use modules::{Module, ModuleGraph, ModuleKind, build_module_graph};

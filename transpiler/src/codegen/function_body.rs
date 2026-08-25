@@ -68,6 +68,24 @@ fn is_cross_ref(rust_type: &str) -> bool {
     CROSS_REF_TYPES.contains(&rust_type)
 }
 
+/// Like `rust_field_name`, but for a bare identifier appearing as a
+/// *value* (a parameter/local reference, `type != lowerToFloor`), not a
+/// struct field name: `true`/`false` are C's own `boolean.h` literal
+/// tokens (`crush = false;`), matching the already-established
+/// `boolean` -> `bool` type mapping -- valid, unescaped Rust boolean
+/// literals as-is here, not identifiers that need `rust_field_name`'s
+/// own escape-or-reject handling (which exists for *field* positions,
+/// where `pub false: bool` is never valid in any form). Every other
+/// keyword (`type`, `crate`, `self`, ...) still goes through
+/// `rust_field_name` unchanged, since those really would be identifier-
+/// position problems.
+fn rust_ident_name(name: &str) -> Result<String, String> {
+    if name == "true" || name == "false" {
+        return Ok(name.to_string());
+    }
+    rust_field_name(name)
+}
+
 #[derive(Clone, Copy)]
 struct FnBodyContext<'a> {
     self_param: &'a str,
@@ -103,15 +121,32 @@ struct FnBodyContext<'a> {
     /// body does `Z_Malloc`/`P_AddThinker`/field-fill-in directly,
     /// unlike `EV_StartLightStrobing`'s call out to a separate
     /// `P_Spawn*` function) -- the constructor's own local variable
-    /// name, its `Thinker` variant/struct name, and its field-types map,
-    /// exactly what `render_spawn_fn` needs, just supplied by the
+    /// name, its `Thinker` variant/struct name, its field-types map
+    /// (exactly what `render_spawn_fn` needs, just supplied by the
     /// enclosing trigger instead of self-discovered from a top-level
-    /// `Decl` (the local is typically declared once, outside the loop
-    /// that actually constructs it). `render_compound_items` watches for
-    /// this and switches into `render_ctor_body` partway through
-    /// whichever block actually contains the `Z_Malloc` call. `None`
-    /// everywhere else.
-    embedded_ctor: Option<(&'a str, &'a str, &'a HashMap<String, String>)>,
+    /// `Decl`, since the local is typically declared once, outside the
+    /// loop that actually constructs it), and a field-defaults map (see
+    /// `render_ctor_body`'s own doc comment). `render_compound_items`
+    /// watches for this and switches into `render_ctor_body` partway
+    /// through whichever block actually contains the `Z_Malloc` call.
+    /// `None` everywhere else.
+    embedded_ctor: Option<CtorSpec<'a>>,
+}
+
+/// Everything needed to construct a value via `render_ctor_body` (see its
+/// own doc comment): the local variable name being built, its `Thinker`
+/// variant/struct name, its field-types map (for the completeness
+/// check), and a field-defaults map (for a field this constructor
+/// genuinely never sets on every path -- also its own doc comment).
+/// Bundled into one struct, rather than a growing parameter list/tuple,
+/// once `render_ctor_body` needed a fourth piece of ctor-specific data
+/// (`field_defaults`) alongside `ctor_var` itself.
+#[derive(Clone, Copy)]
+pub struct CtorSpec<'a> {
+    pub ctor_var: &'a str,
+    pub ctor_rust_type: &'a str,
+    pub ctor_field_types: &'a HashMap<String, String>,
+    pub field_defaults: &'a HashMap<String, String>,
 }
 
 fn indent(depth: usize) -> String {
@@ -198,7 +233,7 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 .extra_cross_ref_idents
                 .get(name.as_str())
                 .is_some_and(|t| is_cross_ref(t));
-            Ok((name.clone(), is_crossref))
+            Ok((rust_ident_name(name)?, is_crossref))
         }
         Expr::Member { base, field, .. } => {
             if !ctx.ctor_var.is_empty()
@@ -465,7 +500,20 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
     }
     let name = declarator_name(&decl.declarator)
         .ok_or_else(|| "render_decl: declarator has no plain name".to_string())?;
-    let _ = ctx;
+    // A trigger's own top-level `Foo* var;` for its embedded constructor
+    // (`EV_DoCeiling`'s `ceiling_t* ceiling;`, declared once outside the
+    // loop that actually builds it -- see `FnBodyContext::embedded_ctor`)
+    // never becomes a real Rust binding at all: `render_ctor_body` gives
+    // each of the constructed value's own *fields* their own `let`
+    // instead, so `ceiling` itself is never assigned or read anywhere in
+    // the translated output. Emitting `let mut ceiling;` for it would be
+    // genuinely dead, uninferable code (Rust has nothing to infer its
+    // type from), so it's dropped here rather than rendered.
+    if let Some(spec) = ctx.embedded_ctor
+        && name == spec.ctor_var
+    {
+        return Ok(Vec::new());
+    }
     Ok(vec![format!("{}let mut {name};", indent(depth))])
 }
 
@@ -804,10 +852,10 @@ fn render_compound_items(
     // everything from that point onward to `render_ctor_body` wholesale,
     // the same "process my whole remaining scope" behavior
     // `render_spawn_fn` already has for a full function.
-    if let Some((ctor_var, ctor_rust_type, ctor_field_types)) = ctx.embedded_ctor
-        && let Some(idx) = items
-            .iter()
-            .position(|item| matches!(item, BlockItem::Stmt(s) if is_malloc_assign(s, ctor_var)))
+    if let Some(spec) = ctx.embedded_ctor
+        && let Some(idx) = items.iter().position(
+            |item| matches!(item, BlockItem::Stmt(s) if is_malloc_assign(s, spec.ctor_var)),
+        )
     {
         let mut out = Vec::new();
         for item in &items[..idx] {
@@ -818,12 +866,10 @@ fn render_compound_items(
         }
         out.extend(render_ctor_body(
             &items[idx..],
-            ctor_var,
-            ctor_rust_type,
-            ctor_field_types,
+            &spec,
             ctx,
             depth,
-            ctor_var,
+            spec.ctor_var,
         )?);
         return Ok(out);
     }
@@ -1108,6 +1154,50 @@ fn ctor_field_assign_target<'a>(s: &'a Stmt, ctor_var: &str) -> Option<&'a str> 
     matches!(base.as_ref(), Expr::Ident(n) if n == ctor_var).then_some(field.as_str())
 }
 
+/// Collects, in first-seen order (deduplicated), every field name
+/// assigned to `ctor_var->field` anywhere inside `s` -- used to recognize
+/// a `switch` that's part of *constructing* the value, deciding some of
+/// its fields per case (`EV_DoCeiling`'s own `switch(type) { case X:
+/// ceiling->topheight = ...; ... }`, unlike every earlier constructor,
+/// which only ever set fields via flat top-level statements). Once the
+/// fields a switch touches are known, they can be pre-declared as `let
+/// mut field;` right before it, and the switch itself then renders
+/// completely unchanged -- `ctx`'s existing `ctor_var` resolution already
+/// turns every `ceiling->field` reference inside its arms into a plain,
+/// already-`let`-bound local either way, so no new statement-shape
+/// handling is needed for the switch's own body.
+fn collect_ctor_fields_in(s: &Stmt, ctor_var: &str, out: &mut Vec<String>) {
+    if let Some(field) = ctor_field_assign_target(s, ctor_var) {
+        if !out.iter().any(|f| f == field) {
+            out.push(field.to_string());
+        }
+        return;
+    }
+    match s {
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_ctor_fields_in(then_branch, ctor_var, out);
+            if let Some(eb) = else_branch {
+                collect_ctor_fields_in(eb, ctor_var, out);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_ctor_fields_in(body, ctor_var, out),
+        Stmt::Case { stmt, .. } => collect_ctor_fields_in(stmt, ctor_var, out),
+        Stmt::Default(stmt) => collect_ctor_fields_in(stmt, ctor_var, out),
+        Stmt::Compound(c) => {
+            for item in &c.items {
+                if let BlockItem::Stmt(s) = item {
+                    collect_ctor_fields_in(s, ctor_var, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn count_ctor_field_assigns_stmt(s: &Stmt, ctor_var: &str, counts: &mut HashMap<String, usize>) {
     if let Some(field) = ctor_field_assign_target(s, ctor_var) {
         *counts.entry(field.to_string()).or_insert(0) += 1;
@@ -1125,6 +1215,14 @@ fn count_ctor_field_assigns_stmt(s: &Stmt, ctor_var: &str, counts: &mut HashMap<
             }
         }
         Stmt::Switch { body, .. } => count_ctor_field_assigns_stmt(body, ctor_var, counts),
+        // `case`/`default` labels wrap only their own next statement (see
+        // `render_switch`'s own module docs on this C parsing quirk) --
+        // never recursed into here before this fix, since no constructor
+        // attempted so far had a `switch` deciding any of its fields
+        // (`EV_DoCeiling`'s own inline constructor is the first), so this
+        // was a real, previously-unexercised gap in `mut`-detection.
+        Stmt::Case { stmt, .. } => count_ctor_field_assigns_stmt(stmt, ctor_var, counts),
+        Stmt::Default(stmt) => count_ctor_field_assigns_stmt(stmt, ctor_var, counts),
         Stmt::Compound(c) => count_ctor_field_assigns(&c.items, ctor_var, counts),
         _ => {}
     }
@@ -1270,7 +1368,7 @@ fn render_params(
         let rust_type = param_types
             .get(&name)
             .ok_or_else(|| format!("{fn_name}: parameter `{name}`'s Rust type isn't known"))?;
-        rendered.push(format!("{name}: {rust_type}"));
+        rendered.push(format!("{}: {rust_type}", rust_field_name(&name)?));
     }
     Ok(rendered)
 }
@@ -1324,15 +1422,14 @@ pub fn render_spawn_fn(
         ctor_var_handle_name: "",
         embedded_ctor: None,
     };
-    let lines = render_ctor_body(
-        &f.body.items,
-        &ctor_var,
+    let no_field_defaults = HashMap::new();
+    let spec = CtorSpec {
+        ctor_var: &ctor_var,
         ctor_rust_type,
         ctor_field_types,
-        &base_ctx,
-        1,
-        fn_name,
-    )?;
+        field_defaults: &no_field_defaults,
+    };
+    let lines = render_ctor_body(&f.body.items, &spec, &base_ctx, 1, fn_name)?;
     Ok(format!(
         "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>) {{\n{}\n}}",
         rendered_params.join(", "),
@@ -1357,15 +1454,32 @@ pub fn render_spawn_fn(
 /// sec;` reads the trigger loop's own `sec` local) -- this function
 /// layers its own `ctor_var` on top via `FnBodyContext: Copy`'s struct-
 /// update syntax, rather than building a context from scratch.
+///
+/// `field_defaults` supplies an explicit rendered-expression string for
+/// a field this constructor genuinely never sets anywhere (`EV_DoCeiling`
+/// never touches `Ceiling.olddirection` at all -- only
+/// `P_ActivateInStasisCeiling`/`EV_CeilingCrushStop`, two *other*
+/// functions entirely, ever read or write it, and always write-before-
+/// read, so the freshly-constructed garbage value is never actually
+/// observed). This is never guessed at automatically -- only used when a
+/// caller supplies an entry, after doing the same kind of corpus tracing
+/// that got `P_SpawnDoorCloseIn30` correctly *rejected* for the opposite
+/// reason (there, the unset field *was* reachable with no defined value).
+/// A field with no entry here still fails the completeness check exactly
+/// as before.
 fn render_ctor_body(
     items: &[BlockItem],
-    ctor_var: &str,
-    ctor_rust_type: &str,
-    ctor_field_types: &HashMap<String, String>,
+    spec: &CtorSpec,
     base_ctx: &FnBodyContext,
     depth: usize,
     fn_name: &str,
 ) -> Result<Vec<String>, String> {
+    let CtorSpec {
+        ctor_var,
+        ctor_rust_type,
+        ctor_field_types,
+        field_defaults,
+    } = *spec;
     let ctx = FnBodyContext {
         ctor_var,
         ctor_var_handle_name: "",
@@ -1468,6 +1582,56 @@ fn render_ctor_body(
             lines.extend(render_stmt(s, &ctx, depth)?);
             continue;
         }
+        if let Stmt::Switch { .. } = s {
+            let mut touched_fields = Vec::new();
+            collect_ctor_fields_in(s, ctor_var, &mut touched_fields);
+            if !touched_fields.is_empty() {
+                // A `switch` deciding some of the constructed value's own
+                // fields per case (`EV_DoCeiling`'s `switch(type) { case
+                // X: ceiling->topheight = ...; ... }`), rather than a
+                // flat statement -- pre-declare whichever of those fields
+                // aren't already `let`-bound (always `mut`, since a
+                // switch-decided field's value depends on which arm ran,
+                // not a single unconditional computation), then render
+                // the switch completely unchanged: `ctx`'s `ctor_var`
+                // resolution already turns every `ceiling->field`
+                // reference inside its arms into a plain reassignment of
+                // that local, exactly like a compound-assignment
+                // refinement already does outside a switch.
+                //
+                // **Every** touched field needs a `field_defaults` entry
+                // here, seeding its own `let`, even one every *real* `case`
+                // sets (confirmed empirically, not assumed, by actually
+                // compiling `EV_DoCeiling`'s output with `rustc`): `type`
+                // maps to a plain `i32`, not a real closed Rust `enum`, so
+                // `render_switch`'s own synthetic `_ => {}` catch-all (for
+                // a discriminant value outside the ones this `switch`
+                // actually names -- unreachable in real Doom, since `type`
+                // is always one of the known `ceiling_e` values, but Rust
+                // can't see that from an `i32`) leaves every switch-only
+                // field looking possibly-uninitialized to Rust's real
+                // definite-assignment check, not just the ones with a
+                // genuine per-arm gap like `bottomheight`.
+                for field in &touched_fields {
+                    let field = rust_field_name(field)?;
+                    if ctor_field_names.contains(&field) {
+                        continue;
+                    }
+                    let default_expr = field_defaults.get(&field).ok_or_else(|| {
+                        format!(
+                            "{fn_name}: `{field}` is only ever set inside a `switch`, and needs an explicit `field_defaults` entry to satisfy Rust's definite-assignment check (its own synthetic `_` catch-all arm never sets it)"
+                        )
+                    })?;
+                    lines.push(format!(
+                        "{}let mut {field} = {default_expr};",
+                        indent(depth)
+                    ));
+                    ctor_field_names.push(field);
+                }
+                lines.extend(render_stmt(s, &ctx, depth)?);
+                continue;
+            }
+        }
         // Once `has_backreference` is true, deferring is safe for *any*
         // statement, whatever shape -- `ctor_var_handle_name` resolves
         // `ctor_var` correctly wherever it appears once rendered with
@@ -1489,15 +1653,23 @@ fn render_ctor_body(
         }
     }
 
-    let missing_fields: Vec<&str> = ctor_field_types
-        .keys()
-        .map(String::as_str)
-        .filter(|f| !ctor_field_names.iter().any(|n| n == f))
-        .collect();
-    if !missing_fields.is_empty() {
+    let mut still_missing: Vec<&str> = Vec::new();
+    for field in ctor_field_types.keys() {
+        if ctor_field_names.contains(field) {
+            continue;
+        }
+        match field_defaults.get(field) {
+            Some(default_expr) => {
+                lines.push(format!("{}let {field} = {default_expr};", indent(depth)));
+                ctor_field_names.push(field.clone());
+            }
+            None => still_missing.push(field.as_str()),
+        }
+    }
+    if !still_missing.is_empty() {
         return Err(format!(
             "{fn_name}: never assigns {ctor_rust_type}'s field(s) {}, so the constructed literal would be incomplete",
-            missing_fields.join(", ")
+            still_missing.join(", ")
         ));
     }
 
@@ -1551,7 +1723,11 @@ fn render_ctor_body(
 /// the `Z_Malloc` call. `ctor_var` is supplied here rather than self-
 /// discovered the way `render_spawn_fn` does, since the local is
 /// typically declared once at the top of the function, not right before
-/// the loop that actually constructs it.
+/// the loop that actually constructs it. The last element is a field-
+/// defaults map (see `render_ctor_body`'s own doc comment) for any field
+/// the constructor genuinely never sets anywhere, once a caller has
+/// traced that it's safe -- pass an empty map when every field really is
+/// assigned somewhere.
 ///
 /// `return_type` renders as the function's own `-> T` when `Some`
 /// (`EV_DoCeiling`/`EV_DoFloor`-style triggers return `int`, whether a
@@ -1564,7 +1740,7 @@ pub fn render_trigger_fn(
     fn_name: &str,
     param_types: &HashMap<String, String>,
     local_var_types: &HashMap<String, String>,
-    embedded_ctor: Option<(&str, &str, &HashMap<String, String>)>,
+    embedded_ctor: Option<CtorSpec>,
     return_type: Option<&str>,
 ) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
@@ -2624,6 +2800,160 @@ pub fn T_MoveCeiling(ceiling: &mut Ceiling, world: &mut World) {
         }
         _ => {}
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_DoCeiling` (`p_ceilng.c`) -- the fourth function shape closed
+    /// out end-to-end: a trigger that constructs its thinker *inline*,
+    /// mid-loop (`render_trigger_fn`'s own `embedded_ctor`), with fields
+    /// decided by a `switch(type)` that's genuinely part of construction,
+    /// not a flat statement. Exercises everything built for this shape at
+    /// once: `render_ctor_body` embedded inside `render_compound_items`;
+    /// `collect_ctor_fields_in` recognizing the switch's own fields
+    /// (`crush` already `let`-bound from a flat statement before it, just
+    /// reassigned inside two arms; `topheight`/`bottomheight`/`direction`/
+    /// `speed` bound for the first time by the switch itself); and
+    /// `field_defaults`, required for *every* switch-touched field here
+    /// (not just the ones with a genuine per-arm gap like
+    /// `bottomheight`'s own `raiseToHighest` case) -- confirmed by
+    /// actually compiling a reduced repro with `rustc` that `type: i32`
+    /// (not a real closed Rust `enum`) means `render_switch`'s own
+    /// synthetic `_ => {}` catch-all leaves *every* field it touches
+    /// looking possibly-uninitialized to Rust's real definite-assignment
+    /// check, even ones every genuine `case` sets. `olddirection` needs a
+    /// default for a different reason: `EV_DoCeiling` never touches it at
+    /// all -- only `P_ActivateInStasisCeiling`/`EV_CeilingCrushStop`, two
+    /// unrelated functions, ever read or write it, always write-before-
+    /// read, confirmed by tracing every real reference in the corpus.
+    /// Two more real bugs caught working through this: the parameter
+    /// `type` (a Rust keyword) was escaped nowhere at all, not in its own
+    /// declaration nor in any bare reference to it (fixed generally, for
+    /// every bare identifier, via a new `rust_ident_name` -- distinct
+    /// from `rust_field_name` since `true`/`false` are real Rust boolean
+    /// literals when they appear as *values*, matching the already-
+    /// established `boolean` -> `bool` mapping, not identifiers needing
+    /// escaping or rejecting the way a field literally named `false`
+    /// would); and the constructor's own top-level `ceiling_t* ceiling;`
+    /// declaration became dead, uninferable code once every one of its
+    /// fields got its own separate `let` instead, so `render_decl` now
+    /// drops a local matching `embedded_ctor`'s own variable entirely.
+    /// **Verified compiling for real**, including the switch/field-
+    /// defaults/keyword fixes together -- zero errors, zero warnings.
+    #[test]
+    fn test_ev_do_ceiling_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("line".to_string(), "LineId".to_string()),
+            ("type".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("sec".to_string(), "SectorId".to_string())]
+            .into_iter()
+            .collect();
+        let ctor_field_types = field_types(&[
+            ("sector", "SectorId"),
+            ("r#type", "i32"),
+            ("bottomheight", "FixedT"),
+            ("topheight", "FixedT"),
+            ("speed", "FixedT"),
+            ("crush", "bool"),
+            ("direction", "i32"),
+            ("tag", "i32"),
+            ("olddirection", "i32"),
+        ]);
+        let field_defaults = field_types(&[
+            ("olddirection", "0"),
+            ("topheight", "world[sec].ceilingheight"),
+            ("bottomheight", "world[sec].floorheight"),
+            ("direction", "0"),
+            ("speed", "CEILSPEED"),
+        ]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "EV_DoCeiling",
+            &params,
+            &locals,
+            Some(CtorSpec {
+                ctor_var: "ceiling",
+                ctor_rust_type: "Ceiling",
+                ctor_field_types: &ctor_field_types,
+                field_defaults: &field_defaults,
+            }),
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_DoCeiling(line: LineId, r#type: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> i32 {
+    let mut secnum;
+    let mut rtn;
+    let mut sec;
+    secnum = -1;
+    rtn = 0;
+    match r#type {
+        fastCrushAndRaise | silentCrushAndRaise | crushAndRaise => {
+            P_ActivateInStasisCeiling(line);
+        }
+        _ => {
+        }
+    }
+    loop {
+        secnum = P_FindSectorFromLineTag(line, secnum);
+        if !(secnum >= 0) {
+            break;
+        }
+        sec = SectorId(secnum as u32);
+        if world[sec].specialdata.is_some() {
+            continue;
+        }
+        rtn = 1;
+        let sector = sec;
+        let mut crush = false;
+        let mut topheight = world[sec].ceilingheight;
+        let mut bottomheight = world[sec].floorheight;
+        let mut direction = 0;
+        let mut speed = CEILSPEED;
+        match r#type {
+            fastCrushAndRaise => {
+                crush = true;
+                topheight = world[sec].ceilingheight;
+                bottomheight = world[sec].floorheight + 8 * FRACUNIT;
+                direction = -1;
+                speed = CEILSPEED * 2;
+            }
+            silentCrushAndRaise | crushAndRaise => {
+                crush = true;
+                topheight = world[sec].ceilingheight;
+                bottomheight = world[sec].floorheight;
+                if r#type != lowerToFloor {
+                    bottomheight += 8 * FRACUNIT;
+                }
+                direction = -1;
+                speed = CEILSPEED;
+            }
+            lowerAndCrush | lowerToFloor => {
+                bottomheight = world[sec].floorheight;
+                if r#type != lowerToFloor {
+                    bottomheight += 8 * FRACUNIT;
+                }
+                direction = -1;
+                speed = CEILSPEED;
+            }
+            raiseToHighest => {
+                topheight = P_FindHighestCeilingSurrounding(sec);
+                direction = 1;
+                speed = CEILSPEED;
+            }
+            _ => {}
+        }
+        let tag = world[sec].tag;
+        let olddirection = 0;
+        let handle = thinkers.insert(Thinker::Ceiling(Ceiling { sector, crush, topheight, bottomheight, direction, speed, tag, r#type, olddirection }));
+        world[sec].specialdata = Some(handle);
+        P_AddActiveCeiling(handle);
+    }
+    return rtn;
 }";
         assert_eq!(rendered, expected);
     }
