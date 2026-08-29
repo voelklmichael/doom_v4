@@ -1567,6 +1567,61 @@ pub fn render_fn(
     ))
 }
 
+fn nth_param_name(f: &FunctionDef, n: usize) -> Option<String> {
+    let DirectDeclarator::Function(_, params) = &f.declarator.direct else {
+        return None;
+    };
+    let param = params.params.get(n)?;
+    let ParamDeclarator::Named(d) = &param.declarator else {
+        return None;
+    };
+    declarator_name(d)
+}
+
+/// Renders a `fn(player_t*, pspdef_t*)`-shaped action function (`state_t.
+/// action`'s `acp2` variant, `action_fn.rs`'s `ActionFn::Weapon`) --
+/// `A_Light0`/`A_Light1`/`A_Light2`, the first real examples. Unlike
+/// `render_fn`'s single-struct tick-function shape, this has two real
+/// parameters, neither a `Thinker`; only `player`'s fields are resolved
+/// (`player_t` isn't struct-mapped in `struct_fields.rs` -- see module
+/// docs -- so `player_field_types` is supplied directly by the caller,
+/// the same as every other function-body test). No `world: &mut World`
+/// parameter yet: none of the three real functions this was built against
+/// touch a cross-reference field, so one isn't threaded through
+/// speculatively -- add it if a future weapon action function needs one,
+/// the same "measure, don't guess" reasoning `render_fn`'s own
+/// self-removal parameters already follow.
+pub fn render_weapon_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    player_field_types: &HashMap<String, String>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+    let player_param = nth_param_name(f, 0)
+        .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
+    let psp_param = nth_param_name(f, 1)
+        .ok_or_else(|| format!("{fn_name}: second parameter has no plain name"))?;
+    let no_extra_cross_refs = HashMap::new();
+    let ctx = FnBodyContext {
+        self_param: &player_param,
+        self_field_types: player_field_types,
+        extra_cross_ref_idents: &no_extra_cross_refs,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
+        embedded_ctor: None,
+        mutating_handle: None,
+    };
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    Ok(format!(
+        "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState) {{\n{}\n}}",
+        body_lines.join("\n")
+    ))
+}
+
 fn body_has_self_removal(items: &[BlockItem], self_param: &str) -> bool {
     items.iter().any(|item| match item {
         BlockItem::Stmt(s) => stmt_has_self_removal(s, self_param),
@@ -4808,6 +4863,44 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         assert_eq!(
             rendered,
             "pub fn A_Metal(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_metal);\n    A_Chase(mo);\n}"
+        );
+    }
+
+    /// First `ActionFn::Weapon`-shaped (`fn(player_t*, pspdef_t*)`)
+    /// action functions translated, via the new `render_weapon_fn`.
+    /// `player_t` isn't struct-mapped (see `render_weapon_fn`'s own
+    /// docs), so `extralight`'s type is supplied directly, the same
+    /// pattern already established for `EV_DoLockedDoor`.
+    #[test]
+    fn test_a_light0_renders_exactly() {
+        let field_types = field_types(&[("extralight", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Light0", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Light0(player: &mut Player, psp: &mut PlayerSpriteState) {\n    player.extralight = 0;\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_light1_renders_exactly() {
+        let field_types = field_types(&[("extralight", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Light1", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Light1(player: &mut Player, psp: &mut PlayerSpriteState) {\n    player.extralight = 1;\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_light2_renders_exactly() {
+        let field_types = field_types(&[("extralight", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Light2", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Light2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    player.extralight = 2;\n}"
         );
     }
 
