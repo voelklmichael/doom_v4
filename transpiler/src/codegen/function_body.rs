@@ -692,6 +692,22 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // conversion hasn't been seen yet; this would need revisiting if
         // one turns up.
         Expr::Cast { expr, .. } => render_expr(expr, ctx),
+        // `player->refire++;` (`A_ReFire`) -- a bare increment/decrement
+        // used as its own standalone statement, not as an `if`'s own
+        // condition (`hoist_pre_inc_dec`'s own narrower shape, which
+        // pattern-matches `PreIncDec` directly before ever reaching this
+        // generic arm, so the two don't conflict) or a `for` loop's step
+        // (`render_for_step`, which now just delegates here instead of
+        // duplicating this same text). C doesn't distinguish pre/post
+        // for a discarded result, so both render identically.
+        Expr::PostIncDec { expr, op } | Expr::PreIncDec { expr, op } => {
+            let (target_text, _) = render_expr(expr, ctx)?;
+            let op_text = match op {
+                IncDecOp::Inc => "+= 1",
+                IncDecOp::Dec => "-= 1",
+            };
+            Ok((format!("{target_text} {op_text}"), false))
+        }
         Expr::Call { callee, args } => {
             let (callee_text, _) = render_expr(callee, ctx)?;
             let mut rendered_args = Vec::with_capacity(args.len());
@@ -764,6 +780,33 @@ fn render_binary_operand(
     is_right: bool,
     ctx: &FnBodyContext,
 ) -> Result<String, String> {
+    // `(player->cmd.buttons & BT_ATTACK) && player->pendingweapon ==
+    // wp_nochange && player->health` (`A_ReFire`) -- the reverse
+    // direction of the bool-as-arithmetic cast just below: a `&&`/`||`
+    // operand that's a bare field (`player->health`) or a non-comparison
+    // `Binary` (`player->cmd.buttons & BT_ATTACK`) is still real C
+    // truthiness -- any nonzero value is true -- the same reading
+    // `render_bool_expr`'s own top-level entry point already gives a
+    // *whole* condition, reused directly here rather than duplicated.
+    // Deliberately scoped to just these two shapes, *not* every
+    // non-comparison operand: a bare `Unary::Not` operand (`!world[p.
+    // unwrap()].cards[idx]`, `EV_DoLockedDoor`/`EV_VerticalDoor`'s own
+    // lock checks) already renders correctly as plain `!` via the
+    // ordinary `Expr::Unary` arm below, since `cards` is a genuine Rust
+    // `bool` array -- routing it through `render_bool_expr` too would
+    // wrongly apply that function's generic *int*-truthiness `== 0`
+    // fallback to an already-`bool` value (confirmed a real regression
+    // against `test_ev_do_locked_door_renders_exactly`/`test_ev_
+    // vertical_door_renders_exactly` when tried). No renderer here
+    // tracks a field's real C type well enough to tell a genuinely-`int`
+    // negation from a genuinely-`bool` one inside a chain, so this
+    // leaves `Unary::Not` exactly as before rather than guessing.
+    if matches!(parent_op, BinaryOp::LogAnd | BinaryOp::LogOr)
+        && (matches!(operand, Expr::Member { .. })
+            || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op)))
+    {
+        return render_bool_expr(operand, ctx);
+    }
     let (text, _) = render_expr(operand, ctx)?;
     if !is_comparison_or_logical(parent_op)
         && matches!(operand, Expr::Binary { op, .. } if is_comparison_or_logical(*op))
@@ -1527,18 +1570,17 @@ fn render_for(
     Ok(lines)
 }
 
-/// `i++`/`i--` -- a `for` loop's own step, the only shape any real
-/// corpus loop has needed so far.
+/// `i++`/`i--`, or a compound-assign step (`A_BrainScream`'s own `for
+/// (x = ...; x < ...; x += FRACUNIT*8)`, scanning 4096-unit-wide slices
+/// of the map rather than counting by ones) -- delegates to
+/// `render_expr_stmt`'s own already-general `Expr::Assign` handling
+/// rather than duplicating it, since a `for` step is just an ordinary
+/// statement rendered without its own trailing `;` (added by `render_for`
+/// itself).
 fn render_for_step(step: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     match step {
-        Expr::PostIncDec { expr, op } | Expr::PreIncDec { expr, op } => {
-            let (target_text, _) = render_expr(expr, ctx)?;
-            let op_text = match op {
-                IncDecOp::Inc => "+= 1",
-                IncDecOp::Dec => "-= 1",
-            };
-            Ok(format!("{target_text} {op_text}"))
-        }
+        Expr::PostIncDec { .. } | Expr::PreIncDec { .. } => Ok(render_expr(step, ctx)?.0),
+        Expr::Assign { .. } => render_expr_stmt(step, ctx),
         other => Err(format!("render_for: unsupported step shape: {other:?}")),
     }
 }
@@ -6997,6 +7039,115 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             "pub fn A_FatRaise(actor: &mut Mobj, world: &mut World) {\n    \
              A_FaceTarget(actor);\n    \
              S_StartSound(actor, sfx_manatk);\n\
+             }"
+        );
+    }
+
+    /// `A_BFGsound` -- identical shape to the already-covered
+    /// `A_OpenShotgun2`/`A_LoadShotgun2` (a single `S_StartSound(player->
+    /// mo, sfx)` call), confirming `render_weapon_fn` generalizes with no
+    /// changes needed.
+    #[test]
+    fn test_a_bfgsound_renders_exactly() {
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_BFGsound", &HashMap::new())
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BFGsound(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             S_StartSound(player.mo, sfx_bfg);\n\
+             }"
+        );
+    }
+
+    /// `A_CheckReload` -- a single opaque call, `P_CheckAmmo(player)`; the
+    /// real corpus body also has an `#if 0`'d-out `P_SetPsprite` call
+    /// right after it, confirming the parser's own preprocessing already
+    /// strips dead `#if 0` blocks before this renderer ever sees them
+    /// (the same "confirmed by direct read, not assumed" `#if 0` handling
+    /// already established for `slidedoor_t`/`FixedDiv2`'s own dead
+    /// alternate path).
+    #[test]
+    fn test_a_check_reload_renders_exactly() {
+        let rendered =
+            render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_CheckReload", &HashMap::new())
+                .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CheckReload(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             P_CheckAmmo(player);\n\
+             }"
+        );
+    }
+
+    /// `A_ReFire` -- the function that motivated `render_binary_operand`'s
+    /// own new arithmetic-as-bool generalization: `(player->cmd.buttons &
+    /// BT_ATTACK) && player->pendingweapon == wp_nochange &&
+    /// player->health` chains a bitwise-flag test and a bare `int` field
+    /// truthiness check together with an already-`bool` comparison, none
+    /// of which previously rendered as valid Rust `bool` text inside a
+    /// `&&` chain. Also the first standalone (non-condition, non-for-step)
+    /// `player->refire++;` statement, exercising `render_expr`'s new
+    /// generic `PostIncDec`/`PreIncDec` arm.
+    #[test]
+    fn test_a_re_fire_renders_exactly() {
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_ReFire", &HashMap::new())
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_ReFire(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             if (player.cmd.buttons & BT_ATTACK) != 0 && player.pendingweapon == wp_nochange && player.health != 0 {\n        \
+             player.refire += 1;\n        \
+             P_FireWeapon(player);\n    \
+             } else {\n        \
+             player.refire = 0;\n        \
+             P_CheckAmmo(player);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_BrainScream` -- `A_BrainExplode`'s own already-translated
+    /// idiom (spawn a rocket-shaped mobj, give it a random downward tics
+    /// countdown clamped to at least 1) repeated across a horizontal
+    /// slice of the map, motivating `render_for_step`'s own generalization
+    /// to a compound-assign step (`x += FRACUNIT*8`, not `x++`/`x--`) --
+    /// the real corpus counterpart `docs/03_TRANSPILER.md`'s own "not yet
+    /// done" list already flagged this gap against. `y`/`z` are freshly
+    /// recomputed every iteration (not hoisted out of the loop), and `x`
+    /// itself is the loop's own already-declared-at-top counter, the only
+    /// shape `render_for`'s init handling supports.
+    #[test]
+    fn test_a_brain_scream_renders_exactly() {
+        let field_types = field_types(&[("x", "FixedT"), ("momz", "FixedT"), ("tics", "i32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainScream",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainScream(mo: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut x;\n    \
+             let mut y;\n    \
+             let mut z;\n    \
+             let mut th;\n    \
+             x = mo.x - 196 * FRACUNIT;\n    \
+             while x < mo.x + 320 * FRACUNIT {\n        \
+             y = mo.y - 320 * FRACUNIT;\n        \
+             z = 128 + P_Random() * 2 * FRACUNIT;\n        \
+             th = P_SpawnMobj(x, y, z, MT_ROCKET);\n        \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FixedT(P_Random() * 512); };\n        \
+             P_SetMobjState(th, S_BRAINEXPLODE1);\n        \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 7; };\n        \
+             if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {\n            \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };\n        \
+             }\n        \
+             x += FRACUNIT * 8;\n    \
+             }\n    \
+             S_StartSound(None, sfx_bosdth);\n\
              }"
         );
     }
