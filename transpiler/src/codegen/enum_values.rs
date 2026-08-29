@@ -301,13 +301,13 @@ mod tests {
             for item in &unit.items {
                 if let ExternalDecl::Declaration(decl) = item {
                     for ts in &decl.specifiers.type_specifiers {
-                        if let TypeSpecifier::Enum(spec) = ts {
-                            if spec.variants.is_some() {
-                                for (_, value) in compute_enum_values(spec) {
-                                    total += 1;
-                                    if value.is_some() {
-                                        folded += 1;
-                                    }
+                        if let TypeSpecifier::Enum(spec) = ts
+                            && spec.variants.is_some()
+                        {
+                            for (_, value) in compute_enum_values(spec) {
+                                total += 1;
+                                if value.is_some() {
+                                    folded += 1;
                                 }
                             }
                         }

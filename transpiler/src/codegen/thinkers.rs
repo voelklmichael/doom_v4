@@ -96,12 +96,26 @@ pub fn render_thinker_enum() -> String {
     out
 }
 
-/// A stub `match` dispatch: one arm per variant, `todo!()` body. See this
-/// module's own docs on why real tick-function bodies are out of scope
-/// here.
+/// A stub `match` dispatch: one arm per variant, `todo!()` body. Takes
+/// `world: &mut World` -- confirmed necessary (not just anticipated) by
+/// `function_body.rs`'s translation of `T_FireFlicker`, the first real
+/// tick body: it needs `World` to resolve a `SectorId` cross-reference
+/// field back to a real `&mut Sector`. Also takes `handle: Handle<Thinker>`
+/// and `arena: &mut Arena<Thinker>`, matching `Arena::run`'s own closure
+/// shape exactly (`FnMut(&mut T, Handle<T>, &mut Arena<T>)`) -- confirmed
+/// necessary by `T_VerticalDoor`, the first complete real tick body that
+/// removes itself (`P_RemoveThinker(&door->thinker)` -> `arena.
+/// remove(handle)`); not every individual variant's own translated
+/// function needs both (`render_fn` only adds them to a function's own
+/// signature when its body actually self-removes), but the dispatch
+/// itself needs them on hand to route through to whichever arm does.
+/// Arms stay `todo!()` here since wiring a real body into this dispatch
+/// also needs the function's own module placement settled (`p_lights.c`
+/// vs `p_spec`'s own `Source` module -- not yet decided, see
+/// `docs/03_TRANSPILER.md`), not just the signature.
 pub fn render_thinker_dispatch_stub() -> String {
-    let mut out =
-        "impl Thinker {\n    pub fn tick(&mut self) {\n        match self {\n".to_string();
+    let mut out = "impl Thinker {\n    pub fn tick(&mut self, world: &mut World, handle: Handle<Thinker>, arena: &mut Arena<Thinker>) {\n        match self {\n"
+            .to_string();
     for (_, rust_name) in THINKER_VARIANTS {
         out.push_str(&format!(
             "            Thinker::{rust_name}(_) => todo!(\"{rust_name} tick logic\"),\n"

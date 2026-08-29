@@ -79,6 +79,12 @@ fn map_type(
         return match specs.type_specifiers.as_slice() {
             [TypeSpecifier::Int] => Some("i32".to_string()),
             [TypeSpecifier::Short] => Some("i16".to_string()),
+            // `long` is bit-identical to `int` on this project's ILP32
+            // target (both 32-bit -- see typecheck::types's own documented
+            // ILP32 assumptions), so it maps to the same `i32` rather than
+            // a separate newtype; state_t.frame/tics/misc1/misc2 are the
+            // first fields needing it.
+            [TypeSpecifier::Long] => Some("i32".to_string()),
             [TypeSpecifier::Unsigned, TypeSpecifier::Short] => Some("u16".to_string()),
             [TypeSpecifier::TypedefName(name)] if name == "fixed_t" => Some("FixedT".to_string()),
             [TypeSpecifier::TypedefName(name)] if name == "boolean" => Some("bool".to_string()),
@@ -104,6 +110,13 @@ fn map_type(
             // once its own name is known here.
             [TypeSpecifier::TypedefName(name)] if name == "degenmobj_t" => {
                 Some("DegenMobj".to_string())
+            }
+            // actionf_t (state_t.action) -- Doom's other function-pointer
+            // dispatch union, see action_fn.rs's own docs. Nullable:
+            // `states[]`'s own data (info.c) initializes plenty of entries
+            // `{NULL}`, states with no action at all.
+            [TypeSpecifier::TypedefName(name)] if name == "actionf_t" => {
+                Some("Option<ActionFn>".to_string())
             }
             [TypeSpecifier::TypedefName(name)] if enum_typedefs.contains(name) => {
                 Some("i32".to_string())
@@ -229,7 +242,7 @@ const RUST_NON_ESCAPABLE_KEYWORDS: &[&str] = &["crate", "self", "super", "Self",
 /// or `Err` if it collides with one of the four keywords raw-identifier
 /// syntax can't escape at all -- fails loudly rather than emitting
 /// something that won't compile.
-fn rust_field_name(name: &str) -> Result<String, String> {
+pub(crate) fn rust_field_name(name: &str) -> Result<String, String> {
     if RUST_NON_ESCAPABLE_KEYWORDS.contains(&name) {
         return Err(format!(
             "field name `{name}` collides with a Rust keyword that can't be raw-identifier-escaped"
@@ -953,6 +966,74 @@ mod tests {
                 field("dy", "FixedT"),
                 field("bbox", "[[FixedT; 4]; 2]"),
                 field("children", "[u16; 2]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_mobjinfo_t_completely() {
+        // Every field of mobjinfo_t (info.h) is a plain `int` -- several
+        // are semantically state indices (spawnstate, seestate, ...) but
+        // declared as bare `int` in the corpus itself, not `statenum_t`
+        // (unlike state_t.nextstate, which is properly enum-typed), so
+        // they map as plain i32 too, matching the field's actual declared
+        // type rather than its intent.
+        let items = parse_rough("info.h");
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "mobjinfo_t").expect("mobjinfo_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("doomednum", "i32"),
+                field("spawnstate", "i32"),
+                field("spawnhealth", "i32"),
+                field("seestate", "i32"),
+                field("seesound", "i32"),
+                field("reactiontime", "i32"),
+                field("attacksound", "i32"),
+                field("painstate", "i32"),
+                field("painchance", "i32"),
+                field("painsound", "i32"),
+                field("meleestate", "i32"),
+                field("missilestate", "i32"),
+                field("deathstate", "i32"),
+                field("xdeathstate", "i32"),
+                field("deathsound", "i32"),
+                field("speed", "i32"),
+                field("radius", "i32"),
+                field("height", "i32"),
+                field("mass", "i32"),
+                field("damage", "i32"),
+                field("activesound", "i32"),
+                field("flags", "i32"),
+                field("raisestate", "i32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_state_t_completely() {
+        // state_t (info.h) exercises spritenum_t/statenum_t (enum
+        // typedefs, mapped generically), `long` (bit-identical to `int` on
+        // this project's ILP32 target), and actionf_t -> Option<ActionFn>
+        // (action_fn.rs's own closed 2-variant enum for Doom's other
+        // function-pointer dispatch union, nullable since states[]'s own
+        // data initializes plenty of entries `{NULL}`).
+        let items = parse_rough("info.h");
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "state_t").expect("state_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("sprite", "i32"),
+                field("frame", "i32"),
+                field("tics", "i32"),
+                field("action", "Option<ActionFn>"),
+                field("nextstate", "i32"),
+                field("misc1", "i32"),
+                field("misc2", "i32"),
             ]
         );
     }

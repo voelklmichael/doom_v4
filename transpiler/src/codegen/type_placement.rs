@@ -13,12 +13,23 @@
 //! itself goes in `p_tick` -- where `P_InitThinkers`/`P_AddThinker`/
 //! `P_RemoveThinker`/`P_RunThinkers` (the original's own thinker-list
 //! management) already live, since the enum + dispatch replace exactly
-//! that mechanism.
+//! that mechanism. `World` (see `world.rs`) joins it there too: both are
+//! new, invented infrastructure with no direct corpus counterpart, and
+//! `Thinker::tick` needs `World` to resolve any cross-reference field a
+//! real body touches (`function_body.rs`'s docs walk through why, via
+//! `T_FireFlicker`). `MobjInfo`/`State` (`Mobj`'s `info`/`state` fields)
+//! live in `info` -- `info.c` exists, so it's `Source` like `p_spec`/
+//! `p_mobj`/`p_tick`, not `HeaderOnly`. `ActionFn` (`State.action`, the
+//! Doom Action Pointer representation -- see `docs/03_TRANSPILER.md`)
+//! joins `MobjInfo`/`State` in `info` too, since it's only ever a field
+//! type there. `Player`/`PlayerSpriteState` (`player_t`/`pspdef_t`) are
+//! registered (`d_player`/`p_pspr`) even though neither is translated as a
+//! real struct yet -- referenced from `ActionFn`'s own variant the same
+//! way `MobjInfo`/`State` were from `Mobj` before *they* existed.
 //!
-//! A type not in this table at all (`MobjInfo`/`State` -- referenced by
-//! `Mobj`'s `info`/`state` fields but not yet translated as real structs,
-//! see `docs/03_TRANSPILER.md`) is simply not imported: a known,
-//! documented gap, not something this step guesses at.
+//! A type not in this table at all is simply not imported: a known,
+//! documented gap (see `docs/03_TRANSPILER.md`), not something this step
+//! guesses at.
 //!
 //! **Imports are computed by scanning already-rendered field-type
 //! strings**, not hand-written per struct: `render_imports_for` tokenizes
@@ -42,7 +53,14 @@ pub fn type_home_module(name: &str) -> Option<&'static str> {
             Some("r_defs")
         }
         "MapThing" => Some("doomdata"),
-        "Thinker" => Some("p_tick"),
+        "Thinker" | "World" => Some("p_tick"),
+        "MobjInfo" | "State" | "ActionFn" => Some("info"),
+        // Player/PlayerSpriteState (player_t/pspdef_t) aren't translated
+        // as real structs yet -- referenced here the same way MobjInfo/
+        // State were from Mobj before they existed, so ActionFn's own
+        // rendering doesn't have to wait for player_t's translation.
+        "Player" => Some("d_player"),
+        "PlayerSpriteState" => Some("p_pspr"),
         "FixedT" | "Handle" | "SectorId" | "SubsectorId" | "VertexId" | "SideId" | "LineId"
         | "PlayerId" | "Arena" => Some("runtime"),
         _ => None,
@@ -122,17 +140,28 @@ mod tests {
         assert_eq!(kind_of("p_spec"), ModuleKind::Source);
         assert_eq!(kind_of("p_mobj"), ModuleKind::Source);
         assert_eq!(kind_of("p_tick"), ModuleKind::Source);
+        assert_eq!(kind_of("info"), ModuleKind::Source);
         assert_eq!(kind_of("r_defs"), ModuleKind::HeaderOnly);
         assert_eq!(kind_of("doomdata"), ModuleKind::HeaderOnly);
     }
 
     #[test]
+    fn test_mobjinfo_and_state_live_in_info() {
+        assert_eq!(type_home_module("MobjInfo"), Some("info"));
+        assert_eq!(type_home_module("State"), Some("info"));
+    }
+
+    #[test]
     fn test_unknown_type_has_no_home_module() {
-        // MobjInfo/State: referenced by Mobj's fields, not yet translated
-        // as real structs -- a known gap, not guessed at.
-        assert_eq!(type_home_module("MobjInfo"), None);
-        assert_eq!(type_home_module("State"), None);
+        assert_eq!(type_home_module("SomeUntranslatedType"), None);
         assert_eq!(type_home_module("i32"), None);
+    }
+
+    #[test]
+    fn test_action_fn_and_player_types_registered() {
+        assert_eq!(type_home_module("ActionFn"), Some("info"));
+        assert_eq!(type_home_module("Player"), Some("d_player"));
+        assert_eq!(type_home_module("PlayerSpriteState"), Some("p_pspr"));
     }
 
     #[test]
@@ -146,6 +175,7 @@ mod tests {
         assert_eq!(
             rendered,
             "use crate::doomdata::{MapThing};\n\
+             use crate::info::{MobjInfo, State};\n\
              use crate::p_tick::{Thinker};\n\
              use crate::runtime::{FixedT, Handle, PlayerId, SubsectorId};"
         );
