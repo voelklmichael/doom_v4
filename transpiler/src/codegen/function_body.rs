@@ -204,6 +204,29 @@ struct FnBodyContext<'a> {
     /// idiom) and every isolated-fragment test below that doesn't
     /// exercise this shape.
     same_handle_write: Option<&'a str>,
+    /// The `target_tracer_key` (see its own doc comment) of whichever
+    /// `target`/`tracer`-typed value is currently mutably borrowed by the
+    /// enclosing write, if any -- the target/tracer-dereferencing mirror
+    /// of `same_handle_write`, needed for the same reason but against a
+    /// different base shape (`actor->target->field = ..`/a local alias's
+    /// own field, not a `P_SpawnMobj`-fresh local). `A_VileAttack`'s own
+    /// `actor->target->momz = 1000*FRACUNIT/actor->target->info->mass;`
+    /// writes one field of `actor->target` while its own RHS reads a
+    /// *different* field (`info`) of that exact same value -- without
+    /// this, the RHS read would take the general target/tracer chain-
+    /// through arm's own fresh `thinkers.get(..)` call, a real second
+    /// borrow of `thinkers` while the write's own `thinkers.get_mut(..)`
+    /// is still live (confirmed by compiling the naive version first, not
+    /// guessed at, the same way `same_handle_write` itself was). Keyed by
+    /// `target_tracer_key` rather than a plain identifier, since the
+    /// written-to base can be `actor->target` (a `Member`, not an
+    /// `Ident`) as well as a local alias (`A_VileAttack`'s own `fire`) --
+    /// and the two must be told apart: `fire->x = actor->target->x - ..`
+    /// writes through `fire` while reading a *different* value
+    /// (`actor->target`) in its own RHS, which must still take the
+    /// general fresh-lookup arm rather than wrongly resolving to `fire`'s
+    /// own bound `m`. `None` everywhere else.
+    same_target_write: Option<&'a str>,
     /// The identifier a self-removal statement (`is_self_removal_call`)
     /// renders through: `"arena"` for the original, still-most-common
     /// shape (self-removal alone, its own dedicated `arena: &mut
@@ -357,6 +380,28 @@ fn is_target_tracer_typed(
             aliases.get(name.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>")
         }
         _ => false,
+    }
+}
+
+/// A discriminator identifying *which* `is_target_tracer_typed` value `e`
+/// refers to -- `"target"`/`"tracer"` for the direct `self_param.field`
+/// shape, or the alias's own identifier name for a local alias
+/// (`A_VileAttack`'s own `fire`, `A_SkullAttack`'s own `dest`). Only
+/// meaningful once `is_target_tracer_typed(e, ..)` is already known
+/// `true` (not re-checked here) -- used purely to tell apart two
+/// *different* target/tracer-typed values within one statement (`fire`
+/// vs. `actor->target` both appearing in `A_VileAttack`'s own `fire->x =
+/// actor->target->x - ..`), which a plain boolean flag can't distinguish.
+/// Returns the field/identifier name borrowed straight out of the AST
+/// node, not a fresh `String` -- cheap, and exactly what `FnBodyContext::
+/// same_target_write`'s own `Option<&'a str>` needs to compare against.
+fn target_tracer_key<'e>(e: &'e Expr, self_param: &str) -> Option<&'e str> {
+    match e {
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == self_param) => {
+            Some(field.as_str())
+        }
+        Expr::Ident(name) => Some(name.as_str()),
+        _ => None,
     }
 }
 
@@ -553,6 +598,33 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].frontsector"), true))
+        }
+        // `actor->target->info` read inside the RHS of a write to a
+        // *different* field of that same `actor->target` (`A_VileAttack`'s
+        // own `actor->target->momz = 1000*FRACUNIT/actor->target->info->
+        // mass;`) -- the target/tracer mirror of `same_handle_write`'s own
+        // arm above, reusing the write's own already-bound `m` instead of
+        // a second, independent `thinkers.get(..)` call that would
+        // conflict with the write's own `thinkers.get_mut(..)` borrow for
+        // the whole block. Keyed by `target_tracer_key` (not a plain
+        // `Ident` match, unlike `same_handle_write`): the written-to base
+        // can itself be a `Member` (`actor->target`), not just a bare
+        // local, and a *different* target/tracer value appearing in the
+        // same RHS (`fire->x = actor->target->x - ..`, writing through the
+        // alias `fire` while reading `actor->target`) must still fall
+        // through to the general fresh-lookup arm just below rather than
+        // wrongly resolving to `fire`'s own bound `m`. Checked before that
+        // general arm for the same reason `same_handle_write`'s own arm
+        // precedes its sibling.
+        Expr::Member { base, field, .. }
+            if is_target_tracer_typed(
+                base,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+            ) && target_tracer_key(base, ctx.self_param) == ctx.same_target_write =>
+        {
+            Ok((format!("m.{}", rust_field_name(field)?), false))
         }
         // `actor->target->field` / `actor->tracer->field`, or the same
         // chain through a local alias (`dest->field` once `dest = actor->
@@ -2005,6 +2077,88 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 render_assign_op(*op)
             ));
         }
+        // `actor->target->field = expr;`, or the same chain through a
+        // local alias (`fire->x = ..;` once `fire = actor->tracer;`,
+        // `A_VileAttack`'s own idiom) -- the target/tracer-dereferencing
+        // write counterpart of the `Handle<Thinker>`-local arm just
+        // above, needing the identical fresh-`get_mut`-at-this-point
+        // treatment for the identical borrow-scoping reason, just through
+        // `is_target_tracer_typed`'s own `Option<Handle<Thinker>>`-typed
+        // base (so the handle itself needs its own `.unwrap()`, unlike
+        // that arm's already-bare `Handle<Thinker>` local). Scoped to a
+        // plain `=` only, and with no `is_option_handle_field`/`rhs_is_
+        // self` case (unlike the arm above) -- no real corpus example
+        // writing *through* a target/tracer chain needs either yet.
+        if *op == AssignOp::Assign
+            && let Expr::Member {
+                base,
+                field: lhs_field,
+                ..
+            } = lhs.as_ref()
+            && is_target_tracer_typed(
+                base,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+            )
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            // Same `FixedT`-field-wrap reasoning as the `Handle<Thinker>`-
+            // local write arm above (`A_BrainExplode`'s own idiom, just
+            // reached through a target/tracer chain instead: no real
+            // corpus example yet, but the same class of raw-`int`-into-
+            // `FixedT` field write could occur here too).
+            let is_fixed_t_field = ctx
+                .self_field_types
+                .get(lhs_field.as_str())
+                .map(String::as_str)
+                == Some("FixedT");
+            // `actor->target->info->mass` read inside this same RHS
+            // (`A_VileAttack`) must resolve through the write's own bound
+            // `m`, not a second `thinkers.get(..)` call -- see
+            // `FnBodyContext::same_target_write`'s own doc comment.
+            let rhs_ctx = FnBodyContext {
+                same_target_write: target_tracer_key(base, ctx.self_param),
+                ..*ctx
+            };
+            let rhs_text = if is_fixed_t_field && !expr_is_fixed_t_valued(rhs, &rhs_ctx) {
+                format!("FixedT({})", render_expr(rhs, &rhs_ctx)?.0)
+            } else {
+                render_expr(rhs, &rhs_ctx)?.0
+            };
+            // `fire->x = actor->target->x - FixedMul(..);` (`A_VileAttack`)
+            // -- the RHS reads a target/tracer value *other* than the one
+            // being written (`actor->target`, not `fire`), which can't
+            // reuse the write's own bound `m` and needs its own real
+            // `thinkers.get(..)` call. Rendering that call *inside* the
+            // `if let .. = thinkers.get_mut(..) { .. }` block below would
+            // be a genuine second, conflicting borrow of `thinkers` --
+            // confirmed a real `rustc` E0502 by compiling the naive
+            // single-statement version first, not guessed at -- so the
+            // RHS is precomputed into its own `let` *before* the mutable
+            // borrow starts instead, the same fix `rustc`'s own E0502
+            // diagnostic suggests. `expr_has_other_target_deref` is
+            // checked against the *original* `rhs` (not `rhs_text`'s
+            // already-rendered output): it needs the real `Expr` tree to
+            // tell a same-key resolution (already `m.field`, safe inline)
+            // apart from a different-key one (still `thinkers.get(..)`,
+            // unsafe inline).
+            if expr_has_other_target_deref(
+                rhs,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+                target_tracer_key(base, ctx.self_param),
+            ) {
+                return Ok(format!(
+                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} = __rhs; }}"
+                ));
+            }
+            return Ok(format!(
+                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} = {rhs_text}; }}"
+            ));
+        }
         let (lhs_text, _) = render_expr(lhs, ctx)?;
         let (rhs_text, _) = render_expr(rhs, ctx)?;
         // `sector_t.specialdata`/`line_t.specialdata` map to
@@ -2350,6 +2504,18 @@ fn render_fn_impl(
         self_field_types,
         &target_tracer_aliases,
     );
+    // `actor->target->momz = ..;`/`fire->x = ..;` (`A_VileAttack`) --
+    // writing *through* a target/tracer chain, not just reading through
+    // one, needs a real *mutable* `Arena` lookup at the point of use
+    // (`render_expr_stmt`'s own target/tracer write arm), the same
+    // "measure, don't add speculatively" discipline as every other flag
+    // here.
+    let needs_target_write = body_has_target_write(
+        &f.body.items,
+        &param_name,
+        self_field_types,
+        &target_tracer_aliases,
+    );
     // A body that assigns a local from `P_SpawnMobj(...)` and then
     // writes one of its fields (`A_Tracer`'s own `th->momz = ...;`)
     // needs real *mutable* `Arena` access -- unlike `needs_target_deref`
@@ -2406,6 +2572,7 @@ fn render_fn_impl(
         embedded_ctor: None,
         mutating_handle: None,
         same_handle_write: None,
+        same_target_write: None,
         plain_int_locals: &plain_int_locals,
         angle_t_locals: &angle_t_locals,
         self_removal_ident,
@@ -2420,7 +2587,7 @@ fn render_fn_impl(
     };
     let thinkers_part = if needs_self_removal && !composed_self_removal {
         ""
-    } else if needs_spawn_mut || composed_self_removal {
+    } else if needs_spawn_mut || composed_self_removal || needs_target_write {
         ", thinkers: &mut Arena<Thinker>"
     } else if needs_target_deref {
         ", thinkers: &Arena<Thinker>"
@@ -2488,6 +2655,7 @@ pub fn render_weapon_fn(
         embedded_ctor: None,
         mutating_handle: None,
         same_handle_write: None,
+        same_target_write: None,
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &angle_t_locals,
@@ -2535,6 +2703,72 @@ fn stmt_has_self_removal(s: &Stmt, self_param: &str) -> bool {
         Stmt::Case { stmt, .. } => stmt_has_self_removal(stmt, self_param),
         Stmt::Default(stmt) => stmt_has_self_removal(stmt, self_param),
         Stmt::While { body, .. } => stmt_has_self_removal(body, self_param),
+        _ => false,
+    }
+}
+
+/// Whether `s` (anywhere in its subtree) writes a field *through* a
+/// `target`/`tracer` chain -- `actor->target->momz = ..`, or the same
+/// through a local alias's own field (`fire->x = ..`), `render_expr_
+/// stmt`'s own new target/tracer write arm's shape (`A_VileAttack`'s own
+/// idiom). Unlike `expr_has_target_deref`'s full expression-tree walk,
+/// this only needs to look at a statement's own top-level `Expr::Assign`
+/// -- this module's own `render_expr_stmt` doc comment already notes
+/// Doom's tick functions never nest an assignment inside a larger
+/// expression -- so it walks statements the same shape as `body_has_
+/// self_removal` rather than `expr_has_target_deref`'s deeper one. Drives
+/// `render_fn_impl`'s own signature extension: a function that writes
+/// through a target/tracer chain needs a real *mutable* `Arena` lookup
+/// (`&mut Arena<Thinker>`), not just `needs_target_deref`'s read-only one
+/// (which alone would still be `true` here too, since that check's own
+/// expression walk doesn't distinguish a read from an assignment's LHS --
+/// this is the finer-grained mutability check layered on top).
+fn body_has_target_write(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_target_write(s, self_param, self_field_types, aliases),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn stmt_has_target_write(
+    s: &Stmt,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    if let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s
+        && let Expr::Member { base, .. } = lhs.as_ref()
+        && is_target_tracer_typed(base, self_param, self_field_types, aliases)
+    {
+        return true;
+    }
+    match s {
+        Stmt::Compound(c) => body_has_target_write(&c.items, self_param, self_field_types, aliases),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_has_target_write(then_branch, self_param, self_field_types, aliases)
+                || else_branch.as_ref().is_some_and(|eb| {
+                    stmt_has_target_write(eb, self_param, self_field_types, aliases)
+                })
+        }
+        Stmt::Switch { body, .. } => {
+            stmt_has_target_write(body, self_param, self_field_types, aliases)
+        }
+        Stmt::Case { stmt, .. } => {
+            stmt_has_target_write(stmt, self_param, self_field_types, aliases)
+        }
+        Stmt::Default(stmt) => stmt_has_target_write(stmt, self_param, self_field_types, aliases),
+        Stmt::While { body, .. } => {
+            stmt_has_target_write(body, self_param, self_field_types, aliases)
+        }
         _ => false,
     }
 }
@@ -2598,6 +2832,100 @@ fn expr_has_target_deref(
         }
         Expr::Member { base, .. } => {
             expr_has_target_deref(base, self_param, self_field_types, aliases)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` dereferences *through* a target/tracer-typed value whose
+/// own `target_tracer_key` is different from `own_key` -- the mirror
+/// image of `same_target_write`'s own "same handle" resolution
+/// (`render_expr`'s `same_target_write` read arm) for the *other* case:
+/// `A_VileAttack`'s own `fire->x = actor->target->x - ..;` writes
+/// through `fire` (`own_key = "fire"`) while its RHS reads `actor->
+/// target` (key `"target"`) -- a genuinely *different* value, so that
+/// read can't reuse the write's own bound `m` and instead needs its own
+/// `thinkers.get(..)` call. That's a real second borrow of `thinkers`
+/// while the write's own `thinkers.get_mut(..)` is still live (confirmed
+/// a real `rustc` E0502 by compiling the naive single-statement version
+/// first, not guessed at) -- so the write arm in `render_expr_stmt`
+/// checks this predicate to decide whether the RHS needs precomputing
+/// into its own `let` *before* the mutable borrow starts, rather than
+/// inline inside the `if let ... get_mut(..) { .. }` block. Deliberately
+/// a separate walk from `expr_has_target_deref` (not that one plus a
+/// post-hoc key filter): the two serve different callers at different
+/// points (this one only ever runs on an already-identified write's own
+/// RHS, with `own_key` always `Some`, so there was no benefit to
+/// threading an `Option` filter through the more general, more widely-
+/// used function instead).
+fn expr_has_other_target_deref(
+    e: &Expr,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+    own_key: Option<&str>,
+) -> bool {
+    if let Expr::Member { base, .. } = e
+        && is_target_tracer_typed(base, self_param, self_field_types, aliases)
+        && target_tracer_key(base, self_param) != own_key
+    {
+        return true;
+    }
+    match e {
+        Expr::Unary { expr, .. }
+        | Expr::PreIncDec { expr, .. }
+        | Expr::PostIncDec { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Sizeof(SizeofArg::Expr(expr)) => {
+            expr_has_other_target_deref(expr, self_param, self_field_types, aliases, own_key)
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
+            expr_has_other_target_deref(lhs, self_param, self_field_types, aliases, own_key)
+                || expr_has_other_target_deref(rhs, self_param, self_field_types, aliases, own_key)
+        }
+        Expr::Assign { lhs, rhs, .. } => {
+            expr_has_other_target_deref(lhs, self_param, self_field_types, aliases, own_key)
+                || expr_has_other_target_deref(rhs, self_param, self_field_types, aliases, own_key)
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_other_target_deref(cond, self_param, self_field_types, aliases, own_key)
+                || expr_has_other_target_deref(
+                    then_expr,
+                    self_param,
+                    self_field_types,
+                    aliases,
+                    own_key,
+                )
+                || expr_has_other_target_deref(
+                    else_expr,
+                    self_param,
+                    self_field_types,
+                    aliases,
+                    own_key,
+                )
+        }
+        Expr::Call { callee, args } => {
+            expr_has_other_target_deref(callee, self_param, self_field_types, aliases, own_key)
+                || args.iter().any(|a| {
+                    expr_has_other_target_deref(a, self_param, self_field_types, aliases, own_key)
+                })
+        }
+        Expr::Index { base, index } => {
+            expr_has_other_target_deref(base, self_param, self_field_types, aliases, own_key)
+                || expr_has_other_target_deref(
+                    index,
+                    self_param,
+                    self_field_types,
+                    aliases,
+                    own_key,
+                )
+        }
+        Expr::Member { base, .. } => {
+            expr_has_other_target_deref(base, self_param, self_field_types, aliases, own_key)
         }
         _ => false,
     }
@@ -3485,6 +3813,7 @@ pub fn render_spawn_fn(
         embedded_ctor: None,
         mutating_handle: None,
         same_handle_write: None,
+        same_target_write: None,
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
@@ -3840,6 +4169,7 @@ pub fn render_trigger_fn(
         embedded_ctor,
         mutating_handle: None,
         same_handle_write: None,
+        same_target_write: None,
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
@@ -4556,6 +4886,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -4644,6 +4975,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -4692,6 +5024,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -4761,6 +5094,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -4917,6 +5251,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -6068,6 +6403,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -6132,6 +6468,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -6222,6 +6559,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -6292,6 +6630,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -6363,6 +6702,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -6439,6 +6779,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -7890,6 +8231,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            same_target_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
@@ -8372,6 +8714,89 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }\n    \
              P_TeleportMove(newmobj, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
              thinkers.remove(handle);\n\
+             }"
+        );
+    }
+
+    /// `A_VileAttack` -- the function motivating write access *through* a
+    /// `target`/`tracer` chain (`actor->target->momz = ..`, `fire->x =
+    /// ..` once `fire = actor->tracer;`), the write-side mirror of the
+    /// already-shipped `target`/`tracer` *read* access. Three new pieces:
+    /// the `render_expr_stmt` write arm keyed off `is_target_tracer_
+    /// typed`'s own `Option<Handle<Thinker>>`-typed base (needing its own
+    /// `.unwrap()`, unlike the `Handle<Thinker>`-local write arm it sits
+    /// beside); `FnBodyContext::same_target_write`/`target_tracer_key` so
+    /// `actor->target->info->mass`, read inside the RHS of the write to
+    /// `actor->target->momz`, resolves through that write's own already-
+    /// bound `m` instead of a second, conflicting `thinkers.get(..)` call
+    /// (confirmed a real second-borrow rejection by compiling the naive
+    /// version first); and `expr_has_other_target_deref`, needed once
+    /// `fire->x = actor->target->x - FixedMul(..);` surfaced a *second*,
+    /// genuinely different borrow conflict from the first: the write here
+    /// is through `fire` while the RHS reads `actor->target` -- a
+    /// *different* target/tracer value, so `same_target_write`'s own
+    /// keying-by-discriminator correctly does *not* resolve it to `fire`'s
+    /// bound `m`, but rendering the read's own `thinkers.get(..)` call
+    /// *inside* the write's `if let .. = thinkers.get_mut(..) { .. }`
+    /// block is still a real second borrow of `thinkers` -- an `E0502`
+    /// `rustc` actually raised against the first draft's naive inline
+    /// rendering, not a hypothetical. The fix: the RHS is precomputed
+    /// into its own `let __rhs = ..;` *before* the mutable borrow starts
+    /// whenever `expr_has_other_target_deref` finds such a differently-
+    /// keyed read, the same fix `rustc`'s own E0502 diagnostic suggests.
+    /// `1000*FRACUNIT/actor->target->info->mass` needed no `FixedT(..)`
+    /// wrap: `expr_is_fixed_t_valued` already recognizes `FRACUNIT` as
+    /// `FixedT`-valued, and `Div<i32> for FixedT` already renders the
+    /// whole division as a `FixedT` result via ordinary operator
+    /// overloading. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against real `Arena`/`Handle`/`FixedT` plus
+    /// hand-written `Mobj`/`MobjInfo`/`World` stand-ins and stub
+    /// `A_FaceTarget`/`P_CheckSight`/`S_StartSound`/`P_DamageMobj`/
+    /// `FixedMul`/`P_RadiusAttack` functions -- zero errors (the borrow-
+    /// conflict fix above was found and fixed via this exact real-`rustc`
+    /// pass, not before it).
+    #[test]
+    fn test_a_vile_attack_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("tracer", "Option<Handle<Thinker>>"),
+            ("momz", "FixedT"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("angle", "u32"),
+            ("info", "&'static MobjInfo"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_VileAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_VileAttack(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut fire;\n    \
+             let mut an;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if !P_CheckSight(actor, actor.target) {\n        \
+             return;\n    \
+             }\n    \
+             S_StartSound(actor, sfx_barexp);\n    \
+             P_DamageMobj(actor.target, actor, actor, 20);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(actor.target.unwrap()) { m.momz = 1000 * FRACUNIT / m.info.mass; };\n    \
+             an = actor.angle >> ANGLETOFINESHIFT;\n    \
+             fire = actor.tracer;\n    \
+             if fire.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             let __rhs = match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - FixedMul(24 * FRACUNIT, finecosine[an as usize]); if let Some(Thinker::Mobj(m)) = thinkers.get_mut(fire.unwrap()) { m.x = __rhs; };\n    \
+             let __rhs = match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - FixedMul(24 * FRACUNIT, finesine[an as usize]); if let Some(Thinker::Mobj(m)) = thinkers.get_mut(fire.unwrap()) { m.y = __rhs; };\n    \
+             P_RadiusAttack(fire, actor, 70);\n\
              }"
         );
     }
