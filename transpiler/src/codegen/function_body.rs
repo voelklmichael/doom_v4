@@ -409,10 +409,8 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
-            let (lhs_text, _) = render_expr(lhs, ctx)?;
-            let lhs_text = parenthesize_if_needed(lhs, &lhs_text, prec, false);
-            let (rhs_text, _) = render_expr(rhs, ctx)?;
-            let rhs_text = parenthesize_if_needed(rhs, &rhs_text, prec, true);
+            let lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
+            let rhs_text = render_binary_operand(rhs, *op, prec, true, ctx)?;
             Ok((
                 format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
                 false,
@@ -547,6 +545,41 @@ fn parenthesize_if_needed(
     } else {
         child_text.to_string()
     }
+}
+
+/// Renders one operand of a `Expr::Binary { op: parent_op, .. }`,
+/// applying `parenthesize_if_needed`'s ordinary precedence rule -- except
+/// when `parent_op` is arithmetic (not itself a comparison/logical op)
+/// and the operand is *itself* a comparison/logical expression
+/// (`EV_DoFloor`'s own `(8*FRACUNIT)*(floortype == raiseFloorCrush)`,
+/// C's bool-as-0-or-1 arithmetic idiom): a comparison already renders as
+/// a real Rust `bool`, which -- unlike C's `int` -- can't be multiplied/
+/// added/etc. directly, so it needs an explicit `as i32` cast. The
+/// comparison itself still needs its own parens *before* that cast
+/// (`as` binds tighter than every binary operator this renderer handles,
+/// so `x == y as i32` would parse as `x == (y as i32)`, not what's
+/// wanted here) -- hard-coded rather than derived from
+/// `parenthesize_if_needed`'s precedence table, since a cast isn't a
+/// binary operator with a precedence level of its own.
+fn render_binary_operand(
+    operand: &Expr,
+    parent_op: BinaryOp,
+    parent_prec: u8,
+    is_right: bool,
+    ctx: &FnBodyContext,
+) -> Result<String, String> {
+    let (text, _) = render_expr(operand, ctx)?;
+    if !is_comparison_or_logical(parent_op)
+        && matches!(operand, Expr::Binary { op, .. } if is_comparison_or_logical(*op))
+    {
+        return Ok(format!("({text}) as i32"));
+    }
+    Ok(parenthesize_if_needed(
+        operand,
+        &text,
+        parent_prec,
+        is_right,
+    ))
 }
 
 /// Whether `expr` renders to an `Option<_>`-typed Rust value -- a bare
@@ -3976,5 +4009,60 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     world[sec].specialdata = Some(handle);
 }";
         assert_eq!(rendered, expected);
+    }
+
+    /// `EV_DoFloor`'s own `floor->floordestheight -= (8*FRACUNIT)*
+    /// (floortype == raiseFloorCrush);` -- C's bool-as-0-or-1 arithmetic
+    /// idiom (`raiseFloorCrush`'s own extra 8-unit lowering, applied only
+    /// when `floortype` really is `raiseFloorCrush`, folded into one
+    /// expression rather than an `if`). A comparison already renders as a
+    /// real Rust `bool`, which can't multiply/add/etc. directly the way
+    /// C's `int`-valued comparisons can -- confirmed as a real, distinct
+    /// gap (not yet exercised by any prior function) directly against
+    /// this real parsed statement before designing `render_binary_
+    /// operand`'s fix, the same real-AST-extraction approach as the
+    /// negated-`--x`/`NULL`-to-`None` tests above: pulls just this one
+    /// statement out of the real `EV_DoFloor` AST without attempting the
+    /// rest of that much harder function (deliberately deferred -- see
+    /// docs/03_TRANSPILER.md).
+    #[test]
+    fn test_bool_as_arithmetic_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_floordestheight_sub_assign = |s: &Stmt| {
+            matches!(s, Stmt::Expr(Some(Expr::Assign { op: AssignOp::SubAssign, lhs, .. }))
+                if matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "floordestheight"))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_floordestheight_sub_assign),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `floordestheight -= ...;` statement somewhere in EV_DoFloor");
+        let Stmt::Expr(Some(e)) = stmt else {
+            unreachable!("guarded by is_floordestheight_sub_assign")
+        };
+
+        let self_field_types = field_types(&[("floordestheight", "FixedT")]);
+        let no_extra_cross_refs = HashMap::new();
+        let ctx = FnBodyContext {
+            self_param: "floor",
+            self_field_types: &self_field_types,
+            extra_cross_ref_idents: &no_extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "floor.floordestheight -= 8 * FRACUNIT * (floortype == raiseFloorCrush) as i32"
+        );
     }
 }
