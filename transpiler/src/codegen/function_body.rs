@@ -363,6 +363,24 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `line->frontsector` -- unlike a self-struct field
+        // (`self_field_types`) or a constructor-in-progress field
+        // (`ctor_field_types`), a trigger function's own parameter (`line:
+        // LineId`, tracked only in `extra_cross_ref_idents`) has no
+        // generic field-type registry to say one of *its* fields is
+        // itself cross-reference-typed -- hand-matched narrowly by name,
+        // the same "no general struct-field-type registry yet" reasoning
+        // as `sides[i].sector` above, so a further chain (`line->
+        // frontsector->floorpic`, `EV_DoFloor`'s own
+        // `raiseFloor24AndChange` case) resolves through `world[...]`
+        // correctly instead of stopping one level short.
+        Expr::Member { base, field, .. }
+            if field == "frontsector"
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("LineId")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].frontsector"), true))
+        }
         Expr::Member { base, field, .. } => {
             if !ctx.ctor_var.is_empty()
                 && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
@@ -4414,6 +4432,71 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
                 "        minsize = textureheight[world[side].bottomtexture as usize];".to_string(),
                 "    }".to_string(),
                 "}".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s fifth piece: `raiseFloor24AndChange`'s own
+    /// `sec->floorpic = line->frontsector->floorpic; sec->special =
+    /// line->frontsector->special;` -- crossref chained through crossref
+    /// via a *different* base shape than the already-built `sides[i].
+    /// sector`: `line`'s own field `frontsector` (`LineId` -> `SectorId`)
+    /// is a trigger function's own *parameter*, tracked only in
+    /// `extra_cross_ref_idents` (no generic field-type registry exists
+    /// for a parameter's own fields the way `self_field_types`/
+    /// `ctor_field_types` cover `self`/a constructor-in-progress), so
+    /// `line->frontsector` needed its own narrow by-name special case to
+    /// let the *further* `.floorpic`/`.special` chain resolve through
+    /// `world[...]` correctly. Clones both real assignment statements
+    /// straight out of `EV_DoFloor`'s own parsed AST.
+    #[test]
+    fn test_frontsector_crossref_chain_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_frontsector_field_assign = |field_name: &'static str| {
+            move |s: &Stmt| {
+                matches!(s, Stmt::Expr(Some(Expr::Assign { lhs, rhs, .. }))
+                    if matches!(lhs.as_ref(), Expr::Member { field, .. } if field == field_name)
+                    && matches!(rhs.as_ref(), Expr::Member { base, field, .. }
+                        if field == field_name
+                        && matches!(base.as_ref(), Expr::Member { field, .. } if field == "frontsector")))
+            }
+        };
+        let find_one = |field_name: &'static str| -> &Stmt {
+            let pred = is_frontsector_field_assign(field_name);
+            f.body
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    BlockItem::Stmt(s) => find_stmt(s, &pred),
+                    BlockItem::Decl(_) => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("expected a `{field_name} = line->frontsector->{field_name};` statement somewhere in EV_DoFloor")
+                })
+        };
+        let floorpic_stmt = find_one("floorpic").clone();
+        let special_stmt = find_one("special").clone();
+
+        let extra_cross_refs = field_types(&[("sec", "SectorId"), ("line", "LineId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
+        rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
+        assert_eq!(
+            rendered,
+            vec![
+                "world[sec].floorpic = world[world[line].frontsector].floorpic;".to_string(),
+                "world[sec].special = world[world[line].frontsector].special;".to_string(),
             ]
         );
     }
