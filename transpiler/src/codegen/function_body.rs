@@ -485,6 +485,20 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "NULL" {
                 return Ok(("None".to_string(), false));
             }
+            // `linetarget` (`p_local.h`'s own `extern mobj_t*
+            // linetarget;`, `A_Punch`/`A_Saw`'s idiom) -- a genuine
+            // file-scope global, not a real Rust local, so a bare
+            // reference to it needs its own `World::linetarget` field
+            // access rather than the plain identifier text every other
+            // local/parameter gets. Checked by name, not through
+            // `extra_cross_ref_idents`' generic lookup (unlike
+            // `is_target_tracer_typed`'s own alias check just below,
+            // which *does* rely on it once this name is registered
+            // there) -- this arm only decides how the identifier's own
+            // *text* renders, not whether it's cross-reference-typed.
+            if name == "linetarget" {
+                return Ok(("world.linetarget".to_string(), false));
+            }
             let is_crossref = ctx
                 .extra_cross_ref_idents
                 .get(name.as_str())
@@ -692,6 +706,28 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `player->mo->x` read inside the RHS of a write to a *different*
+        // field of that same `player->mo` (`A_Punch`'s own `player->mo->
+        // angle = R_PointToAngle2(player->mo->x, player->mo->y, ..);`) --
+        // the bare-self-handle-field mirror of `same_handle_write`'s own
+        // arm above (`mo->info` inside a spawned-mobj write): reuses the
+        // write's own already-bound `m` instead of a second, independent
+        // `thinkers.get(player.mo)` call, which would be a genuine second
+        // borrow of `thinkers` while the write's own `thinkers.
+        // get_mut(player.mo)` is still live for the whole block. Keyed
+        // the same way (`ctx.same_handle_write`), just holding the self-
+        // field's own name (`"mo"`) instead of a bare local's identifier,
+        // since the base here is `player->mo` (a `Member`), not a bare
+        // local variable the way `A_FatAttack1`'s own `mo` is. Checked
+        // before the general arm just below for the same reason
+        // `same_handle_write`'s own arm precedes its sibling.
+        Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Member { field: bf, base: bb, .. }
+                if matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    && Some(bf.as_str()) == ctx.same_handle_write) =>
+        {
+            Ok((format!("m.{}", rust_field_name(field)?), false))
+        }
         // `player->mo->field` -- dereferencing *through* `player`'s own
         // `mo` field (`is_self_bare_handle_field`, its own doc comment
         // explains the bare-vs-`Option` distinction from the arm just
@@ -831,8 +867,16 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // infer it as `usize` here -- narrowly by-name, matching this
             // module's usual "hand-match the one real array identifier"
             // style (`sides`/`sectors`/`textureheight` above).
+            // `player->powers[pw_strength]` (`A_Punch`) is the same shape
+            // once more: `pw_strength` is a bare enum-constant identifier
+            // (`enum_values.rs`'s own `pub const pw_strength: i32 = ..;`,
+            // fixed `i32` elsewhere in the generated crate, not a fresh
+            // local Rust can retroactively infer as `usize` here either)
+            // -- scoped to `player->powers[..]` by the base field's own
+            // name, the same "hand-match the one real array" style.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
                 || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")
             {
                 format!("{index_text} as usize")
             } else {
@@ -1168,6 +1212,25 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Member { field, .. } if field == "specialdata" => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
+        // `if (linetarget)` (`A_Punch`) -- a bare, non-negated `Option`-
+        // valued identifier used for truthiness, the mirror of the
+        // negated `!p`/`!thing->player` arm above but for the un-negated
+        // case, never needed until this first real corpus example (every
+        // earlier `Option`-typed truthiness check in this codebase's own
+        // corpus so far only ever appeared negated, e.g. `EV_DoLockedDoor`'s
+        // `!p`). `is_option_valued`'s own `Expr::Ident` arm already covers
+        // `linetarget` once `render_weapon_fn`/`render_fn_impl` register it
+        // in `extra_cross_ref_idents` (see `body_has_linetarget_ref`), so
+        // no new type-tracking is needed here, just the missing arm.
+        Expr::Ident(_) if is_option_valued(cond, ctx) => {
+            Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
+        }
+        // `if (player->powers[pw_strength])` (`A_Punch`) -- a bare array-
+        // element read used for truthiness, the `Expr::Index` sibling of
+        // the plain-`Member`-field arm just below: `powers` is a plain
+        // `int` array (a tic-count flag, not `Option`-valued), so this is
+        // ordinary C truthiness, `!= 0`.
+        Expr::Index { .. } => Ok(format!("{} != 0", render_expr(cond, ctx)?.0)),
         // `if (actor->info->painsound)` (`A_Pain`) -- a bare struct-field
         // reference used for truthiness, same as `specialdata` above, but
         // this one is a genuinely plain `int` field (`mobjinfo_t.
@@ -2324,6 +2387,81 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 render_assign_op(*op)
             ));
         }
+        // `player->mo->angle = R_PointToAngle2(..);` / `player->mo->flags
+        // |= MF_JUSTATTACKED;` (`A_Punch`/`A_Saw`) -- writing *through*
+        // `player`'s own bare `Handle<Thinker>` field (`is_self_bare_
+        // handle_field`, the write counterpart of that same read-side
+        // special case, `A_FireShotgun2`'s own `player->mo->angle` read)
+        // -- the same fresh-`get_mut`-at-this-point treatment as every
+        // other write-through-a-handle arm in this function, for the
+        // identical borrow-scoping reason. `player->mo->x`/`.y` read
+        // inside this same RHS (`A_Punch`'s own idiom) resolve through
+        // the write's own bound `m` (`same_handle_write`, keyed by the
+        // field's own name, `"mo"`, since the base here is a `Member`,
+        // not a bare local -- see the matching read arm's own doc
+        // comment); a *different* `Arena` read elsewhere in the RHS
+        // (`linetarget->x`/`.y`) still needs its own real `thinkers.
+        // get(..)` call, a second, conflicting borrow of `thinkers` while
+        // this write's own `thinkers.get_mut(..)` is still live --
+        // `expr_has_other_target_deref` already detects exactly this
+        // (`linetarget` is itself registered as an `Option<Handle<
+        // Thinker>>` alias by `render_weapon_fn`, so it already counts as
+        // an "other" target/tracer-shaped deref to that same predicate).
+        // Unlike `A_VileAttack`'s own target/tracer write arm (never
+        // mixing a same-key and an other-key read in one real RHS),
+        // `A_Punch`'s own RHS genuinely mixes both (`player->mo->x`/`.y`,
+        // same key, *and* `linetarget->x`/`.y`, a different one) -- once
+        // hoisted into `let __rhs = ..;` *before* the mutable borrow
+        // starts, a bare `m.field` shortcut for the same-key reads would
+        // reference an `m` that doesn't exist yet at that point (a real
+        // bug caught by tracing this composition through before shipping,
+        // not by inspection alone -- verified by actually compiling the
+        // fix below). So the hoisted path renders the RHS through the
+        // plain `ctx` (no `same_handle_write`), giving every read -- same-
+        // key included -- its own ordinary fresh `thinkers.get(..)` call,
+        // which is sound there since nothing is mutably borrowed yet;
+        // only the non-hoisted path (no "other" read at all) uses
+        // `rhs_ctx`'s `m.field` shortcut, where it's both safe and
+        // necessary (a fresh `thinkers.get(player.mo)` there *would*
+        // conflict with the write's own live `get_mut`).
+        if let Expr::Member {
+            base,
+            field: lhs_field,
+            ..
+        } = lhs.as_ref()
+            && is_self_bare_handle_field(base, ctx.self_param, ctx.self_field_types)
+        {
+            let Expr::Member {
+                field: base_field, ..
+            } = base.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let (base_text, _) = render_expr(base, ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            if expr_has_other_target_deref(
+                rhs,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+                None,
+            ) {
+                let rhs_text = render_expr(rhs, ctx)?.0;
+                return Ok(format!(
+                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} __rhs; }}",
+                    render_assign_op(*op)
+                ));
+            }
+            let rhs_ctx = FnBodyContext {
+                same_handle_write: Some(base_field.as_str()),
+                ..*ctx
+            };
+            let rhs_text = render_expr(rhs, &rhs_ctx)?.0;
+            return Ok(format!(
+                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} {rhs_text}; }}",
+                render_assign_op(*op)
+            ));
+        }
         // `actor->target->field = expr;`, or the same chain through a
         // local alias (`fire->x = ..;` once `fire = actor->tracer;`,
         // `A_VileAttack`'s own idiom) -- the target/tracer-dereferencing
@@ -2883,16 +3021,20 @@ fn nth_param_name(f: &FunctionDef, n: usize) -> Option<String> {
 /// parameters, neither a `Thinker`; only `player`'s fields are resolved
 /// (`player_t` isn't struct-mapped in `struct_fields.rs` -- see module
 /// docs -- so `player_field_types` is supplied directly by the caller,
-/// the same as every other function-body test). No `world: &mut World`
-/// parameter yet: none of the three real functions this was built against
-/// touch a cross-reference field, so one isn't threaded through
-/// speculatively -- add it if a future weapon action function needs one,
-/// the same "measure, don't guess" reasoning `render_fn`'s own
-/// self-removal parameters already follow. `thinkers: &Arena<Thinker>` is
-/// threaded through conditionally (`body_has_self_handle_field_deref`),
+/// the same as every other function-body test). `world: &mut World`/
+/// `thinkers: &Arena<Thinker>` are both threaded through conditionally,
 /// the same "only when a real body needs it" discipline `render_fn_impl`'s
-/// own `needs_target_deref` already established -- `A_FireShotgun2`'s own
-/// `player->mo->angle` is the first real corpus example needing it.
+/// own `needs_target_deref` already established: `thinkers` alone once a
+/// real body dereferences through `player`'s own bare `mo` field
+/// (`body_has_self_handle_field_deref`, `A_FireShotgun2`'s own `player->
+/// mo->angle`), or both together once a body references the global
+/// `linetarget` (`body_has_linetarget_ref`, `A_Punch`/`A_Saw`'s own
+/// idiom -- `linetarget` lives in `World`, and dereferencing through it
+/// needs a real `Arena` lookup the same way `target`/`tracer` do). No
+/// real corpus example needs `world` without `thinkers` (or vice versa)
+/// through `linetarget` specifically, so the two travel together for now
+/// rather than being split into finer-grained flags ahead of a caller
+/// that actually needs just one.
 pub fn render_weapon_fn(
     corpus_dir: &Path,
     file: &str,
@@ -2906,12 +3048,19 @@ pub fn render_weapon_fn(
         .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
     let psp_param = nth_param_name(f, 1)
         .ok_or_else(|| format!("{fn_name}: second parameter has no plain name"))?;
-    let no_extra_cross_refs = HashMap::new();
+    let needs_linetarget = body_has_linetarget_ref(&f.body.items);
+    let mut extra_cross_refs = HashMap::new();
+    if needs_linetarget {
+        extra_cross_refs.insert(
+            "linetarget".to_string(),
+            "Option<Handle<Thinker>>".to_string(),
+        );
+    }
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &player_param,
         self_field_types: player_field_types,
-        extra_cross_ref_idents: &no_extra_cross_refs,
+        extra_cross_ref_idents: &extra_cross_refs,
         ctor_var: "",
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
@@ -2927,13 +3076,27 @@ pub fn render_weapon_fn(
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let needs_self_handle_deref =
         body_has_self_handle_field_deref(&f.body.items, &player_param, player_field_types);
-    let thinkers_part = if needs_self_handle_deref {
+    // `player->mo->angle = ..;`/`player->mo->flags |= ..;` (`A_Punch`/
+    // `A_Saw`) needs a real *mutable* `Arena` lookup, not just `needs_
+    // self_handle_deref`'s read-only one, the same "measure, don't add
+    // speculatively" upgrade `render_fn_impl`'s own `needs_target_write`
+    // already makes for the self-struct-tick shape.
+    let needs_self_handle_write =
+        body_has_self_handle_write(&f.body.items, &player_param, player_field_types);
+    let world_part = if needs_linetarget {
+        ", world: &mut World"
+    } else {
+        ""
+    };
+    let thinkers_part = if needs_self_handle_write {
+        ", thinkers: &mut Arena<Thinker>"
+    } else if needs_self_handle_deref || needs_linetarget {
         ", thinkers: &Arena<Thinker>"
     } else {
         ""
     };
     Ok(format!(
-        "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState{thinkers_part}) {{\n{}\n}}",
+        "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState{world_part}{thinkers_part}) {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -3033,6 +3196,57 @@ fn stmt_has_target_write(
         Stmt::While { body, .. } => {
             stmt_has_target_write(body, self_param, self_field_types, aliases)
         }
+        _ => false,
+    }
+}
+
+/// Whether `s` (anywhere in its subtree) writes a field *through*
+/// `player`'s own bare `Handle<Thinker>` field (`player->mo->angle =
+/// ..;`/`player->mo->flags |= ..;`, `A_Punch`/`A_Saw`'s own idiom) --
+/// the bare-self-handle-field mirror of `stmt_has_target_write` just
+/// above, same shallow statement-level shape (no nested-assignment
+/// corpus example exists for this either). Drives `render_weapon_fn`'s
+/// own signature extension: a function that writes through `player->mo`
+/// needs a real *mutable* `Arena` lookup (`&mut Arena<Thinker>`), not
+/// just a read-only one.
+fn body_has_self_handle_write(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_self_handle_write(s, self_param, self_field_types),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn stmt_has_self_handle_write(
+    s: &Stmt,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> bool {
+    if let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s
+        && let Expr::Member { base, .. } = lhs.as_ref()
+        && is_self_bare_handle_field(base, self_param, self_field_types)
+    {
+        return true;
+    }
+    match s {
+        Stmt::Compound(c) => body_has_self_handle_write(&c.items, self_param, self_field_types),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_has_self_handle_write(then_branch, self_param, self_field_types)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_self_handle_write(eb, self_param, self_field_types))
+        }
+        Stmt::Switch { body, .. } => stmt_has_self_handle_write(body, self_param, self_field_types),
+        Stmt::Case { stmt, .. } => stmt_has_self_handle_write(stmt, self_param, self_field_types),
+        Stmt::Default(stmt) => stmt_has_self_handle_write(stmt, self_param, self_field_types),
+        Stmt::While { body, .. } => stmt_has_self_handle_write(body, self_param, self_field_types),
         _ => false,
     }
 }
@@ -3639,6 +3853,106 @@ fn stmt_has_self_handle_field_deref(
         }
         Stmt::Return(Some(e)) => expr_has_self_handle_field_deref(e, self_param, self_field_types),
         Stmt::Labeled { stmt, .. } => stmt_has_self_handle_field_deref(stmt, self_param, self_field_types),
+        _ => false,
+    }
+}
+
+/// Whether `e` (anywhere in its subtree) references the bare global
+/// identifier `linetarget` (`p_local.h`'s own `extern mobj_t*
+/// linetarget;` -- the last thing `P_AimLineAttack` hit, corpus-wide;
+/// see `World::linetarget`'s own doc comment). Drives `render_weapon_fn`/
+/// `render_fn_impl`'s own signature extension (a real `world: &mut
+/// World, thinkers: &Arena<Thinker>` pair, the same "measure, don't add
+/// speculatively" discipline as every other such scan in this module) --
+/// `A_Punch`/`A_Saw` (`p_pspr.c`) are the first two real corpus bodies
+/// needing it, both checking it for truthiness (bare and negated) and
+/// dereferencing through it (`linetarget->x`/`.y`). Mirrors `expr_has_
+/// self_handle_field_deref`'s exact recursion shape, just with a simpler
+/// leaf check (a bare name match, not a `Member`-base shape).
+fn expr_has_linetarget_ref(e: &Expr) -> bool {
+    if matches!(e, Expr::Ident(n) if n == "linetarget") {
+        return true;
+    }
+    match e {
+        Expr::Unary { expr, .. }
+        | Expr::PreIncDec { expr, .. }
+        | Expr::PostIncDec { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Sizeof(SizeofArg::Expr(expr)) => expr_has_linetarget_ref(expr),
+        Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
+            expr_has_linetarget_ref(lhs) || expr_has_linetarget_ref(rhs)
+        }
+        Expr::Assign { lhs, rhs, .. } => {
+            expr_has_linetarget_ref(lhs) || expr_has_linetarget_ref(rhs)
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_linetarget_ref(cond)
+                || expr_has_linetarget_ref(then_expr)
+                || expr_has_linetarget_ref(else_expr)
+        }
+        Expr::Call { callee, args } => {
+            expr_has_linetarget_ref(callee) || args.iter().any(expr_has_linetarget_ref)
+        }
+        Expr::Index { base, index } => {
+            expr_has_linetarget_ref(base) || expr_has_linetarget_ref(index)
+        }
+        Expr::Member { base, .. } => expr_has_linetarget_ref(base),
+        _ => false,
+    }
+}
+
+fn body_has_linetarget_ref(items: &[BlockItem]) -> bool {
+    items.iter().any(|item| {
+        match item {
+        BlockItem::Decl(d) => d.declarators.iter().any(|decl| {
+            matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_linetarget_ref(e))
+        }),
+        BlockItem::Stmt(s) => stmt_has_linetarget_ref(s),
+    }
+    })
+}
+
+fn stmt_has_linetarget_ref(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => expr_has_linetarget_ref(e),
+        Stmt::Expr(None) => false,
+        Stmt::Compound(c) => body_has_linetarget_ref(&c.items),
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_linetarget_ref(cond)
+                || stmt_has_linetarget_ref(then_branch)
+                || else_branch.as_ref().is_some_and(|eb| stmt_has_linetarget_ref(eb))
+        }
+        Stmt::Switch { cond, body } => expr_has_linetarget_ref(cond) || stmt_has_linetarget_ref(body),
+        Stmt::Case { expr, stmt } => expr_has_linetarget_ref(expr) || stmt_has_linetarget_ref(stmt),
+        Stmt::Default(stmt) => stmt_has_linetarget_ref(stmt),
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr_has_linetarget_ref(cond) || stmt_has_linetarget_ref(body)
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::Decl(d) => d.declarators.iter().any(|decl| {
+                    matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_linetarget_ref(e))
+                }),
+                ForInit::Expr(e) => expr_has_linetarget_ref(e),
+            }) || cond.as_ref().is_some_and(expr_has_linetarget_ref)
+                || step.as_ref().is_some_and(expr_has_linetarget_ref)
+                || stmt_has_linetarget_ref(body)
+        }
+        Stmt::Return(Some(e)) => expr_has_linetarget_ref(e),
+        Stmt::Labeled { stmt, .. } => stmt_has_linetarget_ref(stmt),
         _ => false,
     }
 }
@@ -9277,6 +9591,74 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              count += 1;\n            \
              }\n        \
              }\n    \
+             }"
+        );
+    }
+
+    /// `A_Punch` (`p_pspr.c`) -- the first real corpus body needing the
+    /// global `linetarget` (`p_local.h`'s own `extern mobj_t*
+    /// linetarget;`, the last thing `P_AimLineAttack` hit), and the first
+    /// writing *through* `player`'s own bare `Handle<Thinker>` field
+    /// (`player->mo->angle = ..;`). Three new pieces, each covered by its
+    /// own doc comment at the call site: `World::linetarget` (a plain
+    /// `Option<Handle<Thinker>>` field, the same type `Mobj.target`/
+    /// `.tracer` already use); `render_weapon_fn`'s own `world: &mut
+    /// World, thinkers: &mut Arena<Thinker>` signature extension
+    /// (`body_has_linetarget_ref`/`body_has_self_handle_write`); and the
+    /// bare-self-handle-field *write* arm in `render_expr_stmt`
+    /// (`is_self_bare_handle_field`'s own write-side counterpart), whose
+    /// RHS genuinely mixes a same-key read (`player->mo->x`/`.y`) and a
+    /// different-key one (`linetarget->x`/`.y`) in the same statement --
+    /// a composition `A_VileAttack`'s own target/tracer write arm never
+    /// had to handle, resolved by rendering the hoisted path's RHS
+    /// through the plain (no `same_handle_write`) context instead of
+    /// `rhs_ctx`, since nothing is mutably borrowed yet at that point
+    /// (see the write arm's own doc comment for the full trace). Also
+    /// exercises two smaller, narrowly-scoped additions: a bare, non-
+    /// negated `Option`-valued identifier used for truthiness (`if
+    /// (linetarget)`, `render_bool_expr`'s new `Expr::Ident` arm -- every
+    /// earlier `Option`-typed truthiness check in this codebase's own
+    /// corpus so far only ever appeared negated) and `player->
+    /// powers[pw_strength]`, a bare enum-constant identifier used as an
+    /// array index (needing its own `as usize` cast, the same "fixed
+    /// elsewhere in the crate, not a fresh local" reasoning
+    /// `finecosine`/`finesine`'s own indexing already established, just
+    /// for `powers` specifically). `angle`'s own `angle_t` declaration
+    /// (not plain `int`, unlike `A_PosAttack`'s otherwise-identical
+    /// `damage = (P_Random()%N+1)<<1` idiom) reuses `angle_t_locals`
+    /// unchanged, confirmed against `A_FireShotgun2`'s own established
+    /// shape. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against hand-written `Player`/`PlayerSpriteState`/
+    /// `World`/`Mobj`/`Thinker`/`Arena`/`Handle` stand-ins and stub
+    /// `P_AimLineAttack`/`P_LineAttack`/`S_StartSound`/`R_PointToAngle2`
+    /// functions (matching `P_AimLineAttack`'s real `fixed_t` return type,
+    /// confirming `slope`'s own plain-`int` declaration needs no special
+    /// handling at all -- unlike `A_SkullAttack`'s own `dist`, `slope` is
+    /// only ever used as `FixedT` again afterward, so Rust's ordinary
+    /// deferred-`let` inference already gets it right) -- zero errors.
+    #[test]
+    fn test_a_punch_renders_exactly() {
+        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Punch", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Punch(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut angle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             damage = P_Random() % 10 + 1 << 1;\n    \
+             if player.powers[pw_strength as usize] != 0 {\n        \
+             damage *= 10;\n    \
+             }\n    \
+             angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n    \
+             angle += (P_Random() - P_Random() << 18) as u32;\n    \
+             slope = P_AimLineAttack(player.mo, angle, MELEERANGE);\n    \
+             P_LineAttack(player.mo, angle, MELEERANGE, slope, damage);\n    \
+             if world.linetarget.is_some() {\n        \
+             S_StartSound(player.mo, sfx_punch);\n        \
+             let __rhs = R_PointToAngle2(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }); if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle = __rhs; };\n    \
+             }\n\
              }"
         );
     }

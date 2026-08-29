@@ -22,6 +22,16 @@
 //! `[Player; MAXPLAYERS]`, not `Vec`, matching `runtime/player.rs`'s own
 //! already-documented design (a plain, fixed-size, never-resized array,
 //! unlike `sectors`/`sides`' genuinely per-level-sized tables).
+//! `linetarget` joined once `A_Punch`/`A_Saw` (`p_pspr.c`) needed
+//! somewhere to hold `p_local.h`'s own `extern mobj_t* linetarget;` --
+//! genuine file-scope mutable game state (the last thing
+//! `P_AimLineAttack` hit, corpus-wide, not a per-level table like
+//! `sectors`/`sides` or a program-lifetime fixed array like `players`),
+//! but still just one more piece of state a tick/action function's own
+//! body needs to resolve through, so it lives here rather than as some
+//! new kind of parameter -- a plain `Option<Handle<Thinker>>` field,
+//! the same type `Mobj.target`/`.tracer` already use for "no target"
+//! vs. a real live thinker.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -38,6 +48,7 @@ pub struct World {
     pub sectors: Vec<Sector>,
     pub sides: Vec<Side>,
     pub players: [Player; MAXPLAYERS],
+    pub linetarget: Option<Handle<Thinker>>,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -92,6 +103,7 @@ mod tests {
         assert!(rendered.contains("pub sectors: Vec<Sector>,"));
         assert!(rendered.contains("pub sides: Vec<Side>,"));
         assert!(rendered.contains("pub players: [Player; MAXPLAYERS],"));
+        assert!(rendered.contains("pub linetarget: Option<Handle<Thinker>>,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
