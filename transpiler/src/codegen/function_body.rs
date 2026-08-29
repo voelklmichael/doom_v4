@@ -684,6 +684,17 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Member { field, .. } if field == "specialdata" => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
+        // `if (actor->info->painsound)` (`A_Pain`) -- a bare struct-field
+        // reference used for truthiness, same as `specialdata` above, but
+        // this one is a genuinely plain `int` field (`mobjinfo_t.
+        // painsound`), not `Option`-valued -- ordinary C truthiness,
+        // `!= 0`, not `.is_some()`. Excludes anything `is_option_valued`
+        // already claims (`player`, an `Option<PlayerId>`-typed extra
+        // cross-ref ident) so a genuinely `Option`-typed field falls
+        // through to its own correct handling instead of this one.
+        Expr::Member { .. } if !is_option_valued(cond, ctx) => {
+            Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
+        }
         // `if (twoSided (secnum, i))` -- `EV_DoFloor`'s own adjacency scan,
         // the first bare (non-negated) *call result* used for truthiness
         // rather than a comparison/field. `twoSided` genuinely returns a
@@ -1552,6 +1563,61 @@ pub fn render_fn(
     };
     Ok(format!(
         "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}) {{\n{}\n}}",
+        body_lines.join("\n")
+    ))
+}
+
+fn nth_param_name(f: &FunctionDef, n: usize) -> Option<String> {
+    let DirectDeclarator::Function(_, params) = &f.declarator.direct else {
+        return None;
+    };
+    let param = params.params.get(n)?;
+    let ParamDeclarator::Named(d) = &param.declarator else {
+        return None;
+    };
+    declarator_name(d)
+}
+
+/// Renders a `fn(player_t*, pspdef_t*)`-shaped action function (`state_t.
+/// action`'s `acp2` variant, `action_fn.rs`'s `ActionFn::Weapon`) --
+/// `A_Light0`/`A_Light1`/`A_Light2`, the first real examples. Unlike
+/// `render_fn`'s single-struct tick-function shape, this has two real
+/// parameters, neither a `Thinker`; only `player`'s fields are resolved
+/// (`player_t` isn't struct-mapped in `struct_fields.rs` -- see module
+/// docs -- so `player_field_types` is supplied directly by the caller,
+/// the same as every other function-body test). No `world: &mut World`
+/// parameter yet: none of the three real functions this was built against
+/// touch a cross-reference field, so one isn't threaded through
+/// speculatively -- add it if a future weapon action function needs one,
+/// the same "measure, don't guess" reasoning `render_fn`'s own
+/// self-removal parameters already follow.
+pub fn render_weapon_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    player_field_types: &HashMap<String, String>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+    let player_param = nth_param_name(f, 0)
+        .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
+    let psp_param = nth_param_name(f, 1)
+        .ok_or_else(|| format!("{fn_name}: second parameter has no plain name"))?;
+    let no_extra_cross_refs = HashMap::new();
+    let ctx = FnBodyContext {
+        self_param: &player_param,
+        self_field_types: player_field_types,
+        extra_cross_ref_idents: &no_extra_cross_refs,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
+        embedded_ctor: None,
+        mutating_handle: None,
+    };
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    Ok(format!(
+        "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState) {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -4696,6 +4762,216 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         assert!(
             err.contains("newspecial"),
             "expected `newspecial` in: {err}"
+        );
+    }
+
+    /// First `ActionFn::Mobj`-shaped function (`state_t.action`'s `acp1`
+    /// variant, see `action_fn.rs`) translated end-to-end: `fn(mobj_t*)`
+    /// is exactly `render_fn`'s own existing `self_param: &mut T` shape,
+    /// needing no new renderer capability at all -- `actor->flags &=
+    /// ~MF_SOLID;` is a plain self-field compound assignment
+    /// (`render_assign_op`/`UnaryOp::BitNot` are already fully generic),
+    /// and `MF_SOLID` itself is an already-mapped plain `i32` corpus
+    /// constant (`mobjinfo_data.rs`), not a new identifier kind.
+    #[test]
+    fn test_a_fall_renders_exactly() {
+        let field_types = field_types(&[("flags", "i32")]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Fall", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Fall(actor: &mut Mobj, world: &mut World) {\n    actor.flags &= !MF_SOLID;\n}"
+        );
+    }
+
+    /// Confirms a bare `self_param` (`actor`, not `actor->field`) passed
+    /// directly as a call argument -- `S_StartSound`'s real first
+    /// parameter is `void* origin`, most commonly a `mobj_t*` itself, not
+    /// a field access off one -- already renders correctly through the
+    /// fully generic `Expr::Ident`/`Expr::Call` paths, with no special
+    /// case needed (unlike every prior `S_StartSound` call this renderer
+    /// has seen, all of which passed `&world[..].soundorg` or `NULL`).
+    #[test]
+    fn test_a_xscream_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_XScream",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_XScream(actor: &mut Mobj, world: &mut World) {\n    S_StartSound(actor, sfx_slop);\n}"
+        );
+    }
+
+    /// `actor->info->painsound` -- a two-level member chain through
+    /// `info: &'static MobjInfo` (not a `World`-indexed cross-reference,
+    /// so no `world[..]` wrapping applies) -- confirms `Expr::Member`'s
+    /// fully generic fallback arm already resolves a chain through a
+    /// plain-reference-typed self field with no new code, the same way
+    /// it already resolves a chain through a cross-reference-typed one.
+    #[test]
+    fn test_a_pain_renders_exactly() {
+        let field_types = field_types(&[("info", "&'static MobjInfo")]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Pain", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Pain(actor: &mut Mobj, world: &mut World) {\n    if actor.info.painsound != 0 {\n        S_StartSound(actor, actor.info.painsound);\n    }\n}"
+        );
+    }
+
+    /// `A_Hoof`/`A_Metal`/`A_BabyMetal` (`p_enemy.c`) -- identical two-
+    /// statement shape (a sound, then a monster-generic `A_Chase(mo);`
+    /// tail call), needing no new renderer capability: `A_Chase` isn't
+    /// translated yet, but a bare forward-referencing call by name
+    /// already renders correctly through the fully generic `Expr::Call`
+    /// path (the same accepted "cross-function signature wiring...
+    /// unresolved" gap already documented for other calls). Confirms
+    /// `self_param`'s own name (`mo`, not `actor`) is picked up correctly
+    /// too -- `first_param_name` was already name-agnostic, just not
+    /// exercised by a real second name until now.
+    #[test]
+    fn test_a_hoof_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_Hoof",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Hoof(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_hoof);\n    A_Chase(mo);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_metal_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_Metal",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Metal(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_metal);\n    A_Chase(mo);\n}"
+        );
+    }
+
+    /// First `ActionFn::Weapon`-shaped (`fn(player_t*, pspdef_t*)`)
+    /// action functions translated, via the new `render_weapon_fn`.
+    /// `player_t` isn't struct-mapped (see `render_weapon_fn`'s own
+    /// docs), so `extralight`'s type is supplied directly, the same
+    /// pattern already established for `EV_DoLockedDoor`.
+    #[test]
+    fn test_a_light0_renders_exactly() {
+        let field_types = field_types(&[("extralight", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Light0", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Light0(player: &mut Player, psp: &mut PlayerSpriteState) {\n    player.extralight = 0;\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_light1_renders_exactly() {
+        let field_types = field_types(&[("extralight", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Light1", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Light1(player: &mut Player, psp: &mut PlayerSpriteState) {\n    player.extralight = 1;\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_light2_renders_exactly() {
+        let field_types = field_types(&[("extralight", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Light2", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Light2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    player.extralight = 2;\n}"
+        );
+    }
+
+    /// `A_OpenShotgun2`/`A_LoadShotgun2`/`A_CloseShotgun2` (`p_enemy.c`) --
+    /// multi-line declarator style (`void\nA_OpenShotgun2\n( player_t*\t
+    /// player,\n  pspdef_t*\tpsp )`), confirming `render_weapon_fn` isn't
+    /// sensitive to that formatting. `player->mo` needs no entry at all in
+    /// `player_field_types`: the generic `Expr::Member` fallback only
+    /// treats a field as a cross-reference when its *registered* type is
+    /// one of `CROSS_REF_TYPES`, so an unregistered field already falls
+    /// through to plain, correct `player.mo` access. `A_CloseShotgun2`
+    /// also calls not-yet-translated `A_ReFire(player,psp)` -- the same
+    /// accepted forward-reference-call gap as `A_Hoof`'s own `A_Chase`.
+    #[test]
+    fn test_a_open_shotgun2_renders_exactly() {
+        let rendered = render_weapon_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_OpenShotgun2",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_OpenShotgun2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    S_StartSound(player.mo, sfx_dbopn);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_load_shotgun2_renders_exactly() {
+        let rendered = render_weapon_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_LoadShotgun2",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_LoadShotgun2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    S_StartSound(player.mo, sfx_dbload);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_close_shotgun2_renders_exactly() {
+        let rendered = render_weapon_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_CloseShotgun2",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CloseShotgun2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    S_StartSound(player.mo, sfx_dbcls);\n    A_ReFire(player, psp);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_baby_metal_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BabyMetal",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BabyMetal(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_bspwlk);\n    A_Chase(mo);\n}"
         );
     }
 }
