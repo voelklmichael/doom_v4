@@ -8800,4 +8800,119 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }"
         );
     }
+
+    /// `T_PlatRaise` (`p_plats.c`) -- structurally close to `T_MoveCeiling`
+    /// (self-struct tick function, `switch` on a `plat_e` status field,
+    /// shared `case` labels in a nested `switch` on `plat->type`, the
+    /// `(mobj_t*)&plat->sector->soundorg` sound-origin cast, a self-field
+    /// crossref chain-through reading a *different* struct's field
+    /// through `plat->sector`), plus `T_VerticalDoor`'s own negated-
+    /// pre-decrement idiom (`!--plat->count`) -- and renders end-to-end
+    /// through wholly pre-existing machinery, no new capability needed.
+    /// Confirmed by reading the whole function first, not assumed from
+    /// its opening lines: the outer `switch(plat->status)` has no
+    /// `default:` at all (four explicit `case` labels -- `up`/`down`/
+    /// `waiting`/`in_stasis`, the last two adjacent with no `break`
+    /// between them, a genuine fallthrough into `case in_stasis: break;`'s
+    /// own empty body), so it gets a synthetic trailing `_ => {}`; the
+    /// inner `switch(plat->type)` genuinely does have a `default: break;`,
+    /// so its own already-empty trailing arm *is* that `_`, no synthetic
+    /// arm added on top. `res == crushed && (!plat->crush)` is the first
+    /// real corpus use of a bare `Unary::Not` operand over a genuinely
+    /// `bool`-typed self field (not `Option`-typed, not plain `int`)
+    /// inside a `&&` chain -- confirmed still routing through the plain
+    /// `!` fallback (`render_binary_operand`'s own deliberately-narrow
+    /// `Unary::Not` carve-out, documented since `A_ReFire`, was never
+    /// exercised by a genuine `bool` field before this), producing the
+    /// correct `!plat.crush`, not a wrongly-cast `== 0`. `P_RemoveActivePlat
+    /// (plat)` confirms (a second time, after `T_MoveCeiling`'s own
+    /// `P_RemoveActiveCeiling`) that a similarly-named but structurally
+    /// different removal helper never false-positives `is_self_removal_
+    /// call`'s narrow `P_RemoveThinker(&self->thinker)` shape. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against real `Arena`/`Handle`/`FixedT` plus hand-written `Plat`/
+    /// `World`/`Sector` stand-ins and stub `T_MovePlane`/`S_StartSound`/
+    /// `P_RemoveActivePlat` functions -- zero errors, only expected style
+    /// lints (Doom's own lowercase `up`/`down`/`waiting`/`in_stasis`/
+    /// `blazeDWUS`/etc. enum-constant stand-ins).
+    #[test]
+    fn test_t_plat_raise_renders_exactly() {
+        let field_types = field_types(&[
+            ("sector", "SectorId"),
+            ("speed", "FixedT"),
+            ("low", "FixedT"),
+            ("high", "FixedT"),
+            ("wait", "i32"),
+            ("count", "i32"),
+            ("status", "i32"),
+            ("crush", "bool"),
+            ("r#type", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "T_PlatRaise",
+            "Plat",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
+    let mut res;
+    match plat.status {
+        up => {
+            res = T_MovePlane(plat.sector, plat.speed, plat.high, plat.crush, 0, 1);
+            if plat.r#type == raiseAndChange || plat.r#type == raiseToNearestAndChange {
+                if leveltime & 7 == 0 {
+                    S_StartSound(&world[plat.sector].soundorg, sfx_stnmov);
+                }
+            }
+            if res == crushed && !plat.crush {
+                plat.count = plat.wait;
+                plat.status = down;
+                S_StartSound(&world[plat.sector].soundorg, sfx_pstart);
+            } else {
+                if res == pastdest {
+                    plat.count = plat.wait;
+                    plat.status = waiting;
+                    S_StartSound(&world[plat.sector].soundorg, sfx_pstop);
+                    match plat.r#type {
+                        blazeDWUS | downWaitUpStay => {
+                            P_RemoveActivePlat(plat);
+                        }
+                        raiseAndChange | raiseToNearestAndChange => {
+                            P_RemoveActivePlat(plat);
+                        }
+                        _ => {
+                        }
+                    }
+                }
+            }
+        }
+        down => {
+            res = T_MovePlane(plat.sector, plat.speed, plat.low, false, 0, -1);
+            if res == pastdest {
+                plat.count = plat.wait;
+                plat.status = waiting;
+                S_StartSound(&world[plat.sector].soundorg, sfx_pstop);
+            }
+        }
+        waiting => {
+            plat.count -= 1;
+            if plat.count == 0 {
+                if world[plat.sector].floorheight == plat.low {
+                    plat.status = up;
+                } else {
+                    plat.status = down;
+                }
+                S_StartSound(&world[plat.sector].soundorg, sfx_pstart);
+            }
+        }
+        in_stasis => {
+        }
+        _ => {}
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
 }
