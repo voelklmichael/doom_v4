@@ -745,6 +745,20 @@ fn render_binary_operand(
 /// dereference (matching `render_expr`'s own `Expr::Member` special case
 /// for it). Narrowly by-name/by-shape, the same way `specialdata`'s own
 /// `Option`-awareness is, not a general type-inference pass.
+/// Whether `expr` is a call to a corpus function whose real declared C
+/// return type is `boolean` (already Rust's native `bool`, per
+/// `struct_fields.rs`), so it needs no `!= 0`/`== 0` truthiness cast at
+/// all, bare or negated -- narrowly matched by name (this codebase's
+/// usual "no callee-signature tracking, hand-match the real shape"
+/// style), not a general return-type inference. Extend this list only
+/// once a real corpus call site is found needing it, the same way
+/// `twoSided` stayed its own separate `int`-flag-shaped arm rather than
+/// being folded in here.
+fn is_bool_returning_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call { callee, .. }
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight"))
+}
+
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
     match expr {
         // Covers both a trigger function's own `Option<PlayerId>` local
@@ -804,6 +818,16 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             op: UnaryOp::Not,
             expr,
         } if is_option_valued(expr, ctx) => Ok(format!("{}.is_none()", render_expr(expr, ctx)?.0)),
+        // `! P_CheckSight (actor, actor->target)` (`P_CheckMeleeRange`) --
+        // unlike a plain `int`-valued operand (the generic `== 0` arm just
+        // below), a call to a real `boolean`-returning corpus function is
+        // already a real Rust `bool`, so plain `!` is correct here, the
+        // same "already `bool`, no cast" reasoning `is_bool_returning_call`
+        // callers below already use for the *bare* (non-negated) case.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if is_bool_returning_call(expr) => Ok(format!("!{}", render_expr(expr, ctx)?.0)),
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -856,18 +880,17 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         }
         // `if (P_CheckMeleeRange (actor))` (`A_TroopAttack` and several
         // other melee-attack action functions) -- unlike `twoSided`,
-        // `P_CheckMeleeRange`'s own real corpus declaration
-        // (`p_enemy.c`) returns `boolean`, not a plain `int`, and
-        // `boolean` already maps to Rust's native `bool`
-        // (`struct_fields.rs`'s own established decision) -- so a call
-        // to it is already a real `bool` value, used directly with no
-        // `!= 0` cast at all. Matched narrowly by name, the same "hand-
-        // match the one real corpus shape" style as `twoSided`, rather
-        // than inferring a callee's C return type generically (nothing
-        // else here tracks function signatures).
-        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange") => {
-            Ok(render_expr(cond, ctx)?.0)
-        }
+        // `P_CheckMeleeRange`/`P_CheckSight`'s own real corpus
+        // declarations (`p_enemy.c`/`p_local.h`) return `boolean`, not a
+        // plain `int`, and `boolean` already maps to Rust's native `bool`
+        // (`struct_fields.rs`'s own established decision) -- so a call to
+        // either is already a real `bool` value, used directly with no
+        // `!= 0` cast at all. Matched narrowly by name
+        // (`is_bool_returning_call`), the same "hand-match the one real
+        // corpus shape" style as `twoSided`, rather than inferring a
+        // callee's C return type generically (nothing else here tracks
+        // function signatures).
+        Expr::Call { .. } if is_bool_returning_call(cond) => Ok(render_expr(cond, ctx)?.0),
         _ => Err(format!(
             "render_bool_expr: unsupported condition shape: {cond:?}"
         )),
@@ -1771,6 +1794,51 @@ pub fn render_fn(
     self_rust_type: &str,
     self_field_types: &HashMap<String, String>,
 ) -> Result<String, String> {
+    render_fn_impl(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        None,
+    )
+}
+
+/// `render_fn`'s own `boolean`-returning twin -- `P_CheckMeleeRange`/
+/// `P_CheckMissileRange` (`p_enemy.c`) are `boolean P_Check...(mobj_t*
+/// actor)`, the same single-self-struct-parameter shape `render_fn`
+/// already handles, just with a real return value instead of `void`.
+/// A thin wrapper over the same `render_fn_impl` rather than a new
+/// required parameter threaded through `render_fn`'s own 36 existing call
+/// sites (every one of them a real `void A_*`/tick function, never
+/// needing a return type) -- `boolean` already maps to Rust's native
+/// `bool` (`struct_fields.rs`'s own decision), so `"bool"` is the only
+/// return type this needs to support so far.
+pub fn render_bool_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+) -> Result<String, String> {
+    render_fn_impl(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        Some("bool"),
+    )
+}
+
+fn render_fn_impl(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
     let f = find_function_def(&unit.items, fn_name)
         .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
@@ -1828,8 +1896,9 @@ pub fn render_fn(
     } else {
         ""
     };
+    let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
     Ok(format!(
-        "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}) {{\n{}\n}}",
+        "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -3253,6 +3322,64 @@ pub fn T_Glow(g: &mut Glow, world: &mut World) {
              if actor.target.is_none() || match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 || !P_CheckSight(actor, actor.target) {\n        \
              P_SetMobjState(actor, actor.info.seestate);\n    \
              }\n\
+             }"
+        );
+    }
+
+    /// `P_CheckMeleeRange` -- the first `boolean`-returning function this
+    /// renderer produces (`render_bool_fn`, a thin `-> {return_type}`
+    /// wrapper over the same `render_fn_impl` every `void A_*` action
+    /// function already shares), and the first real corpus use of the
+    /// `dest = actor->target;` local-alias chain-through combined with a
+    /// *further* chain off the dereferenced result (`pl->info->radius`:
+    /// `pl->info` resolves through the alias to a real `&'static
+    /// MobjInfo`, then `.radius` chains off *that* through the ordinary
+    /// generic `Expr::Member` fallback -- no new code needed, since the
+    /// match-expression the alias arm produces is just an ordinary Rust
+    /// value any further `.field` can chain off). Also surfaces a real
+    /// bug, independent of anything built for `A_CPosRefire`'s own `&&`/
+    /// `||`-chain fix: `render_bool_expr`'s own top-level `Unary::Not`
+    /// handling (a *single* condition, not part of a logical chain) had
+    /// no `bool`-returning-callee awareness at all, so `if (!
+    /// P_CheckSight(..))` rendered as `P_CheckSight(..) == 0` -- syntactically
+    /// valid but semantically backwards-compiling nonsense once
+    /// `P_CheckSight` returns a real Rust `bool` (`== 0` doesn't even
+    /// type-check against `bool`, so this would have been caught at the
+    /// `rustc` smoke-compile step, but is fixed here before that point
+    /// via the new `is_bool_returning_call` helper, shared with the
+    /// already-existing bare (non-negated) `P_CheckMeleeRange` arm).
+    /// Verified compiling for real.
+    #[test]
+    fn test_p_check_melee_range_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("info", "&'static MobjInfo"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_CheckMeleeRange",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_CheckMeleeRange(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) -> bool {\n    \
+             let mut pl;\n    \
+             let mut dist;\n    \
+             if actor.target.is_none() {\n        \
+             return false;\n    \
+             }\n    \
+             pl = actor.target;\n    \
+             dist = P_AproxDistance(match thinkers.get(pl.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x, match thinkers.get(pl.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - actor.y);\n    \
+             if dist >= MELEERANGE - 20 * FRACUNIT + match thinkers.get(pl.unwrap()) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.radius {\n        \
+             return false;\n    \
+             }\n    \
+             if !P_CheckSight(actor, actor.target) {\n        \
+             return false;\n    \
+             }\n    \
+             return true;\n\
              }"
         );
     }
