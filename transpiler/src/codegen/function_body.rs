@@ -7338,4 +7338,134 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }"
         );
     }
+
+    /// `A_FatAttack2` -- identical shape to `A_FatAttack1`, differing only
+    /// in `-=`/`*2` (`mo->angle -= FATSPREAD*2;`, a compound-assign RHS
+    /// that's itself a `Binary` rather than a bare macro identifier),
+    /// confirming the same-handle-write machinery generalizes with no
+    /// further changes.
+    #[test]
+    fn test_a_fat_attack2_renders_exactly() {
+        let field_types = field_types(&[
+            ("angle", "u32"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_FatAttack2",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FatAttack2(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut mo;\n    \
+             let mut an;\n    \
+             A_FaceTarget(actor);\n    \
+             actor.angle -= (FATSPREAD) as u32;\n    \
+             P_SpawnMissile(actor, actor.target, MT_FATSHOT);\n    \
+             mo = P_SpawnMissile(actor, actor.target, MT_FATSHOT);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.angle -= FATSPREAD * 2; };\n    \
+             an = match thinkers.get(mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } >> ANGLETOFINESHIFT;\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momx = FixedMul(m.info.speed, finecosine[an as usize]); };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momy = FixedMul(m.info.speed, finesine[an as usize]); };\n\
+             }"
+        );
+    }
+
+    /// `A_FatAttack3` -- two spawns in sequence, `mo` reused (rebound,
+    /// not redeclared) for each -- confirms `render_decl`'s single
+    /// top-level `let mut mo;` correctly serves *both* assignments, and
+    /// that reusing the same handle name across two independent spawns
+    /// doesn't confuse `same_handle_write`'s own by-name matching (each
+    /// write's own RHS only ever sees the *current* value of `mo`, the
+    /// same as the real C reassigning the same pointer variable twice).
+    #[test]
+    fn test_a_fat_attack3_renders_exactly() {
+        let field_types = field_types(&[
+            ("angle", "u32"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_FatAttack3",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FatAttack3(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut mo;\n    \
+             let mut an;\n    \
+             A_FaceTarget(actor);\n    \
+             mo = P_SpawnMissile(actor, actor.target, MT_FATSHOT);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.angle -= FATSPREAD / 2; };\n    \
+             an = match thinkers.get(mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } >> ANGLETOFINESHIFT;\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momx = FixedMul(m.info.speed, finecosine[an as usize]); };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momy = FixedMul(m.info.speed, finesine[an as usize]); };\n    \
+             mo = P_SpawnMissile(actor, actor.target, MT_FATSHOT);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.angle += FATSPREAD / 2; };\n    \
+             an = match thinkers.get(mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } >> ANGLETOFINESHIFT;\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momx = FixedMul(m.info.speed, finecosine[an as usize]); };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momy = FixedMul(m.info.speed, finesine[an as usize]); };\n\
+             }"
+        );
+    }
+
+    /// `A_SkelMissile` -- `mo->x += mo->momx;`/`mo->y += mo->momy;` are
+    /// the same-handle-write shape through a *compound* assign (not
+    /// `A_FatAttack1`'s own plain `=`), confirming `is_fixed_t_field`'s
+    /// FixedT-wrap check (scoped to a plain `=` only, per its own doc
+    /// comment) correctly stays out of the way for a compound op, letting
+    /// the same-handle read resolve through unwrapped. `mo->tracer =
+    /// actor->target;` writes an `Option<Handle<Thinker>>` local's own
+    /// field straight from a *plain* (not further-dereferenced)
+    /// `actor->target` read -- confirms this doesn't need the `Some(..)`
+    /// wrap `fog->target = actor;` (`A_VileTarget`'s own idiom, a bare
+    /// receiver stored as a value) already gets, since the RHS here is
+    /// already `Option`-typed.
+    #[test]
+    fn test_a_skel_missile_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("tracer", "Option<Handle<Thinker>>"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SkelMissile",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SkelMissile(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut mo;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             actor.z += 16 * FRACUNIT;\n    \
+             mo = P_SpawnMissile(actor, actor.target, MT_TRACER);\n    \
+             actor.z -= 16 * FRACUNIT;\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.x += m.momx; };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.y += m.momy; };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.tracer = actor.target; };\n\
+             }"
+        );
+    }
 }
