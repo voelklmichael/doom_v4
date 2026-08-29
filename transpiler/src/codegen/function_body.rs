@@ -277,31 +277,38 @@ fn render_assign_op(op: AssignOp) -> &'static str {
 /// field mapping). Shared by `render_expr`'s target/tracer chain-through
 /// arm and `body_has_target_deref`'s signature-extension scan below, so
 /// both agree on exactly the same shape.
-fn is_target_or_tracer_field<'a>(
-    base: &Expr,
+/// Whether `e` evaluates to a value of type `Option<Handle<Thinker>>`
+/// known (corpus-checked) to always be `Mobj`-shaped when present:
+/// either `{self_param}.target`/`.tracer` directly, or a plain local
+/// alias assigned straight from one of those (`dest = actor->target;`,
+/// `A_SkullAttack`'s own idiom, common corpus-wide -- tracked via
+/// `aliases`, populated by `collect_target_tracer_aliases`). Takes its
+/// dependencies as plain arguments rather than `&FnBodyContext` so it
+/// can be reused both by `render_expr` (which has a `ctx`) and by the
+/// `body_has_target_deref` family (which runs *before* `render_fn` has
+/// built one, to decide whether the signature needs it at all).
+/// Deliberately single-level: `aliases` itself is always built by
+/// scanning for a direct `self.target`/`self.tracer` assignment, not by
+/// resolving through another alias -- no corpus example so far aliases
+/// an alias.
+fn is_target_tracer_typed(
+    e: &Expr,
     self_param: &str,
     self_field_types: &HashMap<String, String>,
-) -> Option<&'a str> {
-    let Expr::Member {
-        base: inner, field, ..
-    } = base
-    else {
-        return None;
-    };
-    if !matches!(inner.as_ref(), Expr::Ident(n) if n == self_param) {
-        return None;
-    }
-    let tf = if field == "target" {
-        "target"
-    } else if field == "tracer" {
-        "tracer"
-    } else {
-        return None;
-    };
-    if self_field_types.get(tf).map(String::as_str) == Some("Option<Handle<Thinker>>") {
-        Some(tf)
-    } else {
-        None
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match e {
+        Expr::Member {
+            base: inner, field, ..
+        } if matches!(inner.as_ref(), Expr::Ident(n) if n == self_param) => {
+            (field == "target" || field == "tracer")
+                && self_field_types.get(field.as_str()).map(String::as_str)
+                    == Some("Option<Handle<Thinker>>")
+        }
+        Expr::Ident(name) => {
+            aliases.get(name.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>")
+        }
+        _ => false,
     }
 }
 
@@ -435,29 +442,34 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].frontsector"), true))
         }
-        // `actor->target->field` / `actor->tracer->field` -- `target`/
-        // `tracer` are self-struct fields themselves `Option<Handle<
-        // Thinker>>`-typed (`struct_fields.rs`'s self-referential-field
-        // mapping), unlike every cross-reference field handled above
-        // (which is a plain index into `World`) -- dereferencing one
-        // needs a real `Arena` lookup, not `world[...]`. Corpus-checked:
-        // only `mobj_t` ever has `target`/`tracer`, so the looked-up
-        // thinker is always the `Mobj` variant, making `_ =>
-        // unreachable!()` genuinely safe (matching `door->field`'s own
-        // `mutating_handle` arm's reasoning above) -- not a defensive
-        // catch-all. `.unwrap()` at the point of use, not a narrowed
-        // rebinding, the same `p->field` (`Option<PlayerId>`) precedent:
-        // every real corpus dereference site already guards this with
-        // its own adjacent `if (!actor->target) return;`.
+        // `actor->target->field` / `actor->tracer->field`, or the same
+        // chain through a local alias (`dest->field` once `dest = actor->
+        // target;`, `A_SkullAttack`'s own idiom) -- `target`/`tracer` are
+        // self-struct fields themselves `Option<Handle<Thinker>>`-typed
+        // (`struct_fields.rs`'s self-referential-field mapping), unlike
+        // every cross-reference field handled above (which is a plain
+        // index into `World`) -- dereferencing one needs a real `Arena`
+        // lookup, not `world[...]`. Corpus-checked: only `mobj_t` ever
+        // has `target`/`tracer`, so the looked-up thinker is always the
+        // `Mobj` variant, making `_ => unreachable!()` genuinely safe
+        // (matching `door->field`'s own `mutating_handle` arm's
+        // reasoning above) -- not a defensive catch-all. `.unwrap()` at
+        // the point of use, not a narrowed rebinding, the same `p->field`
+        // (`Option<PlayerId>`) precedent: every real corpus dereference
+        // site already guards this with its own adjacent `if (!actor->
+        // target) return;`.
         Expr::Member { base, field, .. }
-            if is_target_or_tracer_field(base, ctx.self_param, ctx.self_field_types).is_some() =>
+            if is_target_tracer_typed(
+                base,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+            ) =>
         {
-            let tf = is_target_or_tracer_field(base, ctx.self_param, ctx.self_field_types)
-                .expect("guarded above");
+            let (base_text, _) = render_expr(base, ctx)?;
             Ok((
                 format!(
-                    "match thinkers.get({}.{tf}.unwrap()) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
-                    ctx.self_param,
+                    "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
                     rust_field_name(field)?
                 ),
                 false,
@@ -735,12 +747,16 @@ fn render_binary_operand(
 /// `Option`-awareness is, not a general type-inference pass.
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
     match expr {
-        Expr::Ident(n) => {
+        // Covers both a trigger function's own `Option<PlayerId>` local
+        // (`p`) and a `Mobj`-shaped action function's own local alias of
+        // `target`/`tracer` (`dest`, `A_SkullAttack`'s idiom) -- both
+        // tracked the same way, via `ctx.extra_cross_ref_idents`.
+        Expr::Ident(n) => matches!(
             ctx.extra_cross_ref_idents
                 .get(n.as_str())
-                .map(String::as_str)
-                == Some("Option<PlayerId>")
-        }
+                .map(String::as_str),
+            Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>")
+        ),
         Expr::Member { field, .. } if field == "player" => true,
         // `!actor->target` (`A_PosAttack` and friends) -- `target`'s
         // registered type (`Mobj.target: Option<Handle<Thinker>>`, per
@@ -1760,12 +1776,13 @@ pub fn render_fn(
         .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
     let param_name = first_param_name(f)
         .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
-    let no_extra_cross_refs = HashMap::new();
+    let target_tracer_aliases =
+        collect_target_tracer_aliases(&f.body.items, &param_name, self_field_types);
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &param_name,
         self_field_types,
-        extra_cross_ref_idents: &no_extra_cross_refs,
+        extra_cross_ref_idents: &target_tracer_aliases,
         ctor_var: "",
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
@@ -1793,7 +1810,12 @@ pub fn render_fn(
     // parameter name/mutability a function needing both should get is
     // left undecided until real evidence exists, rather than guessed.
     let needs_self_removal = body_has_self_removal(&f.body.items, &param_name);
-    let needs_target_deref = body_has_target_deref(&f.body.items, &param_name, self_field_types);
+    let needs_target_deref = body_has_target_deref(
+        &f.body.items,
+        &param_name,
+        self_field_types,
+        &target_tracer_aliases,
+    );
     if needs_self_removal && needs_target_deref {
         return Err(format!(
             "{fn_name}: needs both self-removal and target/tracer dereferencing -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
@@ -1903,7 +1925,7 @@ fn stmt_has_self_removal(s: &Stmt, self_param: &str) -> bool {
 
 /// Whether `e` (anywhere in its subtree) dereferences *through*
 /// `{self_param}.target`/`.tracer` to read one of the targeted mobj's own
-/// fields (`render_expr`'s `is_target_or_tracer_field` chain-through arm)
+/// fields (`render_expr`'s `is_target_tracer_typed` chain-through arm)
 /// -- unlike `is_self_removal_call`'s single fixed top-level-statement
 /// shape, this can appear nested arbitrarily deep in any expression
 /// (a condition, a call argument, an assignment's RHS, ...), so it needs
@@ -1916,9 +1938,10 @@ fn expr_has_target_deref(
     e: &Expr,
     self_param: &str,
     self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
 ) -> bool {
     if let Expr::Member { base, .. } = e
-        && is_target_or_tracer_field(base, self_param, self_field_types).is_some()
+        && is_target_tracer_typed(base, self_param, self_field_types, aliases)
     {
         return true;
     }
@@ -1928,37 +1951,136 @@ fn expr_has_target_deref(
         | Expr::PostIncDec { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Sizeof(SizeofArg::Expr(expr)) => {
-            expr_has_target_deref(expr, self_param, self_field_types)
+            expr_has_target_deref(expr, self_param, self_field_types, aliases)
         }
         Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
-            expr_has_target_deref(lhs, self_param, self_field_types)
-                || expr_has_target_deref(rhs, self_param, self_field_types)
+            expr_has_target_deref(lhs, self_param, self_field_types, aliases)
+                || expr_has_target_deref(rhs, self_param, self_field_types, aliases)
         }
         Expr::Assign { lhs, rhs, .. } => {
-            expr_has_target_deref(lhs, self_param, self_field_types)
-                || expr_has_target_deref(rhs, self_param, self_field_types)
+            expr_has_target_deref(lhs, self_param, self_field_types, aliases)
+                || expr_has_target_deref(rhs, self_param, self_field_types, aliases)
         }
         Expr::Conditional {
             cond,
             then_expr,
             else_expr,
         } => {
-            expr_has_target_deref(cond, self_param, self_field_types)
-                || expr_has_target_deref(then_expr, self_param, self_field_types)
-                || expr_has_target_deref(else_expr, self_param, self_field_types)
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || expr_has_target_deref(then_expr, self_param, self_field_types, aliases)
+                || expr_has_target_deref(else_expr, self_param, self_field_types, aliases)
         }
         Expr::Call { callee, args } => {
-            expr_has_target_deref(callee, self_param, self_field_types)
+            expr_has_target_deref(callee, self_param, self_field_types, aliases)
                 || args
                     .iter()
-                    .any(|a| expr_has_target_deref(a, self_param, self_field_types))
+                    .any(|a| expr_has_target_deref(a, self_param, self_field_types, aliases))
         }
         Expr::Index { base, index } => {
-            expr_has_target_deref(base, self_param, self_field_types)
-                || expr_has_target_deref(index, self_param, self_field_types)
+            expr_has_target_deref(base, self_param, self_field_types, aliases)
+                || expr_has_target_deref(index, self_param, self_field_types, aliases)
         }
-        Expr::Member { base, .. } => expr_has_target_deref(base, self_param, self_field_types),
+        Expr::Member { base, .. } => {
+            expr_has_target_deref(base, self_param, self_field_types, aliases)
+        }
         _ => false,
+    }
+}
+
+/// Locals directly aliased from `{self_param}.target`/`.tracer`
+/// (`mobj_t* dest; ... dest = actor->target;`, `A_SkullAttack`'s own
+/// idiom, common corpus-wide) -- registers each such local's name with
+/// the same `"Option<Handle<Thinker>>"` type string `self_field_types`
+/// uses for `target`/`tracer` themselves, into the same map shape a
+/// trigger function's own `local_var_types` already produces
+/// (`FnBodyContext::extra_cross_ref_idents`), so `is_target_tracer_typed`
+/// resolves a self-field chain and a locally-aliased chain identically.
+/// Deliberately single-level (see `is_target_tracer_typed`'s own doc
+/// comment) -- scans for a *direct* `self.target`/`self.tracer`
+/// assignment only, passing an empty map as its own `aliases` argument.
+fn collect_target_tracer_aliases(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    collect_target_tracer_aliases_in(items, self_param, self_field_types, &mut aliases);
+    aliases
+}
+
+fn collect_target_tracer_aliases_in(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &mut HashMap<String, String>,
+) {
+    let no_aliases = HashMap::new();
+    for item in items {
+        match item {
+            BlockItem::Decl(d) => {
+                for decl in &d.declarators {
+                    if let Some(Initializer::Expr(e)) = &decl.initializer
+                        && is_target_tracer_typed(e, self_param, self_field_types, &no_aliases)
+                        && let Some(name) = declarator_name(&decl.declarator)
+                    {
+                        aliases.insert(name, "Option<Handle<Thinker>>".to_string());
+                    }
+                }
+            }
+            BlockItem::Stmt(s) => {
+                collect_target_tracer_aliases_stmt(s, self_param, self_field_types, aliases)
+            }
+        }
+    }
+}
+
+fn collect_target_tracer_aliases_stmt(
+    s: &Stmt,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &mut HashMap<String, String>,
+) {
+    let no_aliases = HashMap::new();
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && is_target_tracer_typed(rhs, self_param, self_field_types, &no_aliases)
+    {
+        aliases.insert(name.clone(), "Option<Handle<Thinker>>".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => {
+            collect_target_tracer_aliases_in(&c.items, self_param, self_field_types, aliases)
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_target_tracer_aliases_stmt(then_branch, self_param, self_field_types, aliases);
+            if let Some(eb) = else_branch {
+                collect_target_tracer_aliases_stmt(eb, self_param, self_field_types, aliases);
+            }
+        }
+        Stmt::Switch { body, .. } => {
+            collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
+        }
+        Stmt::Case { stmt, .. } => {
+            collect_target_tracer_aliases_stmt(stmt, self_param, self_field_types, aliases)
+        }
+        Stmt::Default(stmt) => {
+            collect_target_tracer_aliases_stmt(stmt, self_param, self_field_types, aliases)
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
+        }
+        Stmt::For { body, .. } => {
+            collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
+        }
+        _ => {}
     }
 }
 
@@ -1966,12 +2088,13 @@ fn body_has_target_deref(
     items: &[BlockItem],
     self_param: &str,
     self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
 ) -> bool {
     items.iter().any(|item| match item {
         BlockItem::Decl(d) => d.declarators.iter().any(|decl| {
-            matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_target_deref(e, self_param, self_field_types))
+            matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_target_deref(e, self_param, self_field_types, aliases))
         }),
-        BlockItem::Stmt(s) => stmt_has_target_deref(s, self_param, self_field_types),
+        BlockItem::Stmt(s) => stmt_has_target_deref(s, self_param, self_field_types, aliases),
     })
 }
 
@@ -1979,34 +2102,35 @@ fn stmt_has_target_deref(
     s: &Stmt,
     self_param: &str,
     self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
 ) -> bool {
     match s {
-        Stmt::Expr(Some(e)) => expr_has_target_deref(e, self_param, self_field_types),
+        Stmt::Expr(Some(e)) => expr_has_target_deref(e, self_param, self_field_types, aliases),
         Stmt::Expr(None) => false,
-        Stmt::Compound(c) => body_has_target_deref(&c.items, self_param, self_field_types),
+        Stmt::Compound(c) => body_has_target_deref(&c.items, self_param, self_field_types, aliases),
         Stmt::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            expr_has_target_deref(cond, self_param, self_field_types)
-                || stmt_has_target_deref(then_branch, self_param, self_field_types)
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(then_branch, self_param, self_field_types, aliases)
                 || else_branch
                     .as_ref()
-                    .is_some_and(|eb| stmt_has_target_deref(eb, self_param, self_field_types))
+                    .is_some_and(|eb| stmt_has_target_deref(eb, self_param, self_field_types, aliases))
         }
         Stmt::Switch { cond, body } => {
-            expr_has_target_deref(cond, self_param, self_field_types)
-                || stmt_has_target_deref(body, self_param, self_field_types)
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(body, self_param, self_field_types, aliases)
         }
         Stmt::Case { expr, stmt } => {
-            expr_has_target_deref(expr, self_param, self_field_types)
-                || stmt_has_target_deref(stmt, self_param, self_field_types)
+            expr_has_target_deref(expr, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(stmt, self_param, self_field_types, aliases)
         }
-        Stmt::Default(stmt) => stmt_has_target_deref(stmt, self_param, self_field_types),
+        Stmt::Default(stmt) => stmt_has_target_deref(stmt, self_param, self_field_types, aliases),
         Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
-            expr_has_target_deref(cond, self_param, self_field_types)
-                || stmt_has_target_deref(body, self_param, self_field_types)
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(body, self_param, self_field_types, aliases)
         }
         Stmt::For {
             init,
@@ -2016,19 +2140,19 @@ fn stmt_has_target_deref(
         } => {
             init.as_ref().is_some_and(|i| match i {
                 ForInit::Decl(d) => d.declarators.iter().any(|decl| {
-                    matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_target_deref(e, self_param, self_field_types))
+                    matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_target_deref(e, self_param, self_field_types, aliases))
                 }),
-                ForInit::Expr(e) => expr_has_target_deref(e, self_param, self_field_types),
+                ForInit::Expr(e) => expr_has_target_deref(e, self_param, self_field_types, aliases),
             }) || cond
                 .as_ref()
-                .is_some_and(|e| expr_has_target_deref(e, self_param, self_field_types))
+                .is_some_and(|e| expr_has_target_deref(e, self_param, self_field_types, aliases))
                 || step
                     .as_ref()
-                    .is_some_and(|e| expr_has_target_deref(e, self_param, self_field_types))
-                || stmt_has_target_deref(body, self_param, self_field_types)
+                    .is_some_and(|e| expr_has_target_deref(e, self_param, self_field_types, aliases))
+                || stmt_has_target_deref(body, self_param, self_field_types, aliases)
         }
-        Stmt::Return(Some(e)) => expr_has_target_deref(e, self_param, self_field_types),
-        Stmt::Labeled { stmt, .. } => stmt_has_target_deref(stmt, self_param, self_field_types),
+        Stmt::Return(Some(e)) => expr_has_target_deref(e, self_param, self_field_types, aliases),
+        Stmt::Labeled { stmt, .. } => stmt_has_target_deref(stmt, self_param, self_field_types, aliases),
         _ => false,
     }
 }
@@ -3607,6 +3731,75 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
+    }
+
+    /// `A_SkullAttack`'s `mobj_t* dest; ... dest = actor->target; ...
+    /// dest->x - actor->x ...` -- the local-alias generalization of the
+    /// `actor->target->field` chain-through arm (`is_target_tracer_typed`,
+    /// `collect_target_tracer_aliases`), verified against the real parsed
+    /// AST rather than a fabricated snippet. `A_SkullAttack` as a *whole*
+    /// function isn't attempted here -- it has its own separate, unrelated
+    /// gap (`dist`, declared plain `int`, is assigned `P_AproxDistance`'s
+    /// fixed-point-`FixedT` result and later compared/reassigned as if it
+    /// were still `int`; a different problem from anything this session's
+    /// target/tracer work touches, not investigated here), matching this
+    /// codebase's own "isolate the one clean new piece, leave the rest
+    /// open" precedent (`T_VerticalDoor`'s own countdown/`NULL`/self-
+    /// removal pieces before it rendered whole). `collect_target_tracer_
+    /// aliases` runs against `A_SkullAttack`'s real, complete body (not a
+    /// synthetic fragment) to confirm it actually discovers `dest` from
+    /// real corpus source, then just the one real `dest->x - actor->x`
+    /// sub-expression (pulled out of the real `P_AproxDistance(...)` call
+    /// argument list) is rendered in isolation.
+    #[test]
+    fn test_target_tracer_local_alias_against_real_a_skull_attack() {
+        let path = corpus_dir().join("p_enemy.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_enemy.c should parse");
+        let f = find_function_def(&unit.items, "A_SkullAttack").expect("A_SkullAttack not found");
+        let self_field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let aliases = collect_target_tracer_aliases(&f.body.items, "actor", &self_field_types);
+        assert_eq!(
+            aliases.get("dest").map(String::as_str),
+            Some("Option<Handle<Thinker>>")
+        );
+
+        let is_aprox_distance_call = |s: &Stmt| {
+            matches!(s, Stmt::Expr(Some(Expr::Assign { rhs, .. }))
+                if matches!(rhs.as_ref(), Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_AproxDistance")))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_aprox_distance_call),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `dist = P_AproxDistance(..)` statement in A_SkullAttack");
+        let Stmt::Expr(Some(Expr::Assign { rhs, .. })) = stmt else {
+            unreachable!("guarded by is_aprox_distance_call")
+        };
+        let Expr::Call { args, .. } = rhs.as_ref() else {
+            unreachable!("guarded by is_aprox_distance_call")
+        };
+        let first_arg = &args[0];
+
+        let ctx = FnBodyContext {
+            self_param: "actor",
+            self_field_types: &self_field_types,
+            extra_cross_ref_idents: &aliases,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
+        };
+        let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x"
+        );
     }
 
     /// `T_VerticalDoor`'s innermost `switch(door->type) { case blazeClose:
