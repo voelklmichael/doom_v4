@@ -1862,7 +1862,21 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
         // this arm existed). Scoped to these three names, this module's
         // usual "hand-match the one real callee" style, not a general
         // "assume every unmodeled call is `FixedT`" fallback (most
-        // calls, like `P_Random()`, genuinely aren't).
+        // calls, like `P_Random()`, genuinely aren't). `P_AproxDistance`
+        // (also real `fixed_t`-returning, `p_local.h`) deliberately does
+        // *not* join this list: unlike these three, its one real corpus
+        // caller (`A_SkullAttack`'s own `dist`) assigns straight into a
+        // plain-`int`-declared local that's later used in genuinely
+        // `int`-typed arithmetic (`dist / SKULLSPEED`, `dist < 1`), not
+        // as a `FixedT` value the way `A_BrainExplode`'s own plain-`int`-
+        // declared `x`/`y`/`z` locals are (assigned a `FixedT`-valued
+        // expression here too, but only ever *used* as `FixedT` again
+        // afterward, so Rust's own inference already gets them right with
+        // no cast) -- so `P_AproxDistance` gets its own separate, more
+        // narrowly-scoped recognition in `render_expr_stmt` instead of
+        // this general one, which this module's *other* consumer (should
+        // a `FixedT` self-field ever get written straight from a bare
+        // `P_AproxDistance(..)` call) doesn't need yet.
         Expr::Call { callee, .. } => {
             matches!(callee.as_ref(), Expr::Ident(n) if n == "FixedMul" || n == "FixedDiv" || n == "FixedDiv2")
         }
@@ -2027,6 +2041,33 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
+        // `dist = P_AproxDistance (dest->x - actor->x, dest->y - actor->y);`
+        // (`A_SkullAttack`) -- the same "C silently reinterprets the bits"
+        // idiom as `rhs_is_u32_self_field` just above, but for `FixedT`:
+        // `dist`'s own C declaration is plain `int` (`plain_int_locals`),
+        // while `P_AproxDistance`'s *real* declared return type is
+        // `fixed_t` (`p_local.h`: `fixed_t P_AproxDistance (fixed_t dx,
+        // fixed_t dy);`, confirmed by direct read) -- assigning it
+        // straight into a plain-`int`-declared local needs the newtype's
+        // own raw-representation extraction (`.0`), the same idea as
+        // `sec-sectors`'s own `.0 as i32` (no `as i32` here since
+        // `FixedT`'s inner field is already `i32`). Deliberately its own
+        // narrow, by-name check (`is_approx_distance_call`) rather than
+        // the general `expr_is_fixed_t_valued` -- tried first, and
+        // confirmed *wrong* by the existing test suite: `A_BrainExplode`'s
+        // own plain-`int`-declared `x`/`y`/`z` locals are *also* assigned
+        // a `FixedT`-valued expression (`mo->x + (...)*2048`), but stay
+        // genuinely `FixedT`-typed throughout (never used as raw `int`
+        // arithmetic afterward, only passed on to `P_SpawnMobj`), so
+        // `expr_is_fixed_t_valued`'s general answer is right for *that*
+        // function and wrong for this one -- only `dist`'s own later
+        // `int`-typed uses (`dist / SKULLSPEED`, `dist < 1`) make the
+        // extraction correct here, and there's no way to tell the two
+        // shapes apart from the assignment site alone. Scoped to a
+        // *plain* `=`, not compound: no real corpus example needs this
+        // through a compound op yet.
+        let is_approx_distance_call = matches!(rhs.as_ref(), Expr::Call { callee, .. }
+            if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_AproxDistance"));
         // `actor->angle += (P_Random()-P_Random())<<21;` (`A_FaceTarget`)
         // -- the reverse direction of the `angle_t`-into-plain-`int` bug
         // just above: a *compound*-assign's RHS is ordinary `int`-typed
@@ -2074,6 +2115,8 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
             format!("{rhs_text} as i32")
+        } else if lhs_is_plain_int_local && *op == AssignOp::Assign && is_approx_distance_call {
+            format!("({rhs_text}).0")
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
         } else {
@@ -4726,6 +4769,79 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
         assert_eq!(
             rendered,
             "match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x"
+        );
+    }
+
+    /// `A_SkullAttack` -- closed out end-to-end, the `dist` gap the entry
+    /// above (and `docs/03_TRANSPILER.md`'s own "not yet done" list) left
+    /// open. `dist`'s own C declaration is plain `int`
+    /// (`plain_int_locals`), but `dist = P_AproxDistance(..);` assigns a
+    /// real `fixed_t`-returning call's result into it -- resolved via
+    /// `is_approx_distance_call`'s new `.0` raw-representation extraction
+    /// (see its own doc comment for why this is a narrower, by-name check
+    /// rather than the general `expr_is_fixed_t_valued`: `A_BrainExplode`'s
+    /// own plain-`int`-declared `x`/`y`/`z` locals are *also* assigned a
+    /// `FixedT`-valued expression, but stay genuinely `FixedT` throughout
+    /// with no cast, so the general check would have been wrong for that
+    /// already-shipped function). Once `dist` is genuinely `i32`
+    /// throughout, `dist / SKULLSPEED` (plain `i32` division -- `SKULLSPEED`
+    /// itself is an unexpanded macro identifier, rendered as opaque
+    /// pass-through text same as `MISSILERANGE`) and the final `(...) /
+    /// dist` (`Div<i32> for FixedT`, already implemented) both need zero
+    /// further new code. `dest->height>>1` -- a bit-shift directly on a
+    /// `FixedT`-typed field -- needed the one genuinely new runtime piece,
+    /// `Shr<i32> for FixedT` (`runtime/fixed.rs`, a thin wrapping bit-shift
+    /// of the representation, preserving the `FRACUNIT` scale exactly the
+    /// way `Div<i32>` does via true division). Everything else in the
+    /// function (the target-alias dereference chain through `dest`, the
+    /// `an = actor->angle >> ANGLETOFINESHIFT; ... FixedMul(SKULLSPEED,
+    /// finecosine[an])` idiom, `S_StartSound(actor, ..)`, `actor->flags |=
+    /// MF_SKULLFLY;`) reuses machinery already proven by `A_FatAttack1`/
+    /// `A_Pain`/`A_FaceTarget` with no changes. Signature: `needs_target_
+    /// deref` alone (the `dest` alias chain) -- no self-removal, no spawned
+    /// mobj, so `thinkers: &Arena<Thinker>` (read-only), matching
+    /// `A_FaceTarget`'s own signature shape exactly.
+    #[test]
+    fn test_a_skull_attack_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("angle", "u32"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("z", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SkullAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SkullAttack(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             let mut dest;\n    \
+             let mut an;\n    \
+             let mut dist;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             dest = actor.target;\n    \
+             actor.flags |= MF_SKULLFLY;\n    \
+             S_StartSound(actor, actor.info.attacksound);\n    \
+             A_FaceTarget(actor);\n    \
+             an = actor.angle >> ANGLETOFINESHIFT;\n    \
+             actor.momx = FixedMul(SKULLSPEED, finecosine[an as usize]);\n    \
+             actor.momy = FixedMul(SKULLSPEED, finesine[an as usize]);\n    \
+             dist = (P_AproxDistance(match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - actor.y)).0;\n    \
+             dist = dist / SKULLSPEED;\n    \
+             if dist < 1 {\n        \
+             dist = 1;\n    \
+             }\n    \
+             actor.momz = (match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + (match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.height, _ => unreachable!() } >> 1) - actor.z) / dist;\n\
+             }"
         );
     }
 

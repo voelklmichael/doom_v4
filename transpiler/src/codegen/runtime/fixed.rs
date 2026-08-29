@@ -39,7 +39,7 @@
 //! two *do* rescale by `FRACUNIT` (true fixed-point multiply/divide)
 //! and mixing the two meanings under one name would be wrong.
 
-use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Mul, Neg, Shr, Sub, SubAssign};
 
 pub const FRACBITS: u32 = 16;
 pub const FRACUNIT: FixedT = FixedT(1 << FRACBITS);
@@ -161,6 +161,21 @@ impl Div<i32> for FixedT {
     }
 }
 
+/// `dest->height>>1`-style right shift directly on a `fixed_t` value
+/// (`A_SkullAttack`, halving a height while staying in the same
+/// fixed-point scale) -- a raw bit-shift of the representation, the same
+/// "thin wrapping-arithmetic pass-through" idea as every other operator
+/// here: shifting a fixed-point number right by `n` divides it by `2^n`
+/// while preserving its `FRACUNIT` scale exactly (unlike `Div<i32>`,
+/// which is also scale-preserving but via true division rather than a
+/// bit shift), so the result stays a `FixedT`, not a plain `i32`.
+impl Shr<i32> for FixedT {
+    type Output = FixedT;
+    fn shr(self, rhs: i32) -> FixedT {
+        FixedT(self.0 >> rhs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +279,15 @@ mod tests {
         // real corpus, so both need to agree.
         assert_eq!(FRACUNIT + 2048, 2048 + FRACUNIT);
         assert_eq!(FRACUNIT + 2048, FixedT(FRACUNIT.0 + 2048));
+    }
+
+    #[test]
+    fn test_fixed_shr_by_one_halves_while_staying_fixed_point() {
+        // `dest->height>>1` (`A_SkullAttack`) -- a raw bit-shift of the
+        // representation, staying `FixedT` (unlike `Div<i32>`, which is
+        // also scale-preserving but via true division).
+        let height = FixedT(56 * FRACUNIT.0);
+        assert_eq!(height >> 1, FixedT(height.0 >> 1));
+        assert_eq!(height >> 1, FixedT(28 * FRACUNIT.0));
     }
 }
