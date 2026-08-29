@@ -640,6 +640,19 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Member { field, .. } if field == "specialdata" => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
+        // `if (twoSided (secnum, i))` -- `EV_DoFloor`'s own adjacency scan,
+        // the first bare (non-negated) *call result* used for truthiness
+        // rather than a comparison/field. `twoSided` genuinely returns a
+        // plain C `int` (a bitmasked flag, `flags & ML_TWOSIDED`, `p_spec.c`),
+        // so this is ordinary `int` truthiness, not `Option`-valued like
+        // `specialdata` above -- narrowly matched by name (this codebase's
+        // usual style) rather than a general "any call is int-valued"
+        // fallback, since a differently-shaped callee could just as easily
+        // return something `Option`-valued the way `thing->player` already
+        // does elsewhere.
+        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "twoSided") => {
+            Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
+        }
         _ => Err(format!(
             "render_bool_expr: unsupported condition shape: {cond:?}"
         )),
@@ -4233,6 +4246,91 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
                 "i = 0;".to_string(),
                 "while i < world[sec].linecount {".to_string(),
                 "    i += 1;".to_string(),
+                "}".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s third piece: `raiseToTexture`'s adjacency scan,
+    /// `if (twoSided (secnum, i)) { side = getSide(secnum,i,0); ... }` --
+    /// `p_spec.c`'s `twoSided`/`getSide`/`getSector` helpers, real corpus
+    /// functions (not macros) over the same sector/line/side adjacency
+    /// used already-translated corpus-wide (`sides[i].sector`), not yet
+    /// modeled at all before this. `twoSided` genuinely returns a plain
+    /// `int`, used here as a bare (non-negated) call-result condition for
+    /// the first time -- needs `render_bool_expr`'s new `twoSided` arm.
+    /// `getSide` returns `side_t*` -> `SideId` under the existing memory-
+    /// model decision, exactly like `sec: sector_t*` already does, so
+    /// `side = getSide(...)` and a later `side->field` need no new code at
+    /// all once the caller supplies `side`'s own declared type via
+    /// `extra_cross_ref_idents` -- the same generic mechanism `sec`
+    /// already exercises. Clones the real `cond` plus the real first
+    /// statement of the real `then_branch` (`side = getSide(secnum,i,0);`)
+    /// out of `EV_DoFloor`'s own parsed AST, re-wrapped around a synthetic
+    /// one-statement body -- the rest of that `if`'s body still depends on
+    /// `textureheight[...]` (not modeled yet, tracked separately in
+    /// docs/03_TRANSPILER.md), so it's deliberately left out here.
+    #[test]
+    fn test_two_sided_adjacency_scan_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_two_sided_if = |s: &Stmt| {
+            matches!(s, Stmt::If { cond: Expr::Call { callee, .. }, .. }
+                if matches!(callee.as_ref(), Expr::Ident(n) if n == "twoSided"))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_two_sided_if),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected an `if (twoSided(..))` statement somewhere in EV_DoFloor");
+        let Stmt::If {
+            cond, then_branch, ..
+        } = stmt
+        else {
+            unreachable!("guarded by is_two_sided_if")
+        };
+        let Stmt::Compound(then_body) = then_branch.as_ref() else {
+            panic!("expected the `if (twoSided(..))` body to be a compound statement");
+        };
+        let first_stmt = then_body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => Some(s),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected at least one statement in the `if (twoSided(..))` body");
+
+        let synthetic = Stmt::If {
+            cond: cond.clone(),
+            then_branch: Box::new(Stmt::Compound(crate::parser::ast::CompoundStmt {
+                items: vec![BlockItem::Stmt(first_stmt.clone())],
+            })),
+            else_branch: None,
+        };
+
+        let extra_cross_refs = field_types(&[("side", "SideId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "if twoSided(secnum, i) != 0 {".to_string(),
+                "    side = getSide(secnum, i, 0);".to_string(),
                 "}".to_string(),
             ]
         );
