@@ -169,6 +169,27 @@ struct FnBodyContext<'a> {
     /// triggers, and every isolated-fragment test below never exercise
     /// this shape).
     plain_int_locals: &'a HashSet<String>,
+    /// Set only while rendering the RHS of a write to one field of a
+    /// `Handle<Thinker>`-typed local (the `P_SpawnMobj`-local write arm
+    /// in `render_expr_stmt`) -- the name of that same local, if any
+    /// (`"mo"` for `mo->momx = FixedMul(mo->info->speed, ...)`). A
+    /// further `Member` read through *this exact* name inside that RHS
+    /// (`mo->info`, a *different* field of the same handle) then resolves
+    /// to `m.info` directly, reusing the write's own already-bound match
+    /// variable, instead of a second independent `thinkers.get(mo)` call
+    /// -- confirmed necessary (not hypothetical) while investigating
+    /// `A_FatAttack1`: the write's own `if let Some(Thinker::Mobj(m)) =
+    /// thinkers.get_mut(mo) { .. }` already holds `thinkers` mutably
+    /// borrowed for the whole block, so a second, independent `thinkers.
+    /// get(mo)` for the RHS read would be a real second borrow of the
+    /// same value at the same time -- a genuine `rustc` rejection, not a
+    /// style choice, the same class of borrow conflict `mutating_handle`
+    /// was already designed around for a *different* (multi-statement)
+    /// shape. `None` everywhere else, including inside `mutating_handle`'s
+    /// own block (an unrelated mechanism for a different real corpus
+    /// idiom) and every isolated-fragment test below that doesn't
+    /// exercise this shape.
+    same_handle_write: Option<&'a str>,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -380,6 +401,20 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 ),
                 false,
             ))
+        }
+        // `mo->info` read inside the RHS of a write to a *different*
+        // field of that same `mo` (`mo->momx = FixedMul(mo->info->speed,
+        // ..);`, `A_FatAttack1`'s own idiom) -- reuses the write's own
+        // already-bound `m` (`ctx.same_handle_write`, set only while
+        // rendering that one RHS) instead of a second, independent
+        // `thinkers.get(mo)` call, which would be a genuine second borrow
+        // of `thinkers` while the write's own `thinkers.get_mut(mo)` is
+        // still live -- see `FnBodyContext::same_handle_write`'s own doc
+        // comment for why this isn't just a style choice. Checked before
+        // the general `Handle<Thinker>` arm just below so a same-handle
+        // read never takes that arm's fresh-lookup path by mistake.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if ctx.same_handle_write == Some(n.as_str())) => {
+            Ok((format!("m.{}", rust_field_name(field)?), false))
         }
         // `th->field` (any field, not just `player`) -- `th`'s own
         // declared type is `Handle<Thinker>`, the same "live thinker
@@ -1681,6 +1716,24 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
             op: UnaryOp::Minus,
             expr,
         } => expr_is_fixed_t_valued(expr, ctx),
+        // `FixedMul(mo->info->speed, finecosine[an]);` (`A_FatAttack1`'s
+        // own idiom, written straight into a spawned mobj's `momx`) --
+        // `FixedMul`/`FixedDiv`/`FixedDiv2`'s own real declared C return
+        // type is `fixed_t` (`m_fixed.h`, confirmed by direct read, not
+        // assumed), matching `runtime/fixed.rs`'s already-implemented
+        // `fixed_mul`/`fixed_div`/`fixed_div2` methods this module's
+        // eventual translation of those functions would call into -- so
+        // a bare call to one of them is already `FixedT`-valued and must
+        // *not* additionally get wrapped in `FixedT(..)` (that would try
+        // to build a `FixedT` from a `FixedT` argument, a real `rustc`
+        // rejection this exact double-wrap was caught producing before
+        // this arm existed). Scoped to these three names, this module's
+        // usual "hand-match the one real callee" style, not a general
+        // "assume every unmodeled call is `FixedT`" fallback (most
+        // calls, like `P_Random()`, genuinely aren't).
+        Expr::Call { callee, .. } => {
+            matches!(callee.as_ref(), Expr::Ident(n) if n == "FixedMul" || n == "FixedDiv" || n == "FixedDiv2")
+        }
         _ => false,
     }
 }
@@ -1781,15 +1834,25 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 .get(lhs_field.as_str())
                 .map(String::as_str)
                 == Some("FixedT");
+            // `mo->momx = FixedMul(mo->info->speed, ..);` (`A_FatAttack1`)
+            // -- the RHS can itself read a *different* field of this same
+            // `mo`, which must resolve to the write's own already-bound
+            // `m` rather than a second, independent `thinkers.get(mo)`
+            // call (a real borrow conflict with the `get_mut` below --
+            // see `FnBodyContext::same_handle_write`'s own doc comment).
+            let rhs_ctx = FnBodyContext {
+                same_handle_write: Some(name.as_str()),
+                ..*ctx
+            };
             let rhs_text = if is_option_handle_field && rhs_is_self {
                 "Some(handle)".to_string()
             } else if *op == AssignOp::Assign
                 && is_fixed_t_field
-                && !expr_is_fixed_t_valued(rhs, ctx)
+                && !expr_is_fixed_t_valued(rhs, &rhs_ctx)
             {
-                format!("FixedT({})", render_expr(rhs, ctx)?.0)
+                format!("FixedT({})", render_expr(rhs, &rhs_ctx)?.0)
             } else {
-                render_expr(rhs, ctx)?.0
+                render_expr(rhs, &rhs_ctx)?.0
             };
             return Ok(format!(
                 "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({name}) {{ m.{field} {} {rhs_text}; }}",
@@ -2067,6 +2130,7 @@ fn render_fn_impl(
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
         mutating_handle: None,
+        same_handle_write: None,
         plain_int_locals: &plain_int_locals,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -2187,6 +2251,7 @@ pub fn render_weapon_fn(
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
         mutating_handle: None,
+        same_handle_write: None,
         plain_int_locals: &HashSet::new(),
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -2390,18 +2455,22 @@ fn collect_target_tracer_aliases_stmt(
     }
 }
 
-/// Locals directly assigned from a fresh `P_SpawnMobj(...)` call (`th =
-/// P_SpawnMobj(...);`, `A_Tracer`'s/`A_VileTarget`'s own idiom) --
-/// registers each such local as `"Handle<Thinker>"`-typed (bare, not
-/// `Option`-wrapped: no real corpus call site ever null-checks a
-/// `P_SpawnMobj` result, unlike `target`/`tracer`/`specialdata`), into
-/// the same `extra_cross_ref_idents` map shape `collect_target_tracer_
-/// aliases` already produces -- lets a later `th->field` read/write
-/// resolve through a real `Arena` lookup (`render_expr`'s and
-/// `render_expr_stmt`'s own generalized `Handle<Thinker>`-base arms).
-/// `P_SpawnMobj` itself is not translated (a forward-reference stub,
-/// same as `S_StartSound`/`P_Random` elsewhere in this module) -- only
-/// its *call site's return value* needs a real type here.
+/// Locals directly assigned from a fresh `P_SpawnMobj(...)`/
+/// `P_SpawnMissile(...)` call (`th = P_SpawnMobj(...);`, `A_Tracer`'s/
+/// `A_VileTarget`'s own idiom; `mo = P_SpawnMissile(...);`,
+/// `A_FatAttack1`'s own idiom -- both real corpus functions declared
+/// `mobj_t*`-returning, confirmed by direct read, so the identical
+/// treatment applies to either name) -- registers each such local as
+/// `"Handle<Thinker>"`-typed (bare, not `Option`-wrapped: no real corpus
+/// call site ever null-checks either result, unlike `target`/`tracer`/
+/// `specialdata`), into the same `extra_cross_ref_idents` map shape
+/// `collect_target_tracer_aliases` already produces -- lets a later
+/// `th->field` read/write resolve through a real `Arena` lookup
+/// (`render_expr`'s and `render_expr_stmt`'s own generalized
+/// `Handle<Thinker>`-base arms). Neither `P_SpawnMobj` nor
+/// `P_SpawnMissile` is itself translated (both stay forward-reference
+/// stubs, same as `S_StartSound`/`P_Random` elsewhere in this module) --
+/// only each call site's own return value needs a real type here.
 fn collect_spawn_mobj_locals(items: &[BlockItem]) -> HashMap<String, String> {
     let mut locals = HashMap::new();
     collect_spawn_mobj_locals_in(items, &mut locals);
@@ -2417,13 +2486,18 @@ fn collect_spawn_mobj_locals_in(items: &[BlockItem], locals: &mut HashMap<String
 }
 
 fn collect_spawn_mobj_locals_stmt(s: &Stmt, locals: &mut HashMap<String, String>) {
+    // `mo = P_SpawnMissile(actor, actor->target, MT_FATSHOT);`
+    // (`A_FatAttack1`/`A_FatAttack2`/`A_FatAttack3`, `A_SkelMissile`) --
+    // `P_SpawnMissile`'s own real declared return type (`p_mobj.c`) is
+    // `mobj_t*`, the identical shape `P_SpawnMobj` already gets this
+    // exact treatment for, confirmed by direct read rather than assumed.
     if let Stmt::Expr(Some(Expr::Assign {
         op: AssignOp::Assign,
         lhs,
         rhs,
     })) = s
         && let Expr::Ident(name) = lhs.as_ref()
-        && matches!(rhs.as_ref(), Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_SpawnMobj"))
+        && matches!(rhs.as_ref(), Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_SpawnMobj" || n == "P_SpawnMissile"))
     {
         locals.insert(name.clone(), "Handle<Thinker>".to_string());
     }
@@ -3032,6 +3106,7 @@ pub fn render_spawn_fn(
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
         mutating_handle: None,
+        same_handle_write: None,
         plain_int_locals: &HashSet::new(),
     };
     let no_field_defaults = HashMap::new();
@@ -3384,6 +3459,7 @@ pub fn render_trigger_fn(
         ctor_field_types: &HashMap::new(),
         embedded_ctor,
         mutating_handle: None,
+        same_handle_write: None,
         plain_int_locals: &HashSet::new(),
     };
 
@@ -4097,6 +4173,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
@@ -4182,6 +4259,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -4227,6 +4305,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -4293,6 +4372,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
@@ -4373,6 +4453,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
@@ -5521,6 +5602,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -5582,6 +5664,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
@@ -5669,6 +5752,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
@@ -5736,6 +5820,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
@@ -5804,6 +5889,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
@@ -5877,6 +5963,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            same_handle_write: None,
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
@@ -7196,6 +7283,58 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              actor.y = match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } + FixedMul(24 * FRACUNIT, finesine[an as usize]);\n    \
              actor.z = match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() };\n    \
              P_SetThingPosition(actor);\n\
+             }"
+        );
+    }
+
+    /// `A_FatAttack1` -- the function that motivated `collect_spawn_mobj_
+    /// locals`'s own generalization to `P_SpawnMissile` (not just
+    /// `P_SpawnMobj`, confirmed identical `mobj_t*`-returning shape by
+    /// reading `p_mobj.c` directly) and `FnBodyContext::same_handle_
+    /// write`'s new same-handle-RHS-read mechanism: `mo->momx = FixedMul
+    /// (mo->info->speed, finecosine[an]);` writes one field of the
+    /// freshly-spawned `mo` while its own RHS reads a *different* field
+    /// (`mo->info`) of that same handle -- the read resolves to the
+    /// write's own already-bound `m.info`, not a second, conflicting
+    /// `thinkers.get(mo)` borrow. Also confirms `expr_is_fixed_t_valued`'s
+    /// new `FixedMul`/`FixedDiv`/`FixedDiv2` recognition: without it,
+    /// `momx`'s own `FixedT`-field write would have wrongly double-wrapped
+    /// an already-`FixedT`-valued `FixedMul(..)` result in another
+    /// `FixedT(..)`, a real `rustc` rejection caught while designing this
+    /// (not shipped). The leading bare `P_SpawnMissile(actor, actor->
+    /// target, MT_FATSHOT);` (no assignment, deliberately discarding its
+    /// own return value -- confirmed a real corpus idiom, not a typo, by
+    /// reading the surrounding lines) renders through the already-generic
+    /// bare-call-statement path with no special casing at all.
+    #[test]
+    fn test_a_fat_attack1_renders_exactly() {
+        let field_types = field_types(&[
+            ("angle", "u32"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_FatAttack1",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FatAttack1(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut mo;\n    \
+             let mut an;\n    \
+             A_FaceTarget(actor);\n    \
+             actor.angle += (FATSPREAD) as u32;\n    \
+             P_SpawnMissile(actor, actor.target, MT_FATSHOT);\n    \
+             mo = P_SpawnMissile(actor, actor.target, MT_FATSHOT);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.angle += FATSPREAD; };\n    \
+             an = match thinkers.get(mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } >> ANGLETOFINESHIFT;\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momx = FixedMul(m.info.speed, finecosine[an as usize]); };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momy = FixedMul(m.info.speed, finesine[an as usize]); };\n\
              }"
         );
     }
