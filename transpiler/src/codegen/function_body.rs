@@ -7197,6 +7197,133 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         );
     }
 
+    /// `A_Lower`/`A_Raise`/`A_GunFlash`/`A_FireMissile`/`A_FireBFG`/
+    /// `A_FirePlasma` (`p_pspr.c`) -- six more `render_weapon_fn` bodies,
+    /// all rendering correctly through already-existing machinery with no
+    /// new capability: `psp->sy`/`weaponinfo[player->readyweapon].field`
+    /// both compose for free out of pieces this module already has --
+    /// `psp` (an ordinary, unregistered second parameter) falls through
+    /// the generic `Expr::Member` case exactly like `player->mo` already
+    /// does; `weaponinfo[..]` is a plain, unregistered global array (no
+    /// `World`/cross-ref wrapping needed, unlike `sectors`/`sides`), so
+    /// indexing it and then reading a further field off the result is
+    /// just two ordinary, already-generic `Expr::Index`/`Expr::Member`
+    /// steps stacked -- the existing `as usize` cast (triggered whenever
+    /// an index expression is itself an `Expr::Member`) already fires
+    /// correctly for `player->readyweapon` used as an index into it.
+    /// `player->ammo[weaponinfo[player->readyweapon].ammo]--;` is the
+    /// first real corpus use of the generic standalone `PostIncDec`
+    /// statement arm against a doubly-nested index chain rather than a
+    /// bare identifier. **Deliberately not attempted alongside these**:
+    /// `A_FirePistol`/`A_FireShotgun`/`A_FireCGun` all pass `!player->
+    /// refire` (negating a plain, non-`bool` `int` field) directly as a
+    /// bare function-call *argument* -- a third context beyond the two
+    /// this renderer already has truthiness-aware negation for (a
+    /// top-level `if` condition, via `render_bool_expr`; a `&&`/`||`
+    /// chain operand, via `render_binary_operand`) -- so today it would
+    /// silently render as Rust's bitwise `!` on an `i32` (wrong) rather
+    /// than `== 0`, the same trap already documented and deliberately
+    /// left alone elsewhere in this module. Left for a future increment
+    /// once a real need justifies generalizing negation to call-argument
+    /// position, rather than guessed at here.
+    #[test]
+    fn test_a_lower_renders_exactly() {
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Lower", &HashMap::new())
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Lower(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             psp.sy += LOWERSPEED;\n    \
+             if psp.sy < WEAPONBOTTOM {\n        \
+             return;\n    \
+             }\n    \
+             if player.playerstate == PST_DEAD {\n        \
+             psp.sy = WEAPONBOTTOM;\n        \
+             return;\n    \
+             }\n    \
+             if player.health == 0 {\n        \
+             P_SetPsprite(player, ps_weapon, S_NULL);\n        \
+             return;\n    \
+             }\n    \
+             player.readyweapon = player.pendingweapon;\n    \
+             P_BringUpWeapon(player);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_raise_renders_exactly() {
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Raise", &HashMap::new())
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Raise(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             let mut newstate;\n    \
+             psp.sy -= RAISESPEED;\n    \
+             if psp.sy > WEAPONTOP {\n        \
+             return;\n    \
+             }\n    \
+             psp.sy = WEAPONTOP;\n    \
+             newstate = weaponinfo[player.readyweapon as usize].readystate;\n    \
+             P_SetPsprite(player, ps_weapon, newstate);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_gun_flash_renders_exactly() {
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_GunFlash", &HashMap::new())
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_GunFlash(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_fire_missile_renders_exactly() {
+        let rendered =
+            render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireMissile", &HashMap::new())
+                .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FireMissile(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
+             P_SpawnPlayerMissile(player.mo, MT_ROCKET);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_fire_bfg_renders_exactly() {
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireBFG", &HashMap::new())
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FireBFG(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= BFGCELLS;\n    \
+             P_SpawnPlayerMissile(player.mo, MT_BFG);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_fire_plasma_renders_exactly() {
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FirePlasma", &HashMap::new())
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FirePlasma(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + (P_Random() & 1));\n    \
+             P_SpawnPlayerMissile(player.mo, MT_PLASMA);\n\
+             }"
+        );
+    }
+
     /// `A_BrainScream` -- `A_BrainExplode`'s own already-translated
     /// idiom (spawn a rocket-shaped mobj, give it a random downward tics
     /// countdown clamped to at least 1) repeated across a horizontal
