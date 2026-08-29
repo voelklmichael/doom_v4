@@ -53,7 +53,7 @@
 use crate::codegen::struct_fields::rust_field_name;
 use crate::parser::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, ForInit,
-    FunctionDef, IncDecOp, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
+    FunctionDef, IncDecOp, Initializer, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
 };
 use crate::parser::grammar::declarator_name;
 use crate::parser::parse_full;
@@ -790,9 +790,21 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
     // to.
     let mut lines = Vec::new();
     for decl in &d.declarators {
-        if decl.initializer.is_some() {
-            return Err("render_decl: an initializer is not supported so far".to_string());
-        }
+        // `int minsize = MAXINT;` (`EV_DoFloor`'s own `raiseToTexture`
+        // case) -- a plain expression initializer, rendered inline on the
+        // same `let mut` this renderer already always uses for a
+        // deferred-inference local (unconditionally `mut`, the same as
+        // every uninitialized decl below, rather than analyzing whether
+        // this particular one is ever reassigned).
+        let init_text = match &decl.initializer {
+            None => String::new(),
+            Some(Initializer::Expr(e)) => format!(" = {}", render_expr(e, ctx)?.0),
+            Some(Initializer::List(_)) => {
+                return Err(
+                    "render_decl: a brace-list initializer is not supported so far".to_string(),
+                );
+            }
+        };
         if !matches!(decl.declarator.direct, DirectDeclarator::Ident(_)) {
             return Err(
                 "render_decl: only a plain (non-array, non-function) declarator is supported so far"
@@ -815,7 +827,7 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         {
             continue;
         }
-        lines.push(format!("{}let mut {name};", indent(depth)));
+        lines.push(format!("{}let mut {name}{init_text};", indent(depth)));
     }
     Ok(lines)
 }
@@ -979,6 +991,18 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             }
             Ok(lines)
         }
+        // A `case`'s own body wrapped in real braces (`case raiseToTexture:
+        // { int minsize = MAXINT; side_t* side; ... } break;`, `EV_DoFloor`'s
+        // own `p_floor.c`) parses as one bare `Stmt::Compound`, unlike
+        // every other case in the same `switch` (flat, brace-less
+        // siblings) -- `render_switch` hands each arm's own statements to
+        // `render_stmt` directly, so this needed the same dispatch
+        // `render_block` already has for a `Compound`, just reachable as
+        // an ordinary statement rather than only an `if`/`while` body.
+        // Rust's own `match` arm already provides equivalent block
+        // scoping for `minsize`/`side`, so the case's extra braces need
+        // no separate nesting of their own here.
+        Stmt::Compound(c) => render_compound_items(&c.items, ctx, depth),
         Stmt::Switch { cond, body } => render_switch(cond, body, ctx, depth),
         Stmt::While { cond, body } => render_while(cond, body, ctx, depth),
         Stmt::For {
@@ -4600,6 +4624,78 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
                 "    }".to_string(),
                 "}".to_string(),
             ]
+        );
+    }
+
+    /// Attempting `EV_DoFloor`'s full end-to-end assembly (via
+    /// `render_trigger_fn`, the same integration point `EV_DoCeiling`/
+    /// `EV_DoDoor`/`EV_DoPlat` already went through) surfaces a genuine
+    /// latent bug in the original C, the same class already documented
+    /// for `P_SpawnDoorCloseIn30`: `floor->newspecial` is *only* ever set
+    /// deep inside the `lowerAndChange` case's own `for` loop, inside an
+    /// `if (sec->floorheight == floor->floordestheight)` that isn't
+    /// guaranteed to match any adjacent sector -- unlike `floor->texture`
+    /// (also refined there, but *first* given an unconditional value
+    /// right before the loop, `floor->texture = sec->floorpic;`).
+    /// `T_MoveFloor` (already translated, `p_floor.c`) reads
+    /// `floor->newspecial` unconditionally once a `lowerAndChange` floor
+    /// reaches `pastdest`, regardless of whether that `for` loop ever
+    /// found a match -- so a `lowerAndChange` floor whose sector has no
+    /// two-sided neighbor at exactly its own destination height reads
+    /// genuinely uninitialized `Z_Malloc` memory in the real original
+    /// game, real reachable UB (confirmed by tracing the real call sites
+    /// of both functions, not assumed). Since there's no well-defined C
+    /// value to be faithful *to* here, `render_ctor_body`'s rejection is
+    /// the correct, honest answer, not a gap to route around with a
+    /// fabricated default -- unlike this test's *other* four switch-only
+    /// fields (`direction`/`sector`/`speed`/`floordestheight`), which
+    /// really are set by every one of `floor_e`'s 12 real call-site
+    /// values across the whole corpus (grepped directly, not assumed);
+    /// only the 13th variant, `donutRaise`, would reach the switch's own
+    /// empty `default:` arm unset, and `EV_DoFloor` is never actually
+    /// called with it anywhere in the corpus -- provably dead code, the
+    /// same "never observed" reasoning already used for `EV_DoCeiling`'s
+    /// own `Ceiling.olddirection`, so those four get real placeholder
+    /// defaults instead.
+    #[test]
+    fn test_ev_do_floor_detects_missing_newspecial_default() {
+        let params = field_types(&[("line", "LineId"), ("floortype", "i32")]);
+        let locals = field_types(&[("sec", "SectorId")]);
+        let ctor_field_types = field_types(&[
+            ("r#type", "i32"),
+            ("crush", "bool"),
+            ("sector", "SectorId"),
+            ("direction", "i32"),
+            ("newspecial", "i32"),
+            ("texture", "i16"),
+            ("floordestheight", "FixedT"),
+            ("speed", "FixedT"),
+        ]);
+        let field_defaults = field_types(&[
+            ("direction", "0"),
+            ("sector", "sec"),
+            ("speed", "FLOORSPEED"),
+            ("floordestheight", "world[sec].floorheight"),
+            ("texture", "world[sec].floorpic"),
+        ]);
+        let err = render_trigger_fn(
+            &corpus_dir(),
+            "p_floor.c",
+            "EV_DoFloor",
+            &params,
+            &locals,
+            Some(CtorSpec {
+                ctor_var: "floor",
+                ctor_rust_type: "FloorMove",
+                ctor_field_types: &ctor_field_types,
+                field_defaults: &field_defaults,
+            }),
+            Some("i32"),
+        )
+        .expect_err("newspecial should be detected as missing a safe default");
+        assert!(
+            err.contains("newspecial"),
+            "expected `newspecial` in: {err}"
         );
     }
 }
