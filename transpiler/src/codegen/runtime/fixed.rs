@@ -24,8 +24,22 @@
 //! Plain arithmetic (`Add`/`Sub`/`Neg`) wraps rather than panics on
 //! overflow, matching the original's C `int` semantics (two's-complement
 //! wraparound in practice) rather than Rust's own debug-mode default.
+//!
+//! `Mul<FixedT>`/`Mul<i32>`/`Div<i32>` (plain scalar, not the rescaling
+//! `fixed_mul`/`fixed_div`) and `AddAssign`/`SubAssign` are new,
+//! genuinely-corpus-needed additions (`A_Tracer`, `p_enemy.c`): C's
+//! `fixed_t` is a bare `typedef int`, so an idiom like `40*FRACUNIT`
+//! (constructing a fixed value from a plain scale factor) or `dist /
+//! actor->info->speed` (a `fixed_t` divided by a plain `int`, e.g. to
+//! turn a distance into a tic count) or `actor->momz -= FRACUNIT/8`
+//! never goes through `FixedDiv`/`FixedMul` at all in the original --
+//! it's just raw `int` arithmetic on the representation, exactly what
+//! `Add`/`Sub`/`Neg` already model for `+`/`-`/unary `-`. Kept as their
+//! own operators, not folded into `fixed_mul`/`fixed_div`, since those
+//! two *do* rescale by `FRACUNIT` (true fixed-point multiply/divide)
+//! and mixing the two meanings under one name would be wrong.
 
-use std::ops::{Add, Neg, Sub};
+use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 
 pub const FRACBITS: u32 = 16;
 pub const FRACUNIT: FixedT = FixedT(1 << FRACBITS);
@@ -81,6 +95,69 @@ impl Neg for FixedT {
     type Output = FixedT;
     fn neg(self) -> FixedT {
         FixedT(self.0.wrapping_neg())
+    }
+}
+
+impl AddAssign for FixedT {
+    fn add_assign(&mut self, rhs: FixedT) {
+        self.0 = self.0.wrapping_add(rhs.0);
+    }
+}
+
+impl SubAssign for FixedT {
+    fn sub_assign(&mut self, rhs: FixedT) {
+        self.0 = self.0.wrapping_sub(rhs.0);
+    }
+}
+
+/// `mo->x + (P_Random()-P_Random())*2048`/`128 + P_Random()*2*FRACUNIT`
+/// (`A_BrainExplode`) -- a `fixed_t` field offset by a plain scaled
+/// `int` (or the reverse order), the same "no rescaling, just raw
+/// representation arithmetic" idiom `Mul<i32>`/`Div<i32>` below already
+/// cover for `*`/`/`; needed in both operand orders since the real
+/// corpus uses both (`x = mo->x + ...` puts the `FixedT` first, `z =
+/// 128 + ...` puts the plain `int` first).
+impl Add<i32> for FixedT {
+    type Output = FixedT;
+    fn add(self, rhs: i32) -> FixedT {
+        FixedT(self.0.wrapping_add(rhs))
+    }
+}
+
+impl Add<FixedT> for i32 {
+    type Output = FixedT;
+    fn add(self, rhs: FixedT) -> FixedT {
+        FixedT(self.wrapping_add(rhs.0))
+    }
+}
+
+/// `40*FRACUNIT`-style construction (a plain scale factor times
+/// `FRACUNIT`, or any other `FixedT` constant/value) -- raw `i32`
+/// multiply of the representation, matching what C's `int*int` really
+/// computes here (no `FRACUNIT`-rescaling `fixed_mul` involved).
+impl Mul<FixedT> for i32 {
+    type Output = FixedT;
+    fn mul(self, rhs: FixedT) -> FixedT {
+        FixedT(self.wrapping_mul(rhs.0))
+    }
+}
+
+impl Mul<i32> for FixedT {
+    type Output = FixedT;
+    fn mul(self, rhs: i32) -> FixedT {
+        FixedT(self.0.wrapping_mul(rhs))
+    }
+}
+
+/// `dist / actor->info->speed`-style division by a plain scalar `int`
+/// (not another `fixed_t`) -- raw `i32` division of the representation,
+/// matching what C's `int/int` really computes (the rescaling
+/// `fixed_div`/`FixedDiv` is a distinct, explicitly-named operation for
+/// dividing one `fixed_t` by another).
+impl Div<i32> for FixedT {
+    type Output = FixedT;
+    fn div(self, rhs: i32) -> FixedT {
+        FixedT(self.0 / rhs)
     }
 }
 
@@ -150,5 +227,42 @@ mod tests {
     #[test]
     fn test_neg_matches_c_unary_minus() {
         assert_eq!(-FixedT(5 * FRACUNIT.0), FixedT(-5 * FRACUNIT.0));
+    }
+
+    #[test]
+    fn test_add_assign_sub_assign_match_add_sub() {
+        let mut x = FixedT(3 * FRACUNIT.0);
+        x += FixedT(FRACUNIT.0);
+        assert_eq!(x, FixedT(4 * FRACUNIT.0));
+        x -= FixedT(FRACUNIT.0);
+        assert_eq!(x, FixedT(3 * FRACUNIT.0));
+    }
+
+    #[test]
+    fn test_int_times_fixed_matches_40_times_fracunit_idiom() {
+        // `40*FRACUNIT` (`A_Tracer`'s own `dest->z+40*FRACUNIT`) -- a
+        // plain scale factor times FRACUNIT, not a rescaling fixed_mul.
+        assert_eq!(40 * FRACUNIT, FixedT(40 * FRACUNIT.0));
+    }
+
+    #[test]
+    fn test_fixed_times_int_is_symmetric_with_int_times_fixed() {
+        assert_eq!(FRACUNIT * 8, 8 * FRACUNIT);
+    }
+
+    #[test]
+    fn test_fixed_div_by_plain_int_is_raw_division() {
+        // `FRACUNIT/8` (`A_Tracer`'s own `actor->momz -= FRACUNIT/8`) --
+        // raw division of the representation, not FixedDiv's rescaling.
+        assert_eq!(FRACUNIT / 8, FixedT(FRACUNIT.0 / 8));
+    }
+
+    #[test]
+    fn test_fixed_plus_int_is_symmetric_with_int_plus_fixed() {
+        // `A_BrainExplode`'s own `mo->x + (...)*2048` and `128 +
+        // P_Random()*2*FRACUNIT` -- both operand orders appear in the
+        // real corpus, so both need to agree.
+        assert_eq!(FRACUNIT + 2048, 2048 + FRACUNIT);
+        assert_eq!(FRACUNIT + 2048, FixedT(FRACUNIT.0 + 2048));
     }
 }

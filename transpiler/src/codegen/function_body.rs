@@ -381,6 +381,33 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `th->field` (any field, not just `player`) -- `th`'s own
+        // declared type is `Handle<Thinker>`, the same "live thinker
+        // needing a real `Arena` lookup" shape `thing->player` above
+        // already covers, generalized to every field now that a second
+        // real caller needs it: `A_Tracer`'s own `th = P_SpawnMobj(...);
+        // th->momz = ...; th->tics -= ...;` (`collect_spawn_mobj_locals`
+        // registers `th` here the same way `thing`'s own parameter type
+        // is registered elsewhere). Unlike `thing->player`'s own `_ =>
+        // None` fallback (correct there since `.player` is itself
+        // `Option`-typed), this uses `_ => unreachable!()` -- corpus-
+        // checked safe the same way `door->field`/target-tracer
+        // dereferencing already are: every real `Handle<Thinker>`-typed
+        // local reaching this arm is either a `mobj_t*` parameter or a
+        // value fresh out of `P_SpawnMobj`, always the `Mobj` variant.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>")) =>
+        {
+            let Expr::Ident(name) = base.as_ref() else {
+                unreachable!("guarded above")
+            };
+            Ok((
+                format!(
+                    "match thinkers.get({name}) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
+                    rust_field_name(field)?
+                ),
+                false,
+            ))
+        }
         // `door->field` *read*, inside `render_existing_thinker_mutation`'s
         // own block (`ctx.mutating_handle` set) -- a fresh `thinkers.
         // get(..)` call at this exact point (not a hoisted `&` binding,
@@ -582,7 +609,18 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // type gets inferred as `usize` straight from this same
             // indexing use, needing no cast), a struct field's type is
             // already fixed elsewhere and can't retroactively change.
-            let index_text = if matches!(index.as_ref(), Expr::Member { .. }) {
+            // `finecosine`/`finesine` (`tables.h`) need the same cast even
+            // for a *plain* index identifier (`finecosine[exact]`,
+            // `A_Tracer`'s own idiom): unlike `sidenum[side^1]`'s fresh,
+            // single-purpose local, `exact` (`angle_t`/`u32`) is *also*
+            // used earlier in real `u32` arithmetic against `actor->angle`
+            // (`exact - actor->angle > 0x80000000`), so Rust can't freely
+            // infer it as `usize` here -- narrowly by-name, matching this
+            // module's usual "hand-match the one real array identifier"
+            // style (`sides`/`sectors`/`textureheight` above).
+            let index_text = if matches!(index.as_ref(), Expr::Member { .. })
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine")
+            {
                 format!("{index_text} as usize")
             } else {
                 index_text
@@ -1561,6 +1599,46 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
             if field == "thinker" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
 }
 
+/// Whether `e` is built entirely from a known real `FixedT` source
+/// (`FRACUNIT`, or a self-struct/`Handle<Thinker>`-local field
+/// registered `"FixedT"` -- both share `ctx.self_field_types`, since a
+/// `P_SpawnMobj` local is always the same `Mobj` shape `self_param` is)
+/// threaded through plain arithmetic (`+`/`-`/`*`/`/`/unary `-`).
+/// `false` for anything else -- a bare call (`P_Random()`), a plain
+/// integer literal, or arithmetic built purely from those. Drives one
+/// narrow gap `A_BrainExplode` surfaced: `th->momz = P_Random()*512;`
+/// assigns a *plain* `i32` value (no `FixedT` source anywhere in it)
+/// straight into a `FixedT` field -- valid, unremarkable C (`fixed_t`
+/// is a bare `typedef int`, so this is just an `int` written into
+/// another `int`), but Rust needs an explicit `FixedT(..)` wrap, the
+/// same "C silently reinterprets the bits, Rust needs it spelled out"
+/// idea as the already-established `angle_t`/plain-`int` cast pair.
+/// Conservative on purpose: a `false` result only means "not provably
+/// `FixedT`," not "definitely plain `int`," so this only ever adds a
+/// wrap, never removes information a caller's already-typed value
+/// needs.
+fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
+    match e {
+        Expr::Ident(n) => n == "FRACUNIT",
+        Expr::Member { base, field, .. } => {
+            let base_is_self_or_handle_local = matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                || matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
+            base_is_self_or_handle_local
+                && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT")
+        }
+        Expr::Binary {
+            op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+            lhs,
+            rhs,
+        } => expr_is_fixed_t_valued(lhs, ctx) || expr_is_fixed_t_valued(rhs, ctx),
+        Expr::Unary {
+            op: UnaryOp::Minus,
+            expr,
+        } => expr_is_fixed_t_valued(expr, ctx),
+        _ => false,
+    }
+}
+
 /// `Expr::Assign` is rendered here (not in `render_expr`) since Doom's
 /// tick functions only ever use it as a bare statement, never nested
 /// inside a larger expression -- confirmed for `T_FireFlicker`, not yet
@@ -1607,6 +1685,69 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             return Ok(format!(
                 "if let Some(Thinker::{}({})) = thinkers.get_mut({}) {{ {}.{field} = {rhs_text}; }}",
                 mh.rust_type, mh.var, mh.handle_expr, mh.var
+            ));
+        }
+        // `th->field = expr;` / `th->field -= expr;` -- writing a field of
+        // a `Handle<Thinker>`-typed local (`collect_spawn_mobj_locals`'s
+        // own `th = P_SpawnMobj(...);`, `A_Tracer`'s idiom), the write
+        // counterpart of the general read arm `render_expr`'s own
+        // `Member` handling gained for the same case. A fresh `thinkers.
+        // get_mut(..)` call at exactly this point, the same borrow-
+        // scoping reasoning as `mutating_handle`'s own write arm just
+        // above -- unlike that one, this also needs to support a
+        // *compound* op (`th->tics -= P_Random()&3;`, `A_Tracer`'s own
+        // countdown refinement, not just `EV_VerticalDoor`'s plain `=`),
+        // so it renders whatever real `AssignOp` the source used rather
+        // than hardcoding `=`. One more real wrinkle: `fog->target =
+        // actor;` (`A_VileTarget`'s own idiom) stores the function's
+        // *own* receiver as a value into the freshly-spawned mobj's
+        // `target` field -- `self_param` alone renders as a `&mut Mobj`,
+        // not the `Handle<Thinker>` this `Option<Handle<Thinker>>` field
+        // actually needs, so this narrow case (scoped to the two fields
+        // known `Option<Handle<Thinker>>`-typed on `Mobj`, mirroring
+        // `is_target_tracer_typed`'s own pair) substitutes the fixed
+        // `handle` name `render_fn_impl`'s own signature extension
+        // supplies whenever a body needs its receiver's own handle as a
+        // value (see `body_has_self_handle_value`).
+        if let Expr::Member {
+            base,
+            field: lhs_field,
+            ..
+        } = lhs.as_ref()
+            && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+        {
+            let Expr::Ident(name) = base.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let field = rust_field_name(lhs_field)?;
+            let is_option_handle_field = lhs_field == "target" || lhs_field == "tracer";
+            let rhs_is_self = matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param);
+            // `th->momz = P_Random()*512;` (`A_BrainExplode`) -- a plain
+            // `i32` expression (no `FixedT` source anywhere in it, see
+            // `expr_is_fixed_t_valued`'s own doc comment) assigned into a
+            // field this same `Mobj` shape's `self_field_types` registers
+            // `FixedT`, needing an explicit wrap the same way `angle_t`'s
+            // own bit-reinterpretation idiom already does elsewhere.
+            // Scoped to a plain `=` only -- no real corpus example needs
+            // this through a compound op yet.
+            let is_fixed_t_field = ctx
+                .self_field_types
+                .get(lhs_field.as_str())
+                .map(String::as_str)
+                == Some("FixedT");
+            let rhs_text = if is_option_handle_field && rhs_is_self {
+                "Some(handle)".to_string()
+            } else if *op == AssignOp::Assign
+                && is_fixed_t_field
+                && !expr_is_fixed_t_valued(rhs, ctx)
+            {
+                format!("FixedT({})", render_expr(rhs, ctx)?.0)
+            } else {
+                render_expr(rhs, ctx)?.0
+            };
+            return Ok(format!(
+                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({name}) {{ m.{field} {} {rhs_text}; }}",
+                render_assign_op(*op)
             ));
         }
         let (lhs_text, _) = render_expr(lhs, ctx)?;
@@ -1662,9 +1803,26 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let lhs_is_u32_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
+        // `actor->tracer = fog;` (`A_VileTarget`'s own idiom) -- writing a
+        // bare `Handle<Thinker>`-typed local (`fog`, fresh out of
+        // `P_SpawnMobj`) straight into `self`'s own `target`/`tracer`
+        // field needs the same `Some(..)` wrap `specialdata`'s own
+        // constructor back-reference already gets above, generalized:
+        // unlike `specialdata` (this renderer's only other `Option<
+        // Handle<Thinker>>` field, keyed off `ctor_var_handle_name`
+        // specifically), `target`/`tracer` are looked up the ordinary
+        // way, via `self_field_types`, and the RHS is any local
+        // registered `"Handle<Thinker>"` in `extra_cross_ref_idents`, not
+        // just a constructor's own handle.
+        let lhs_is_target_or_tracer_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && (field == "target" || field == "tracer"));
+        let rhs_is_handle_local = matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
         let rhs_text = if lhs_is_specialdata && rhs_is_null {
             "None".to_string()
-        } else if lhs_is_specialdata && rhs_is_ctor_var {
+        } else if (lhs_is_specialdata && rhs_is_ctor_var)
+            || (lhs_is_target_or_tracer_self_field && rhs_is_handle_local)
+        {
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
             format!("{rhs_text} as i32")
@@ -1846,11 +2004,18 @@ fn render_fn_impl(
         .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
     let target_tracer_aliases =
         collect_target_tracer_aliases(&f.body.items, &param_name, self_field_types);
+    let spawn_mobj_locals = collect_spawn_mobj_locals(&f.body.items);
+    let mut extra_cross_ref_idents = target_tracer_aliases.clone();
+    extra_cross_ref_idents.extend(
+        spawn_mobj_locals
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &param_name,
         self_field_types,
-        extra_cross_ref_idents: &target_tracer_aliases,
+        extra_cross_ref_idents: &extra_cross_ref_idents,
         ctor_var: "",
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
@@ -1870,13 +2035,8 @@ fn render_fn_impl(
     // Same "measure, don't add speculatively" discipline as the self-
     // removal check just above: only a function that actually
     // dereferences *through* `target`/`tracer` (not just checks
-    // truthiness or passes it opaquely) gets the extra `thinkers: &Arena
-    // <Thinker>` read-only lookup parameter. Deliberately not combined
-    // with the self-removal case above (which would need a *mutable*
-    // `Arena<Thinker>` under a different parameter name) -- no real
-    // corpus function needs both at once yet, so which single `Arena`
-    // parameter name/mutability a function needing both should get is
-    // left undecided until real evidence exists, rather than guessed.
+    // truthiness or passes it opaquely) gets the extra `thinkers` read-
+    // only lookup parameter.
     let needs_self_removal = body_has_self_removal(&f.body.items, &param_name);
     let needs_target_deref = body_has_target_deref(
         &f.body.items,
@@ -1884,18 +2044,49 @@ fn render_fn_impl(
         self_field_types,
         &target_tracer_aliases,
     );
-    if needs_self_removal && needs_target_deref {
+    // A body that assigns a local from `P_SpawnMobj(...)` and then
+    // writes one of its fields (`A_Tracer`'s own `th->momz = ...;`)
+    // needs real *mutable* `Arena` access -- unlike `needs_target_deref`
+    // (read-only), this reuses the same `thinkers` parameter name but
+    // makes it `&mut Arena<Thinker>` instead, which still supports every
+    // `needs_target_deref` read site too (`&mut Arena` can always
+    // reborrow immutably for `.get(..)`), so the two compose for free
+    // when a function (like `A_Tracer`) needs both at once: one mutable
+    // `thinkers` parameter, not two conflicting ones. Every real
+    // `P_SpawnMobj` local found is assumed to need mutation -- narrower
+    // ("does it ever actually write a field") wasn't worth measuring
+    // separately, since every real caller so far does.
+    let needs_spawn_mut = !spawn_mobj_locals.is_empty();
+    // `fog->target = actor;` (`A_VileTarget`'s own idiom) needs the
+    // function's *own* receiver as a `Handle<Thinker>` *value* -- a
+    // genuinely different need from self-removal's own `handle` (that
+    // one also needs `arena.remove(handle)`; this one only ever reads
+    // `handle` as a plain value), so it reuses the same fixed `handle`
+    // parameter name without self-removal's own `arena` companion.
+    let needs_self_handle_value =
+        body_has_self_handle_value(&f.body.items, &param_name, &spawn_mobj_locals);
+    if needs_self_removal && (needs_target_deref || needs_spawn_mut || needs_self_handle_value) {
         return Err(format!(
-            "{fn_name}: needs both self-removal and target/tracer dereferencing -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
+            "{fn_name}: needs both self-removal and target/tracer dereferencing or a spawned mobj's own handle -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
         ));
     }
-    let extra_params = if needs_self_removal {
+    let handle_part = if needs_self_removal {
         ", handle: Handle<Thinker>, arena: &mut Arena<Thinker>"
+    } else if needs_self_handle_value {
+        ", handle: Handle<Thinker>"
+    } else {
+        ""
+    };
+    let thinkers_part = if needs_self_removal {
+        ""
+    } else if needs_spawn_mut {
+        ", thinkers: &mut Arena<Thinker>"
     } else if needs_target_deref {
         ", thinkers: &Arena<Thinker>"
     } else {
         ""
     };
+    let extra_params = format!("{thinkers_part}{handle_part}");
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
     Ok(format!(
         "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
@@ -2150,6 +2341,142 @@ fn collect_target_tracer_aliases_stmt(
             collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
         }
         _ => {}
+    }
+}
+
+/// Locals directly assigned from a fresh `P_SpawnMobj(...)` call (`th =
+/// P_SpawnMobj(...);`, `A_Tracer`'s/`A_VileTarget`'s own idiom) --
+/// registers each such local as `"Handle<Thinker>"`-typed (bare, not
+/// `Option`-wrapped: no real corpus call site ever null-checks a
+/// `P_SpawnMobj` result, unlike `target`/`tracer`/`specialdata`), into
+/// the same `extra_cross_ref_idents` map shape `collect_target_tracer_
+/// aliases` already produces -- lets a later `th->field` read/write
+/// resolve through a real `Arena` lookup (`render_expr`'s and
+/// `render_expr_stmt`'s own generalized `Handle<Thinker>`-base arms).
+/// `P_SpawnMobj` itself is not translated (a forward-reference stub,
+/// same as `S_StartSound`/`P_Random` elsewhere in this module) -- only
+/// its *call site's return value* needs a real type here.
+fn collect_spawn_mobj_locals(items: &[BlockItem]) -> HashMap<String, String> {
+    let mut locals = HashMap::new();
+    collect_spawn_mobj_locals_in(items, &mut locals);
+    locals
+}
+
+fn collect_spawn_mobj_locals_in(items: &[BlockItem], locals: &mut HashMap<String, String>) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_spawn_mobj_locals_stmt(s, locals);
+        }
+    }
+}
+
+fn collect_spawn_mobj_locals_stmt(s: &Stmt, locals: &mut HashMap<String, String>) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && matches!(rhs.as_ref(), Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_SpawnMobj"))
+    {
+        locals.insert(name.clone(), "Handle<Thinker>".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_spawn_mobj_locals_in(&c.items, locals),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_spawn_mobj_locals_stmt(then_branch, locals);
+            if let Some(eb) = else_branch {
+                collect_spawn_mobj_locals_stmt(eb, locals);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_spawn_mobj_locals_stmt(body, locals),
+        Stmt::Case { stmt, .. } => collect_spawn_mobj_locals_stmt(stmt, locals),
+        Stmt::Default(stmt) => collect_spawn_mobj_locals_stmt(stmt, locals),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_spawn_mobj_locals_stmt(body, locals)
+        }
+        Stmt::For { body, .. } => collect_spawn_mobj_locals_stmt(body, locals),
+        _ => {}
+    }
+}
+
+/// `X->target = actor;` / `X->tracer = actor;` (`A_VileTarget`'s own
+/// `fog->target = actor;`) -- storing the function's *own* receiver
+/// (`self_param`) as a value into a freshly-spawned `Handle<Thinker>`-
+/// typed local's own `target`/`tracer` field. Unlike every other self-
+/// struct reference in this module, this needs `self_param`'s own
+/// identity as a real `Handle<Thinker>` *value*, not just `&mut self` --
+/// a genuinely new need, on the same footing as `body_has_self_removal`
+/// first needing a self-removing tick function's own handle, just for a
+/// different reason (storing it elsewhere rather than removing it).
+/// Drives `render_fn_impl`'s own signature extension (a `handle:
+/// Handle<Thinker>` parameter, reusing the same fixed name self-removal
+/// already established, without that case's own `arena: &mut
+/// Arena<Thinker>` -- nothing here calls `Arena::remove`). Scoped to
+/// `target`/`tracer` specifically, the only two `Mobj` fields known
+/// `Option<Handle<Thinker>>`-typed so far (mirroring `is_target_tracer_
+/// typed`'s own pair).
+fn is_self_handle_value_assign(
+    s: &Stmt,
+    self_param: &str,
+    spawn_locals: &HashMap<String, String>,
+) -> bool {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+    else {
+        return false;
+    };
+    let Expr::Member { base, field, .. } = lhs.as_ref() else {
+        return false;
+    };
+    (field == "target" || field == "tracer")
+        && matches!(base.as_ref(), Expr::Ident(n) if spawn_locals.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+        && matches!(rhs.as_ref(), Expr::Ident(n) if n == self_param)
+}
+
+fn body_has_self_handle_value(
+    items: &[BlockItem],
+    self_param: &str,
+    spawn_locals: &HashMap<String, String>,
+) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_self_handle_value(s, self_param, spawn_locals),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn stmt_has_self_handle_value(
+    s: &Stmt,
+    self_param: &str,
+    spawn_locals: &HashMap<String, String>,
+) -> bool {
+    if is_self_handle_value_assign(s, self_param, spawn_locals) {
+        return true;
+    }
+    match s {
+        Stmt::Compound(c) => body_has_self_handle_value(&c.items, self_param, spawn_locals),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_has_self_handle_value(then_branch, self_param, spawn_locals)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_self_handle_value(eb, self_param, spawn_locals))
+        }
+        Stmt::Switch { body, .. } => stmt_has_self_handle_value(body, self_param, spawn_locals),
+        Stmt::Case { stmt, .. } => stmt_has_self_handle_value(stmt, self_param, spawn_locals),
+        Stmt::Default(stmt) => stmt_has_self_handle_value(stmt, self_param, spawn_locals),
+        Stmt::While { body, .. } => stmt_has_self_handle_value(body, self_param, spawn_locals),
+        _ => false,
     }
 }
 
@@ -6357,6 +6684,319 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              sound = sfx_pdiehi;\n    \
              }\n    \
              S_StartSound(mo, sound);\n\
+             }"
+        );
+    }
+
+    /// `A_Tracer` -- the first function needing real `Arena` *write*
+    /// access from inside a `Mobj`-shaped action function: `th =
+    /// P_SpawnMobj(...); th->momz = ...; th->tics -= ...;`. `th` is
+    /// registered `"Handle<Thinker>"`-typed by the new
+    /// `collect_spawn_mobj_locals` scan (mirroring `collect_target_
+    /// tracer_aliases`'s own shape, just triggered by a `P_SpawnMobj`
+    /// call instead of a `target`/`tracer` read); every subsequent
+    /// `th->field` read/write resolves through the new generalized
+    /// `Handle<Thinker>`-base arms in `render_expr`/`render_expr_stmt`
+    /// (a fresh `thinkers.get`/`get_mut` at each point of use, the same
+    /// per-access-borrow discipline `render_existing_thinker_mutation`
+    /// already established for `EV_VerticalDoor`'s own reused-thinker
+    /// case -- a single hoisted binding was already proven wrong by
+    /// `rustc` there, so it's never attempted here either). Also the
+    /// first function needing a *compound* assign through a `Handle<
+    /// Thinker>`-typed base (`th->tics -= P_Random()&3;`), which the
+    /// sibling `mutating_handle` write arm never needed (`EV_VerticalDoor`'s
+    /// own reused-thinker writes are all plain `=`) -- this one renders
+    /// whatever real `AssignOp` the source used instead. `dest =
+    /// actor->tracer;` reuses the already-existing target/tracer local-
+    /// alias mechanism unchanged. New `FixedT` arithmetic surfaced by
+    /// this function's own tail (`40*FRACUNIT`, `dist / actor->info->
+    /// speed`, `FRACUNIT/8`, `actor->momz -= FRACUNIT/8`): `fixed_t` is
+    /// a bare `typedef int` in the original, so none of these ever go
+    /// through the rescaling `FixedMul`/`FixedDiv` -- `runtime/fixed.rs`
+    /// gains `Mul<FixedT> for i32`/`Mul<i32> for FixedT`/`Div<i32> for
+    /// FixedT` (raw representation arithmetic, the same idea `Add`/`Sub`
+    /// already model for `+`/`-`) plus `AddAssign`/`SubAssign`. `dist`
+    /// itself is treated as a plain scalar throughout (declared `fixed_t`
+    /// in the original, but only ever divided by/compared against plain
+    /// `int`s after `P_AproxDistance` computes it here) -- the
+    /// verification harness's own `P_AproxDistance` stub returns `i32`
+    /// to match, the same "stub signature matches this real call site's
+    /// own usage, not necessarily the callee's eventual one" precedent
+    /// already documented for `S_StartSound` (`EV_VerticalDoor`).
+    /// `finecosine[exact]`/`finesine[exact]` need an explicit `as usize`
+    /// even though `exact` is a plain index identifier (unlike
+    /// `sidenum[side^1]`'s fresh, single-purpose local): `exact` is
+    /// *also* used earlier in real `u32` arithmetic against `actor->
+    /// angle`, so Rust can't freely infer it `usize` -- narrowly matched
+    /// by the array's own name (`finecosine`/`finesine`), the same
+    /// "hand-match the one real array identifier" style as `sides`/
+    /// `sectors`/`textureheight`. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against hand-written stand-in
+    /// `World`/`Thinker`/`Mobj`/`MobjInfo`/`Arena`/`Handle`/`FixedT`
+    /// shapes and stub `P_SpawnPuff`/`P_SpawnMobj`/`R_PointToAngle2`/
+    /// `P_AproxDistance`/`FixedMul`/`P_Random` functions -- zero errors.
+    #[test]
+    fn test_a_tracer_renders_exactly() {
+        let field_types = field_types(&[
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("tics", "i32"),
+            ("angle", "u32"),
+            ("tracer", "Option<Handle<Thinker>>"),
+            ("info", "&'static MobjInfo"),
+        ]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Tracer", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Tracer(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut exact;\n    \
+             let mut dist;\n    \
+             let mut slope;\n    \
+             let mut dest;\n    \
+             let mut th;\n    \
+             if (gametic & 3) != 0 {\n        \
+             return;\n    \
+             }\n    \
+             P_SpawnPuff(actor.x, actor.y, actor.z);\n    \
+             th = P_SpawnMobj(actor.x - actor.momx, actor.y - actor.momy, actor.z, MT_SMOKE);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FRACUNIT; };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 3; };\n    \
+             if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {\n        \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };\n    \
+             }\n    \
+             dest = actor.tracer;\n    \
+             if dest.is_none() || match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 {\n        \
+             return;\n    \
+             }\n    \
+             exact = R_PointToAngle2(actor.x, actor.y, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
+             if exact != actor.angle {\n        \
+             if exact - actor.angle > 0x80000000 {\n            \
+             actor.angle -= (TRACEANGLE) as u32;\n            \
+             if exact - actor.angle < 0x80000000 {\n                \
+             actor.angle = exact;\n            \
+             }\n        \
+             } else {\n            \
+             actor.angle += (TRACEANGLE) as u32;\n            \
+             if exact - actor.angle > 0x80000000 {\n                \
+             actor.angle = exact;\n            \
+             }\n        \
+             }\n    \
+             }\n    \
+             exact = actor.angle >> ANGLETOFINESHIFT;\n    \
+             actor.momx = FixedMul(actor.info.speed, finecosine[exact as usize]);\n    \
+             actor.momy = FixedMul(actor.info.speed, finesine[exact as usize]);\n    \
+             dist = P_AproxDistance(match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - actor.y);\n    \
+             dist = dist / actor.info.speed;\n    \
+             if dist < 1 {\n        \
+             dist = 1;\n    \
+             }\n    \
+             slope = (match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + 40 * FRACUNIT - actor.z) / dist;\n    \
+             if slope < actor.momz {\n        \
+             actor.momz -= FRACUNIT / 8;\n    \
+             } else {\n        \
+             actor.momz += FRACUNIT / 8;\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_VileTarget` -- the second function needing the new `P_SpawnMobj`
+    /// write-access mechanism, and the first needing the function's own
+    /// *receiver* as a `Handle<Thinker>` *value* (`fog->target = actor;`,
+    /// storing `actor` itself into the freshly-spawned `fog`'s own
+    /// `target` field) -- a genuinely new need, on the same footing as
+    /// `body_has_self_removal` first needing a self-removing tick
+    /// function's own handle, just to store it elsewhere rather than
+    /// remove it (`body_has_self_handle_value`, a new `render_fn_impl`
+    /// signature-extension case adding a bare `handle: Handle<Thinker>`
+    /// parameter, reusing self-removal's own fixed name without its
+    /// `arena: &mut Arena<Thinker>` companion, since nothing here calls
+    /// `Arena::remove`). `actor->tracer = fog;` (self's own `tracer`
+    /// field, a bare `Handle<Thinker>` RHS) needed the mirror-image
+    /// generalization: `render_expr_stmt`'s existing `specialdata`-only
+    /// `Some(..)`-wrap now also covers `target`/`tracer` self-writes
+    /// whenever the RHS is a registered `Handle<Thinker>` local. `fog->
+    /// tracer = actor->target;` needs no wrap at all -- `actor->target`
+    /// (a bare, non-chained self-field read) is already `Option<Handle<
+    /// Thinker>>`-shaped, confirming the new write arm doesn't double-
+    /// wrap an already-`Option` RHS. A genuine latent bug in the
+    /// original C, preserved faithfully rather than silently corrected:
+    /// `fog = P_SpawnMobj (actor->target->x, actor->target->x,
+    /// actor->target->z, MT_FIRE);` passes `actor->target->x` twice --
+    /// the second argument should almost certainly be `actor->target->y`,
+    /// but the real corpus source (`p_enemy.c`) really does say `x`
+    /// twice; translated as-written, not "fixed," matching this project's
+    /// own standing practice for genuine original-game defects. Verified
+    /// compiling for real alongside `A_Tracer`, same stand-in shapes.
+    #[test]
+    fn test_a_vile_target_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_VileTarget",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_VileTarget(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
+             let mut fog;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             fog = P_SpawnMobj(match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() }, MT_FIRE);\n    \
+             actor.tracer = Some(fog);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(fog) { m.target = Some(handle); };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(fog) { m.tracer = actor.target; };\n    \
+             A_Fire(fog);\n\
+             }"
+        );
+    }
+
+    /// `A_BrainExplode` -- a second, simpler `P_SpawnMobj`-write-access
+    /// caller than `A_Tracer`'s own (no target/tracer dereferencing, no
+    /// self-handle-value need, just a straight-line spawn-then-mutate),
+    /// but the one that actually surfaced the mixed `FixedT`/`i32`
+    /// arithmetic gap this session's own `runtime/fixed.rs` additions
+    /// exist for: `x = mo->x + (P_Random()-P_Random())*2048;` and `z =
+    /// 128 + P_Random()*2*FRACUNIT;` need `Add<i32>`/`Add<FixedT>` in
+    /// both operand orders (the real corpus uses both), and `th->momz =
+    /// P_Random()*512;` -- a *plain* `i32` expression with no `FixedT`
+    /// source in it anywhere -- needs the new `expr_is_fixed_t_valued`
+    /// check to wrap it `FixedT(..)` before assigning into a `FixedT`
+    /// field, the same "C silently reinterprets the bits" idiom the
+    /// `angle_t`/plain-`int` pair already established, just the mirror
+    /// direction (plain `int` *into* a narrower Rust type, not out of
+    /// one). Verified compiling for real.
+    #[test]
+    fn test_a_brain_explode_renders_exactly() {
+        let field_types = field_types(&[("x", "FixedT"), ("momz", "FixedT"), ("tics", "i32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainExplode",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainExplode(mo: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut x;\n    \
+             let mut y;\n    \
+             let mut z;\n    \
+             let mut th;\n    \
+             x = mo.x + (P_Random() - P_Random()) * 2048;\n    \
+             y = mo.y;\n    \
+             z = 128 + P_Random() * 2 * FRACUNIT;\n    \
+             th = P_SpawnMobj(x, y, z, MT_ROCKET);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FixedT(P_Random() * 512); };\n    \
+             P_SetMobjState(th, S_BRAINEXPLODE1);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 7; };\n    \
+             if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {\n        \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_Explode` -- a single opaque forward-referencing call passing
+    /// `thingy->target` bare (no dereference), the same already-
+    /// established shape every other `P_RadiusAttack`/`P_DamageMobj`-
+    /// style call uses.
+    #[test]
+    fn test_a_explode_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_Explode",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Explode(thingy: &mut Mobj, world: &mut World) {\n    \
+             P_RadiusAttack(thingy, thingy.target, 128);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_skel_whoosh_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SkelWhoosh",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SkelWhoosh(actor: &mut Mobj, world: &mut World) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             S_StartSound(actor, sfx_skeswg);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_skel_fist_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SkelFist",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SkelFist(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             damage = (P_Random() % 10 + 1) * 6;\n        \
+             S_StartSound(actor, sfx_skepch);\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_fat_raise_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_FatRaise",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FatRaise(actor: &mut Mobj, world: &mut World) {\n    \
+             A_FaceTarget(actor);\n    \
+             S_StartSound(actor, sfx_manatk);\n\
              }"
         );
     }
