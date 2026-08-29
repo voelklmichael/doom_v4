@@ -4768,4 +4768,62 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             "pub fn A_Pain(actor: &mut Mobj, world: &mut World) {\n    if actor.info.painsound != 0 {\n        S_StartSound(actor, actor.info.painsound);\n    }\n}"
         );
     }
+
+    /// `A_Hoof`/`A_Metal`/`A_BabyMetal` (`p_enemy.c`) -- identical two-
+    /// statement shape (a sound, then a monster-generic `A_Chase(mo);`
+    /// tail call), needing no new renderer capability: `A_Chase` isn't
+    /// translated yet, but a bare forward-referencing call by name
+    /// already renders correctly through the fully generic `Expr::Call`
+    /// path (the same accepted "cross-function signature wiring...
+    /// unresolved" gap already documented for other calls). Confirms
+    /// `self_param`'s own name (`mo`, not `actor`) is picked up correctly
+    /// too -- `first_param_name` was already name-agnostic, just not
+    /// exercised by a real second name until now.
+    #[test]
+    fn test_a_hoof_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_Hoof",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Hoof(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_hoof);\n    A_Chase(mo);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_metal_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_Metal",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Metal(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_metal);\n    A_Chase(mo);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_baby_metal_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BabyMetal",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BabyMetal(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_bspwlk);\n    A_Chase(mo);\n}"
+        );
+    }
 }
