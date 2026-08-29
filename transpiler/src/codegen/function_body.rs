@@ -724,6 +724,20 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "twoSided") => {
             Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
         }
+        // `if (P_CheckMeleeRange (actor))` (`A_TroopAttack` and several
+        // other melee-attack action functions) -- unlike `twoSided`,
+        // `P_CheckMeleeRange`'s own real corpus declaration
+        // (`p_enemy.c`) returns `boolean`, not a plain `int`, and
+        // `boolean` already maps to Rust's native `bool`
+        // (`struct_fields.rs`'s own established decision) -- so a call
+        // to it is already a real `bool` value, used directly with no
+        // `!= 0` cast at all. Matched narrowly by name, the same "hand-
+        // match the one real corpus shape" style as `twoSided`, rather
+        // than inferring a callee's C return type generically (nothing
+        // else here tracks function signatures).
+        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange") => {
+            Ok(render_expr(cond, ctx)?.0)
+        }
         _ => Err(format!(
             "render_bool_expr: unsupported condition shape: {cond:?}"
         )),
@@ -5215,6 +5229,188 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              } else {\n        \
              S_StartSound(actor, sound);\n    \
              }\n\
+             }"
+        );
+    }
+
+    /// `A_BspiAttack`/`A_CyberAttack` (`p_enemy.c`) -- the first
+    /// functions to pass `actor->target` itself (not a field reached
+    /// *through* it) as a bare call argument to a not-yet-translated
+    /// function (`P_SpawnMissile`) -- needs no new capability at all,
+    /// since the already-generic `Expr::Member`/`Expr::Call` paths
+    /// already resolve a bare `Option<Handle<Thinker>>`-valued field
+    /// read correctly; only *dereferencing through* it needs the not-
+    /// yet-built `Arena` read access this module still defers (see
+    /// `A_FaceTarget`).
+    #[test]
+    fn test_a_bspi_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BspiAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BspiAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             P_SpawnMissile(actor, actor.target, MT_ARACHPLAZ);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_cyber_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_CyberAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CyberAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             P_SpawnMissile(actor, actor.target, MT_ROCKET);\n\
+             }"
+        );
+    }
+
+    /// `A_TroopAttack`/`A_HeadAttack` -- a melee-or-missile branch via
+    /// `if (P_CheckMeleeRange (actor))`, the first bare-`boolean`-call
+    /// condition this renderer has hit: `P_CheckMeleeRange`'s own real
+    /// declared return type is `boolean` (not `int`, unlike `twoSided`),
+    /// which already maps to Rust's native `bool` -- used directly with
+    /// no `!= 0` cast, a new narrow `render_bool_expr` arm.
+    #[test]
+    fn test_a_troop_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_TroopAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_TroopAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             S_StartSound(actor, sfx_claw);\n        \
+             damage = (P_Random() % 8 + 1) * 3;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n        \
+             return;\n    \
+             }\n    \
+             P_SpawnMissile(actor, actor.target, MT_TROOPSHOT);\n\
+             }"
+        );
+    }
+
+    /// `A_SargAttack` -- the melee branch has no `return`/missile
+    /// fallback at all (a pure gate: does nothing if out of range).
+    #[test]
+    fn test_a_sarg_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SargAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SargAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             damage = (P_Random() % 10 + 1) * 4;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_head_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_HeadAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_HeadAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             damage = (P_Random() % 6 + 1) * 10;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n        \
+             return;\n    \
+             }\n    \
+             P_SpawnMissile(actor, actor.target, MT_HEADSHOT);\n\
+             }"
+        );
+    }
+
+    /// `A_BruisAttack` -- the one melee/missile attack in this group
+    /// with no `A_FaceTarget` call at all anywhere in its body, confirmed
+    /// directly against the real source rather than assumed missing --
+    /// translated exactly as the original has it, quirk and all.
+    #[test]
+    fn test_a_bruis_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BruisAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BruisAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             S_StartSound(actor, sfx_claw);\n        \
+             damage = (P_Random() % 8 + 1) * 10;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n        \
+             return;\n    \
+             }\n    \
+             P_SpawnMissile(actor, actor.target, MT_BRUISERSHOT);\n\
              }"
         );
     }
