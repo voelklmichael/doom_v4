@@ -5124,4 +5124,98 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }"
         );
     }
+
+    /// `A_PainAttack` -- reuses the same `!actor->target` check, then
+    /// two forward-referencing calls (`A_FaceTarget`, not-yet-translated
+    /// `A_PainShootSkull`), no new capability needed.
+    #[test]
+    fn test_a_pain_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PainAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PainAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             A_PainShootSkull(actor, actor.angle);\n\
+             }"
+        );
+    }
+
+    /// `A_PainDie` -- `actor->angle+ANG90`/`+ANG180`/`+ANG270`: `ANG90`
+    /// and friends (`tables.h`) are plain `#define`d hex-literal macros,
+    /// not enum constants, so they render as bare pass-through
+    /// identifiers the same way `MISSILERANGE` already does -- this
+    /// renderer never evaluates a macro, just emits whatever identifier
+    /// text the AST already has, trusting some later stage to have a
+    /// real Rust `const` with that same name (the same accepted
+    /// forward-reference gap as every other not-yet-wired global).
+    #[test]
+    fn test_a_pain_die_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PainDie",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PainDie(actor: &mut Mobj, world: &mut World) {\n    \
+             A_Fall(actor);\n    \
+             A_PainShootSkull(actor, actor.angle + ANG90);\n    \
+             A_PainShootSkull(actor, actor.angle + ANG180);\n    \
+             A_PainShootSkull(actor, actor.angle + ANG270);\n\
+             }"
+        );
+    }
+
+    /// `A_Scream` -- a `switch` whose very first arm (`case 0: return;`)
+    /// exercises the `render_switch` fallthrough fix from the previous
+    /// commit against real corpus code (not just a hand-built repro),
+    /// alongside two ordinary shared-case-label groups and a `default`.
+    /// `actor->type==MT_SPIDER || actor->type == MT_CYBORG` is the first
+    /// real corpus `==` comparison nested inside `||` this renderer has
+    /// hit -- ordinary precedence-aware `Binary` rendering, no new code.
+    #[test]
+    fn test_a_scream_renders_exactly() {
+        let field_types = field_types(&[("info", "&'static MobjInfo")]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Scream", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Scream(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut sound;\n    \
+             match actor.info.deathsound {\n        \
+             0 => {\n            \
+             return;\n        \
+             }\n        \
+             sfx_podth1 | sfx_podth2 | sfx_podth3 => {\n            \
+             sound = sfx_podth1 + P_Random() % 3;\n        \
+             }\n        \
+             sfx_bgdth1 | sfx_bgdth2 => {\n            \
+             sound = sfx_bgdth1 + P_Random() % 2;\n        \
+             }\n        \
+             _ => {\n            \
+             sound = actor.info.deathsound;\n        \
+             }\n    \
+             }\n    \
+             if actor.r#type == MT_SPIDER || actor.r#type == MT_CYBORG {\n        \
+             S_StartSound(None, sound);\n    \
+             } else {\n        \
+             S_StartSound(actor, sound);\n    \
+             }\n\
+             }"
+        );
+    }
 }
