@@ -169,6 +169,20 @@ struct FnBodyContext<'a> {
     /// triggers, and every isolated-fragment test below never exercise
     /// this shape).
     plain_int_locals: &'a HashSet<String>,
+    /// Names of `self_param`'s own sibling locals declared as a plain
+    /// `angle_t` (`u32`) at the function's top level (`collect_angle_t_
+    /// locals`, the mirror image of `plain_int_locals`) -- needed for the
+    /// reverse gap `A_FaceTarget`'s own `self`-field compound assign
+    /// already fixed (`lhs_is_u32_self_field`), just against a *local*
+    /// instead of a self-struct field: `A_FireShotgun2`'s own `angle_t
+    /// angle; ... angle = player->mo->angle; angle += (P_Random()-
+    /// P_Random())<<19;` compound-assigns ordinary `int`-typed arithmetic
+    /// (no operand itself a registered `u32` value) into a genuinely
+    /// `u32`-typed local -- confirmed a real `rustc` rejection (`cannot
+    /// add-assign i32 to u32`), the identical class of bug, just on a
+    /// local rather than a field. Empty for every context that isn't a
+    /// plain tick/weapon-action function's own top-level locals.
+    angle_t_locals: &'a HashSet<String>,
     /// Set only while rendering the RHS of a write to one field of a
     /// `Handle<Thinker>`-typed local (the `P_SpawnMobj`-local write arm
     /// in `render_expr_stmt`) -- the name of that same local, if any
@@ -344,6 +358,29 @@ fn is_target_tracer_typed(
         }
         _ => false,
     }
+}
+
+/// Whether `e` is `{self_param}.field` where `field`'s registered type is
+/// exactly `"Handle<Thinker>"` -- bare, never `Option`-wrapped, unlike
+/// `is_target_tracer_typed`'s `target`/`tracer` case. `player->mo`
+/// (`render_weapon_fn`'s own `player_field_types` map, since `player_t`
+/// isn't struct-mapped) is the corpus-checked real example: no call site
+/// anywhere null-checks `player->mo` before dereferencing it (the same
+/// "no real call site ever null-checks this" reasoning already
+/// established for a `P_SpawnMobj` result), so the field is registered
+/// bare rather than `Option`-wrapped, and its own chain-through render
+/// arm needs no `.unwrap()` the way `is_target_tracer_typed`'s sibling
+/// arm does -- kept as a genuinely separate predicate/arm pair rather
+/// than folded into that one, since the two shapes render differently at
+/// their point of use.
+fn is_self_bare_handle_field(
+    e: &Expr,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> bool {
+    matches!(e, Expr::Member { base, field, .. }
+        if matches!(base.as_ref(), Expr::Ident(n) if n == self_param)
+            && self_field_types.get(field.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
 }
 
 /// Renders `e`, returning `(text, is_unresolved_cross_ref)` -- the second
@@ -545,6 +582,29 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             Ok((
                 format!(
                     "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
+                    rust_field_name(field)?
+                ),
+                false,
+            ))
+        }
+        // `player->mo->field` -- dereferencing *through* `player`'s own
+        // `mo` field (`is_self_bare_handle_field`, its own doc comment
+        // explains the bare-vs-`Option` distinction from the arm just
+        // above). `A_FireShotgun2`'s own `angle = player->mo->angle;` is
+        // the real corpus example this was built against -- reading
+        // `player->mo` opaquely (`S_StartSound(player->mo, ..)`, already
+        // correct via the generic `Member` fallback below, since a
+        // registered-but-not-cross-ref-typed field renders as plain
+        // `.mo` access there) is a different, already-working case from
+        // dereferencing *through* it to reach a further field, which this
+        // arm alone handles.
+        Expr::Member { base, field, .. }
+            if is_self_bare_handle_field(base, ctx.self_param, ctx.self_field_types) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!(
+                    "match thinkers.get({base_text}) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
                     rust_field_name(field)?
                 ),
                 false,
@@ -1984,6 +2044,13 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let lhs_is_u32_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
+        // `angle += (P_Random()-P_Random())<<19;` (`A_FireShotgun2`) --
+        // the same `int`-arithmetic-into-`u32` compound-assign gap as
+        // `lhs_is_u32_self_field` just above, but the LHS is a plain
+        // `angle_t`-declared local, not a self-struct field -- see
+        // `FnBodyContext::angle_t_locals`'s own doc comment.
+        let lhs_is_angle_t_local =
+            matches!(lhs.as_ref(), Expr::Ident(n) if ctx.angle_t_locals.contains(n.as_str()));
         // `actor->tracer = fog;` (`A_VileTarget`'s own idiom) -- writing a
         // bare `Handle<Thinker>`-typed local (`fog`, fresh out of
         // `P_SpawnMobj`) straight into `self`'s own `target`/`tracer`
@@ -2007,7 +2074,7 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
             format!("{rhs_text} as i32")
-        } else if lhs_is_u32_self_field && *op != AssignOp::Assign {
+        } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
         } else {
             rhs_text
@@ -2120,6 +2187,32 @@ fn collect_plain_int_locals(items: &[BlockItem]) -> HashSet<String> {
     names
 }
 
+/// Mirrors `collect_plain_int_locals`, but for a local declared `angle_t`
+/// (`[TypeSpecifier::TypedefName("angle_t")]`, a distinct AST shape from
+/// bare `int`'s `[TypeSpecifier::Int]`) -- see `FnBodyContext::
+/// angle_t_locals`'s own doc comment for why this is needed. Same
+/// deliberately shallow, top-level-only scan.
+fn collect_angle_t_locals(items: &[BlockItem]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in items {
+        let BlockItem::Decl(d) = item else { continue };
+        if !matches!(
+            d.specifiers.type_specifiers.as_slice(),
+            [TypeSpecifier::TypedefName(n)] if n == "angle_t"
+        ) {
+            continue;
+        }
+        for decl in &d.declarators {
+            if let DirectDeclarator::Ident(_) = decl.declarator.direct
+                && let Some(name) = declarator_name(&decl.declarator)
+            {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
 /// Renders `fn_name` (found in `corpus_dir.join(file)`) as a real Rust
 /// `pub fn`, given `self_rust_type` (the already-translated struct name
 /// for its first parameter) and `self_field_types` (that struct's
@@ -2193,6 +2286,7 @@ fn render_fn_impl(
             .map(|(k, v)| (k.clone(), v.clone())),
     );
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
+    let angle_t_locals = collect_angle_t_locals(&f.body.items);
     // Only a tick function that actually removes itself somewhere in its
     // body (`is_self_removal_call`, possibly nested arbitrarily deep in
     // `switch`/`if` -- `T_VerticalDoor` buries several inside two levels
@@ -2270,6 +2364,7 @@ fn render_fn_impl(
         mutating_handle: None,
         same_handle_write: None,
         plain_int_locals: &plain_int_locals,
+        angle_t_locals: &angle_t_locals,
         self_removal_ident,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -2320,7 +2415,11 @@ fn nth_param_name(f: &FunctionDef, n: usize) -> Option<String> {
 /// touch a cross-reference field, so one isn't threaded through
 /// speculatively -- add it if a future weapon action function needs one,
 /// the same "measure, don't guess" reasoning `render_fn`'s own
-/// self-removal parameters already follow.
+/// self-removal parameters already follow. `thinkers: &Arena<Thinker>` is
+/// threaded through conditionally (`body_has_self_handle_field_deref`),
+/// the same "only when a real body needs it" discipline `render_fn_impl`'s
+/// own `needs_target_deref` already established -- `A_FireShotgun2`'s own
+/// `player->mo->angle` is the first real corpus example needing it.
 pub fn render_weapon_fn(
     corpus_dir: &Path,
     file: &str,
@@ -2335,6 +2434,7 @@ pub fn render_weapon_fn(
     let psp_param = nth_param_name(f, 1)
         .ok_or_else(|| format!("{fn_name}: second parameter has no plain name"))?;
     let no_extra_cross_refs = HashMap::new();
+    let angle_t_locals = collect_angle_t_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &player_param,
         self_field_types: player_field_types,
@@ -2347,10 +2447,18 @@ pub fn render_weapon_fn(
         same_handle_write: None,
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
+        angle_t_locals: &angle_t_locals,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    let needs_self_handle_deref =
+        body_has_self_handle_field_deref(&f.body.items, &player_param, player_field_types);
+    let thinkers_part = if needs_self_handle_deref {
+        ", thinkers: &Arena<Thinker>"
+    } else {
+        ""
+    };
     Ok(format!(
-        "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState) {{\n{}\n}}",
+        "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState{thinkers_part}) {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -2763,6 +2871,139 @@ fn stmt_has_target_deref(
         }
         Stmt::Return(Some(e)) => expr_has_target_deref(e, self_param, self_field_types, aliases),
         Stmt::Labeled { stmt, .. } => stmt_has_target_deref(stmt, self_param, self_field_types, aliases),
+        _ => false,
+    }
+}
+
+/// Whether `e` (anywhere in its subtree) dereferences *through* a bare
+/// `Handle<Thinker>`-typed self-struct field (`is_self_bare_handle_field`
+/// -- `player->mo->field` under `render_weapon_fn`) -- the mirror of
+/// `expr_has_target_deref`, just for the bare-field shape instead of the
+/// `Option`-wrapped `target`/`tracer` one, and deliberately without an
+/// `aliases` parameter: no real corpus function has aliased `player->mo`
+/// into a plain local the way `A_SkullAttack` aliases `actor->target`, so
+/// that generalization isn't built ahead of a real need. Drives
+/// `render_weapon_fn`'s own signature extension, the same "measure, don't
+/// add speculatively" discipline as every other such scan in this module.
+fn expr_has_self_handle_field_deref(
+    e: &Expr,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> bool {
+    if let Expr::Member { base, .. } = e
+        && is_self_bare_handle_field(base, self_param, self_field_types)
+    {
+        return true;
+    }
+    match e {
+        Expr::Unary { expr, .. }
+        | Expr::PreIncDec { expr, .. }
+        | Expr::PostIncDec { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Sizeof(SizeofArg::Expr(expr)) => {
+            expr_has_self_handle_field_deref(expr, self_param, self_field_types)
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
+            expr_has_self_handle_field_deref(lhs, self_param, self_field_types)
+                || expr_has_self_handle_field_deref(rhs, self_param, self_field_types)
+        }
+        Expr::Assign { lhs, rhs, .. } => {
+            expr_has_self_handle_field_deref(lhs, self_param, self_field_types)
+                || expr_has_self_handle_field_deref(rhs, self_param, self_field_types)
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_self_handle_field_deref(cond, self_param, self_field_types)
+                || expr_has_self_handle_field_deref(then_expr, self_param, self_field_types)
+                || expr_has_self_handle_field_deref(else_expr, self_param, self_field_types)
+        }
+        Expr::Call { callee, args } => {
+            expr_has_self_handle_field_deref(callee, self_param, self_field_types)
+                || args
+                    .iter()
+                    .any(|a| expr_has_self_handle_field_deref(a, self_param, self_field_types))
+        }
+        Expr::Index { base, index } => {
+            expr_has_self_handle_field_deref(base, self_param, self_field_types)
+                || expr_has_self_handle_field_deref(index, self_param, self_field_types)
+        }
+        Expr::Member { base, .. } => {
+            expr_has_self_handle_field_deref(base, self_param, self_field_types)
+        }
+        _ => false,
+    }
+}
+
+fn body_has_self_handle_field_deref(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Decl(d) => d.declarators.iter().any(|decl| {
+            matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_self_handle_field_deref(e, self_param, self_field_types))
+        }),
+        BlockItem::Stmt(s) => stmt_has_self_handle_field_deref(s, self_param, self_field_types),
+    })
+}
+
+fn stmt_has_self_handle_field_deref(
+    s: &Stmt,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => expr_has_self_handle_field_deref(e, self_param, self_field_types),
+        Stmt::Expr(None) => false,
+        Stmt::Compound(c) => body_has_self_handle_field_deref(&c.items, self_param, self_field_types),
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_self_handle_field_deref(cond, self_param, self_field_types)
+                || stmt_has_self_handle_field_deref(then_branch, self_param, self_field_types)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_self_handle_field_deref(eb, self_param, self_field_types))
+        }
+        Stmt::Switch { cond, body } => {
+            expr_has_self_handle_field_deref(cond, self_param, self_field_types)
+                || stmt_has_self_handle_field_deref(body, self_param, self_field_types)
+        }
+        Stmt::Case { expr, stmt } => {
+            expr_has_self_handle_field_deref(expr, self_param, self_field_types)
+                || stmt_has_self_handle_field_deref(stmt, self_param, self_field_types)
+        }
+        Stmt::Default(stmt) => stmt_has_self_handle_field_deref(stmt, self_param, self_field_types),
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr_has_self_handle_field_deref(cond, self_param, self_field_types)
+                || stmt_has_self_handle_field_deref(body, self_param, self_field_types)
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::Decl(d) => d.declarators.iter().any(|decl| {
+                    matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_self_handle_field_deref(e, self_param, self_field_types))
+                }),
+                ForInit::Expr(e) => expr_has_self_handle_field_deref(e, self_param, self_field_types),
+            }) || cond
+                .as_ref()
+                .is_some_and(|e| expr_has_self_handle_field_deref(e, self_param, self_field_types))
+                || step
+                    .as_ref()
+                    .is_some_and(|e| expr_has_self_handle_field_deref(e, self_param, self_field_types))
+                || stmt_has_self_handle_field_deref(body, self_param, self_field_types)
+        }
+        Stmt::Return(Some(e)) => expr_has_self_handle_field_deref(e, self_param, self_field_types),
+        Stmt::Labeled { stmt, .. } => stmt_has_self_handle_field_deref(stmt, self_param, self_field_types),
         _ => false,
     }
 }
@@ -3203,6 +3444,7 @@ pub fn render_spawn_fn(
         same_handle_write: None,
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
+        angle_t_locals: &HashSet::new(),
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -3557,6 +3799,7 @@ pub fn render_trigger_fn(
         same_handle_write: None,
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
+        angle_t_locals: &HashSet::new(),
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -4272,6 +4515,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -4359,6 +4603,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -4406,6 +4651,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -4474,6 +4720,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -4556,6 +4803,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -5706,6 +5954,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -5769,6 +6018,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -5858,6 +6108,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -5927,6 +6178,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -5997,6 +6249,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
         rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
@@ -6072,6 +6325,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7522,6 +7776,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             same_handle_write: None,
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
         };
         let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
@@ -7560,6 +7815,75 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              i = 0;\n    \
              while i < 7 {\n        \
              P_GunShot(player.mo, false);\n        \
+             i += 1;\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_FireShotgun2` -- closes the real `player->mo` dereference gap
+    /// (`docs/03_TRANSPILER.md`'s own "not yet done" list, wrongly called
+    /// a clean pick for this exact function by an earlier round's survey,
+    /// then correctly re-flagged as genuinely blocked before this round).
+    /// `angle = player->mo->angle;` needs a real `Arena` lookup *through*
+    /// `player`'s own `mo` field, the mirror of `thing->player`'s inverse
+    /// direction -- `is_self_bare_handle_field`/its own `render_expr` arm,
+    /// registered here via `field_types(&[("mo", "Handle<Thinker>")])`
+    /// (bare, not `Option`-wrapped: no real corpus call site anywhere
+    /// null-checks `player->mo`, the same "no real call site ever
+    /// null-checks this" reasoning already established for a
+    /// `P_SpawnMobj` result). Reading/passing `player->mo` opaquely
+    /// (`S_StartSound`, `P_SetMobjState`, `P_BulletSlope`, `P_LineAttack`'s
+    /// own first argument) already rendered correctly before this, via
+    /// the pre-existing generic `Member` fallback -- only the *further*
+    /// chain-through needed the new arm, confirmed by first tracing every
+    /// statement against the unmodified renderer. `render_weapon_fn` now
+    /// threads a conditional `thinkers: &Arena<Thinker>` parameter
+    /// through (`body_has_self_handle_field_deref`), the same "only when
+    /// a real body needs it" discipline `render_fn_impl`'s own
+    /// `needs_target_deref` already established. `angle += (P_Random()-
+    /// P_Random())<<19;` needed one more small, independently-motivated
+    /// piece: `angle`'s own C type is `angle_t` (`u32`), a *local*, not a
+    /// self-struct field -- `lhs_is_u32_self_field`'s existing `as u32`
+    /// compound-assign cast (`A_FaceTarget`'s own `actor->angle += ...`)
+    /// only ever checked a self-struct field's registered type, so a
+    /// bare `angle_t`-declared local needed its own parallel tracking
+    /// (`FnBodyContext::angle_t_locals`, `collect_angle_t_locals`,
+    /// mirroring `plain_int_locals`'s own shallow top-level scan) to get
+    /// the same cast -- confirmed a real `rustc` rejection (`cannot
+    /// add-assign i32 to u32`) by tracing the same class of bug already
+    /// documented for the self-struct-field case, not guessed at. The
+    /// plain `angle = player->mo->angle;` assignment needs no cast at
+    /// all (both sides are genuinely `u32`, matching the established
+    /// "stub matches the caller's real usage" precedent). `bulletslope`
+    /// (`p_pspr.c`'s own file-scope `fixed_t` global, set by the
+    /// forward-referenced `P_BulletSlope`) needs no new handling: an
+    /// unregistered bare identifier already renders as plain opaque
+    /// pass-through text (the same `MISSILERANGE`/`textureheight[]`
+    /// precedent), and `FixedT + i32` (`bulletslope + (...)<<5`) already
+    /// has a real trait impl from `A_Tracer`'s own earlier work.
+    #[test]
+    fn test_a_fire_shotgun2_renders_exactly() {
+        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireShotgun2", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FireShotgun2(player: &mut Player, psp: &mut PlayerSpriteState, thinkers: &Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             let mut angle;\n    \
+             let mut damage;\n    \
+             S_StartSound(player.mo, sfx_dshtgn);\n    \
+             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 2;\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
+             P_BulletSlope(player.mo);\n    \
+             i = 0;\n    \
+             while i < 20 {\n        \
+             damage = 5 * (P_Random() % 3 + 1);\n        \
+             angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n        \
+             angle += (P_Random() - P_Random() << 19) as u32;\n        \
+             P_LineAttack(player.mo, angle, MISSILERANGE, bulletslope + (P_Random() - P_Random() << 5), damage);\n        \
              i += 1;\n    \
              }\n\
              }"
