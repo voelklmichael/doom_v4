@@ -546,9 +546,21 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             for a in args {
                 rendered_args.push(render_expr(a, ctx)?.0);
             }
+            // `getSide`/`getSector` (`p_spec.c`) return `side_t*`/
+            // `sector_t*` -> `SideId`/`SectorId` under the existing
+            // memory-model decision, matched narrowly by name (the same
+            // "not yet fully modeled callee" treatment `twoSided` already
+            // gets above) -- needed so a `.field` chained *directly* off
+            // the call result (`getSide(secnum,i,0)->sector`, `EV_DoFloor`'s
+            // own `lowerAndChange` case) resolves through `world[...]`
+            // correctly, not just once the result is first bound to an
+            // already-known-typed local the way `side = getSide(..);`
+            // already works.
+            let is_crossref =
+                matches!(callee.as_ref(), Expr::Ident(n) if n == "getSide" || n == "getSector");
             Ok((
                 format!("{callee_text}({})", rendered_args.join(", ")),
-                false,
+                is_crossref,
             ))
         }
         _ => Err(format!("render_expr: unsupported expression shape: {e:?}")),
@@ -976,6 +988,12 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             body,
         } => render_for(init, cond, step, body, ctx, depth),
         Stmt::Continue => Ok(vec![format!("{}continue;", indent(depth))]),
+        // A real loop-exiting `break` (`EV_DoFloor`'s own `lowerAndChange`
+        // case, several levels inside a `for` loop's own body) -- distinct
+        // from the switch-case-delimiter `break` `render_switch` consumes
+        // itself while splitting arms apart (that one is peeled off
+        // before individual statements ever reach `render_stmt` at all).
+        Stmt::Break => Ok(vec![format!("{}break;", indent(depth))]),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
 }
@@ -4497,6 +4515,90 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             vec![
                 "world[sec].floorpic = world[world[line].frontsector].floorpic;".to_string(),
                 "world[sec].special = world[world[line].frontsector].special;".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s sixth and final piece: `lowerAndChange`'s own
+    /// `if (getSide(secnum,i,0)->sector-sectors == secnum) { sec =
+    /// getSector(secnum,i,1); ... } else { sec = getSector(secnum,i,0);
+    /// ... }` -- pointer arithmetic (the already-built `X-sectors` idiom,
+    /// `EV_VerticalDoor`'s own `secnum = sec-sectors;`) nested inside a
+    /// comparison for the first time, chained directly off a call result
+    /// rather than a local (`getSide(secnum,i,0)->sector`, needing the
+    /// `Expr::Call` arm's new `getSide`/`getSector` -> cross-ref-typed
+    /// special case, mirroring `twoSided`'s own by-name treatment), plus
+    /// `sec` genuinely reassigned mid-construction (`sec = getSector(..);`,
+    /// a plain local rebind -- harmless since `floor->sector = sec;`
+    /// earlier in the case already copied the *old* value by-value, a
+    /// `SectorId` being `Copy`, exactly like C's own pointer-copy
+    /// semantics). Also surfaced a real, separate gap: a loop-exiting
+    /// `break` reached as an ordinary statement (not `render_switch`'s own
+    /// case-delimiter, which is peeled off before individual statements
+    /// ever reach `render_stmt`) had no generic arm at all -- `Stmt::Break`
+    /// now renders the same way `Stmt::Continue` already did. Clones the
+    /// real `if`/`else` straight out of `EV_DoFloor`'s own parsed AST.
+    /// **Combined with the five pieces above, `EV_DoFloor`'s entire body
+    /// is now covered piece-by-piece** (not yet assembled/compiled as one
+    /// whole function -- see docs/03_TRANSPILER.md).
+    #[test]
+    fn test_lower_and_change_sec_reassignment_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_side_sector_check = |s: &Stmt| {
+            matches!(s, Stmt::If { cond: Expr::Binary { op: BinaryOp::Eq, lhs, rhs }, else_branch: Some(_), .. }
+                if matches!(rhs.as_ref(), Expr::Ident(n) if n == "secnum")
+                && matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Sub, rhs: sub_rhs, .. }
+                    if matches!(sub_rhs.as_ref(), Expr::Ident(n) if n == "sectors")))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_side_sector_check),
+                BlockItem::Decl(_) => None,
+            })
+            .expect(
+                "expected an `if (getSide(..)->sector-sectors == secnum)` statement somewhere in EV_DoFloor",
+            );
+
+        let self_field_types = field_types(&[
+            ("floordestheight", "FixedT"),
+            ("texture", "i16"),
+            ("newspecial", "i32"),
+        ]);
+        let extra_cross_refs = field_types(&[("sec", "SectorId")]);
+        let ctx = FnBodyContext {
+            self_param: "floor",
+            self_field_types: &self_field_types,
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "if world[getSide(secnum, i, 0)].sector.0 as i32 == secnum {".to_string(),
+                "    sec = getSector(secnum, i, 1);".to_string(),
+                "    if world[sec].floorheight == floor.floordestheight {".to_string(),
+                "        floor.texture = world[sec].floorpic;".to_string(),
+                "        floor.newspecial = world[sec].special;".to_string(),
+                "        break;".to_string(),
+                "    }".to_string(),
+                "} else {".to_string(),
+                "    sec = getSector(secnum, i, 0);".to_string(),
+                "    if world[sec].floorheight == floor.floordestheight {".to_string(),
+                "        floor.texture = world[sec].floorpic;".to_string(),
+                "        floor.newspecial = world[sec].special;".to_string(),
+                "        break;".to_string(),
+                "    }".to_string(),
+                "}".to_string(),
             ]
         );
     }
