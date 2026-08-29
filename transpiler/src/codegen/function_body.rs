@@ -58,6 +58,7 @@ use crate::parser::ast::{
 use crate::parser::grammar::declarator_name;
 use crate::parser::parse_full;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Rust types this renderer knows are `World`-indexed cross-references,
@@ -149,6 +150,25 @@ struct FnBodyContext<'a> {
     /// for why a hoisted `&mut` binding doesn't work here. `None`
     /// everywhere else.
     mutating_handle: Option<MutatingHandle<'a>>,
+    /// Names of `self_param`'s own sibling locals declared as a bare
+    /// `int` at the function's top level (`render_fn`'s own
+    /// `collect_plain_int_locals`) -- needed for a real gap `A_PosAttack`
+    /// surfaced: C silently reinterprets an `angle_t` (`u32` under this
+    /// project's own field-type mapping) as a plain `int` on assignment
+    /// (`angle = actor->angle;`, `int angle;` vs. `angle_t angle;`), the
+    /// same bit-reinterpreting idiom `EV_VerticalDoor`'s own `secnum =
+    /// sec-sectors;` already needs a `.0 as i32` for -- confirmed a real
+    /// compile error (`u32 += i32`), not a hypothetical, by actually
+    /// compiling `A_PosAttack`'s first-draft output with `rustc` before
+    /// this field existed. Assigning a `self_param` field whose
+    /// registered type is `u32` into one of these names now renders an
+    /// explicit `as i32`, matching C's own implicit conversion instead of
+    /// leaving Rust to (wrongly, for this idiom) infer the local as
+    /// `u32` from its first use. Empty for every context that isn't a
+    /// plain tick/action function's own top-level locals (constructors,
+    /// triggers, and every isolated-fragment test below never exercise
+    /// this shape).
+    plain_int_locals: &'a HashSet<String>,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -640,6 +660,22 @@ fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
                 == Some("Option<PlayerId>")
         }
         Expr::Member { field, .. } if field == "player" => true,
+        // `!actor->target` (`A_PosAttack` and friends) -- `target`'s
+        // registered type (`Mobj.target: Option<Handle<Thinker>>`, per
+        // `struct_fields.rs`'s own self-referential-field mapping) is the
+        // general case `field == "player"` above only special-cased by
+        // name for: any self-struct field whose `self_field_types` entry
+        // is itself `Option<...>`-shaped gets the same `.is_none()`
+        // treatment, not just that one hardcoded name.
+        Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx
+                    .self_field_types
+                    .get(field.as_str())
+                    .is_some_and(|t| t.starts_with("Option<")) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -707,6 +743,20 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // does elsewhere.
         Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "twoSided") => {
             Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
+        }
+        // `if (P_CheckMeleeRange (actor))` (`A_TroopAttack` and several
+        // other melee-attack action functions) -- unlike `twoSided`,
+        // `P_CheckMeleeRange`'s own real corpus declaration
+        // (`p_enemy.c`) returns `boolean`, not a plain `int`, and
+        // `boolean` already maps to Rust's native `bool`
+        // (`struct_fields.rs`'s own established decision) -- so a call
+        // to it is already a real `bool` value, used directly with no
+        // `!= 0` cast at all. Matched narrowly by name, the same "hand-
+        // match the one real corpus shape" style as `twoSided`, rather
+        // than inferring a callee's C return type generically (nothing
+        // else here tracks function signatures).
+        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange") => {
+            Ok(render_expr(cond, ctx)?.0)
         }
         _ => Err(format!(
             "render_bool_expr: unsupported condition shape: {cond:?}"
@@ -1146,7 +1196,19 @@ fn render_switch(
                 }
             }
         }
-        let falls_through = !saw_break && i < stmts.len();
+        // `case 0: return;` (`A_Scream`) -- an arm can end in an
+        // unconditional `return` with no `break` at all, reaching the
+        // next label only because nothing else follows it in the source,
+        // not because it falls through. Confirmed against the real
+        // parsed AST before fixing rather than assumed: without this, the
+        // naive "no `break` seen before the next label" rule would have
+        // wrongly folded the *next* arm's own statements in as dead code
+        // after the `return` -- harmless to runtime behavior (`return`
+        // still exits first), but not the honest, clean-`match` output
+        // this renderer is otherwise held to, and `cargo clippy` flags
+        // the resulting unreachable code.
+        let terminates = saw_break || matches!(own_stmts.last(), Some(Stmt::Return(_)));
+        let falls_through = !terminates && i < stmts.len();
         arms.push(RawArm {
             labels,
             own_stmts,
@@ -1434,10 +1496,28 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let rhs_is_null = matches!(rhs.as_ref(), Expr::Ident(n) if n == "NULL");
         let rhs_is_ctor_var = !ctx.ctor_var_handle_name.is_empty()
             && matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.ctor_var);
+        // `angle = actor->angle;` (`A_PosAttack`) -- `angle`'s true C
+        // type is a plain `int` (`FnBodyContext::plain_int_locals`),
+        // while `actor->angle`'s registered Rust type is `u32`
+        // (`angle_t`, `struct_fields.rs`'s own mapping) -- C silently
+        // reinterprets the bits on assignment, which Rust needs an
+        // explicit `as i32` for, the same idea as `sec-sectors`'s own
+        // `.0 as i32` elsewhere in this module. Scoped narrowly to a
+        // direct `self_param` field read assigned straight into one of
+        // these locals -- confirmed a real compile error otherwise (see
+        // `FnBodyContext::plain_int_locals`'s own doc comment), not
+        // guessed at.
+        let lhs_is_plain_int_local =
+            matches!(lhs.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()));
+        let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
         let rhs_text = if lhs_is_specialdata && rhs_is_null {
             "None".to_string()
         } else if lhs_is_specialdata && rhs_is_ctor_var {
             format!("Some({rhs_text})")
+        } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
+            format!("{rhs_text} as i32")
         } else {
             rhs_text
         };
@@ -1518,6 +1598,37 @@ fn first_param_name(f: &FunctionDef) -> Option<String> {
     declarator_name(d)
 }
 
+/// Names declared as a bare, non-array, non-pointer `int` at a
+/// function's own top level (`int angle;`, possibly several off one
+/// specifier like `int secnum,rtn;`) -- see `FnBodyContext::
+/// plain_int_locals`. Deliberately shallow (top-level items only, not
+/// recursing into `if`/`switch`/`for` bodies): C89 declarations always
+/// sit at the top of whichever block they belong to, and every real
+/// corpus function needing this so far declares every local it needs
+/// directly at the function's own top level, the same scope
+/// `render_decl`'s own single-declarator-per-line precedent (`EV_DoDoor`'s
+/// `int secnum,rtn;`) was measured against.
+fn collect_plain_int_locals(items: &[BlockItem]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in items {
+        let BlockItem::Decl(d) = item else { continue };
+        if !matches!(
+            d.specifiers.type_specifiers.as_slice(),
+            [TypeSpecifier::Int]
+        ) {
+            continue;
+        }
+        for decl in &d.declarators {
+            if let DirectDeclarator::Ident(_) = decl.declarator.direct
+                && let Some(name) = declarator_name(&decl.declarator)
+            {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
 /// Renders `fn_name` (found in `corpus_dir.join(file)`) as a real Rust
 /// `pub fn`, given `self_rust_type` (the already-translated struct name
 /// for its first parameter) and `self_field_types` (that struct's
@@ -1537,6 +1648,7 @@ pub fn render_fn(
     let param_name = first_param_name(f)
         .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
     let no_extra_cross_refs = HashMap::new();
+    let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &param_name,
         self_field_types,
@@ -1546,6 +1658,7 @@ pub fn render_fn(
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
         mutating_handle: None,
+        plain_int_locals: &plain_int_locals,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     // Only a tick function that actually removes itself somewhere in its
@@ -1614,6 +1727,7 @@ pub fn render_weapon_fn(
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
         mutating_handle: None,
+        plain_int_locals: &HashSet::new(),
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     Ok(format!(
@@ -2088,6 +2202,7 @@ pub fn render_spawn_fn(
         ctor_field_types: &HashMap::new(),
         embedded_ctor: None,
         mutating_handle: None,
+        plain_int_locals: &HashSet::new(),
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -2439,6 +2554,7 @@ pub fn render_trigger_fn(
         ctor_field_types: &HashMap::new(),
         embedded_ctor,
         mutating_handle: None,
+        plain_int_locals: &HashSet::new(),
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -2967,6 +3083,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -3051,6 +3168,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -3095,6 +3213,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -3171,6 +3290,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -4318,6 +4438,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -4378,6 +4499,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -4464,6 +4586,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -4530,6 +4653,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -4597,6 +4721,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
         rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
@@ -4669,6 +4794,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             ctor_field_types: &HashMap::new(),
             embedded_ctor: None,
             mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -4972,6 +5098,556 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         assert_eq!(
             rendered,
             "pub fn A_BabyMetal(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_bspwlk);\n    A_Chase(mo);\n}"
+        );
+    }
+
+    /// `A_PosAttack`/`A_SPosAttack`/`A_CPosAttack` (`p_enemy.c`) -- the
+    /// first functions to check `!actor->target` (`Mobj.target: Option
+    /// <Handle<Thinker>>`, per `struct_fields.rs`'s own self-referential-
+    /// field mapping), generalizing `is_option_valued`'s `Expr::Member`
+    /// handling beyond the one hardcoded `player`-named field: any self-
+    /// struct field whose registered `self_field_types` entry is itself
+    /// `Option<...>`-shaped now gets the same `.is_none()` treatment.
+    /// Neither function dereferences *through* `target` any further than
+    /// this truthiness check (that needs real `Arena` read access from
+    /// inside a `Mobj`-shaped action function -- not yet built, see
+    /// `A_FaceTarget`'s own deferred investigation in the module docs),
+    /// so both stay within the fully generic call/arithmetic paths
+    /// otherwise: a forward-referencing call to not-yet-translated
+    /// `A_FaceTarget`, and C's familiar `(P_Random()-P_Random())<<20`/
+    /// `((P_Random()%5)+1)*3` damage-roll idiom, exercised here for the
+    /// first time with `%` inside an already-parenthesized sub-
+    /// expression rather than at the top level. **A real bug caught by
+    /// actually compiling this function's first-draft output with
+    /// `rustc`, not just unit-testing its text**: `angle = actor->angle;`
+    /// assigns `angle_t` (`u32`, `struct_fields.rs`'s own mapping) into a
+    /// plain C `int` local -- Rust's own deferred-`let` inference wrongly
+    /// picked up `u32` from this first use, then broke on the very next
+    /// line's `i32`-valued `P_Random()` arithmetic (`u32 += i32`, a real
+    /// `rustc` error, not hypothetical). Fixed generally, not just here:
+    /// `FnBodyContext::plain_int_locals` (`render_fn`'s own
+    /// `collect_plain_int_locals`) tracks which locals are genuinely
+    /// declared `int`, and assigning a `u32`-registered `self_param`
+    /// field straight into one now renders an explicit `as i32`,
+    /// matching C's own implicit bit-reinterpreting conversion -- the
+    /// same idea as `EV_VerticalDoor`'s own `secnum = sec-sectors;`
+    /// needing `.0 as i32`.
+    #[test]
+    fn test_a_pos_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>"), ("angle", "u32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PosAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PosAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut angle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             angle = actor.angle as i32;\n    \
+             slope = P_AimLineAttack(actor, angle, MISSILERANGE);\n    \
+             S_StartSound(actor, sfx_pistol);\n    \
+             angle += P_Random() - P_Random() << 20;\n    \
+             damage = (P_Random() % 5 + 1) * 3;\n    \
+             P_LineAttack(actor, angle, MISSILERANGE, slope, damage);\n\
+             }"
+        );
+    }
+
+    /// `A_SPosAttack` -- the same `!actor->target` check plus a real
+    /// `for` loop (`render_for`'s existing plain-assignment-init shape,
+    /// `EV_DoFloor`'s own precedent) firing three shots, plus the same
+    /// `bangle = actor->angle;` `as i32` reinterpretation as `A_PosAttack`.
+    #[test]
+    fn test_a_spos_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>"), ("angle", "u32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SPosAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SPosAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut i;\n    \
+             let mut angle;\n    \
+             let mut bangle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             S_StartSound(actor, sfx_shotgn);\n    \
+             A_FaceTarget(actor);\n    \
+             bangle = actor.angle as i32;\n    \
+             slope = P_AimLineAttack(actor, bangle, MISSILERANGE);\n    \
+             i = 0;\n    \
+             while i < 3 {\n        \
+             angle = bangle + (P_Random() - P_Random() << 20);\n        \
+             damage = (P_Random() % 5 + 1) * 3;\n        \
+             P_LineAttack(actor, angle, MISSILERANGE, slope, damage);\n        \
+             i += 1;\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_CPosAttack` -- `A_SPosAttack`'s own single-shot sibling (no
+    /// loop, otherwise byte-for-byte the same damage-roll shape).
+    #[test]
+    fn test_a_cpos_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>"), ("angle", "u32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_CPosAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CPosAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut angle;\n    \
+             let mut bangle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             S_StartSound(actor, sfx_shotgn);\n    \
+             A_FaceTarget(actor);\n    \
+             bangle = actor.angle as i32;\n    \
+             slope = P_AimLineAttack(actor, bangle, MISSILERANGE);\n    \
+             angle = bangle + (P_Random() - P_Random() << 20);\n    \
+             damage = (P_Random() % 5 + 1) * 3;\n    \
+             P_LineAttack(actor, angle, MISSILERANGE, slope, damage);\n\
+             }"
+        );
+    }
+
+    /// `A_PainAttack` -- reuses the same `!actor->target` check, then
+    /// two forward-referencing calls (`A_FaceTarget`, not-yet-translated
+    /// `A_PainShootSkull`), no new capability needed.
+    #[test]
+    fn test_a_pain_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PainAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PainAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             A_PainShootSkull(actor, actor.angle);\n\
+             }"
+        );
+    }
+
+    /// `A_PainDie` -- `actor->angle+ANG90`/`+ANG180`/`+ANG270`: `ANG90`
+    /// and friends (`tables.h`) are plain `#define`d hex-literal macros,
+    /// not enum constants, so they render as bare pass-through
+    /// identifiers the same way `MISSILERANGE` already does -- this
+    /// renderer never evaluates a macro, just emits whatever identifier
+    /// text the AST already has, trusting some later stage to have a
+    /// real Rust `const` with that same name (the same accepted
+    /// forward-reference gap as every other not-yet-wired global).
+    #[test]
+    fn test_a_pain_die_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PainDie",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PainDie(actor: &mut Mobj, world: &mut World) {\n    \
+             A_Fall(actor);\n    \
+             A_PainShootSkull(actor, actor.angle + ANG90);\n    \
+             A_PainShootSkull(actor, actor.angle + ANG180);\n    \
+             A_PainShootSkull(actor, actor.angle + ANG270);\n\
+             }"
+        );
+    }
+
+    /// `A_Scream` -- a `switch` whose very first arm (`case 0: return;`)
+    /// exercises the `render_switch` fallthrough fix from the previous
+    /// commit against real corpus code (not just a hand-built repro),
+    /// alongside two ordinary shared-case-label groups and a `default`.
+    /// `actor->type==MT_SPIDER || actor->type == MT_CYBORG` is the first
+    /// real corpus `==` comparison nested inside `||` this renderer has
+    /// hit -- ordinary precedence-aware `Binary` rendering, no new code.
+    #[test]
+    fn test_a_scream_renders_exactly() {
+        let field_types = field_types(&[("info", "&'static MobjInfo")]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Scream", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Scream(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut sound;\n    \
+             match actor.info.deathsound {\n        \
+             0 => {\n            \
+             return;\n        \
+             }\n        \
+             sfx_podth1 | sfx_podth2 | sfx_podth3 => {\n            \
+             sound = sfx_podth1 + P_Random() % 3;\n        \
+             }\n        \
+             sfx_bgdth1 | sfx_bgdth2 => {\n            \
+             sound = sfx_bgdth1 + P_Random() % 2;\n        \
+             }\n        \
+             _ => {\n            \
+             sound = actor.info.deathsound;\n        \
+             }\n    \
+             }\n    \
+             if actor.r#type == MT_SPIDER || actor.r#type == MT_CYBORG {\n        \
+             S_StartSound(None, sound);\n    \
+             } else {\n        \
+             S_StartSound(actor, sound);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_BspiAttack`/`A_CyberAttack` (`p_enemy.c`) -- the first
+    /// functions to pass `actor->target` itself (not a field reached
+    /// *through* it) as a bare call argument to a not-yet-translated
+    /// function (`P_SpawnMissile`) -- needs no new capability at all,
+    /// since the already-generic `Expr::Member`/`Expr::Call` paths
+    /// already resolve a bare `Option<Handle<Thinker>>`-valued field
+    /// read correctly; only *dereferencing through* it needs the not-
+    /// yet-built `Arena` read access this module still defers (see
+    /// `A_FaceTarget`).
+    #[test]
+    fn test_a_bspi_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BspiAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BspiAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             P_SpawnMissile(actor, actor.target, MT_ARACHPLAZ);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_cyber_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_CyberAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CyberAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             P_SpawnMissile(actor, actor.target, MT_ROCKET);\n\
+             }"
+        );
+    }
+
+    /// `A_TroopAttack`/`A_HeadAttack` -- a melee-or-missile branch via
+    /// `if (P_CheckMeleeRange (actor))`, the first bare-`boolean`-call
+    /// condition this renderer has hit: `P_CheckMeleeRange`'s own real
+    /// declared return type is `boolean` (not `int`, unlike `twoSided`),
+    /// which already maps to Rust's native `bool` -- used directly with
+    /// no `!= 0` cast, a new narrow `render_bool_expr` arm.
+    #[test]
+    fn test_a_troop_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_TroopAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_TroopAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             S_StartSound(actor, sfx_claw);\n        \
+             damage = (P_Random() % 8 + 1) * 3;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n        \
+             return;\n    \
+             }\n    \
+             P_SpawnMissile(actor, actor.target, MT_TROOPSHOT);\n\
+             }"
+        );
+    }
+
+    /// `A_SargAttack` -- the melee branch has no `return`/missile
+    /// fallback at all (a pure gate: does nothing if out of range).
+    #[test]
+    fn test_a_sarg_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SargAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SargAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             damage = (P_Random() % 10 + 1) * 4;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_head_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_HeadAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_HeadAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             damage = (P_Random() % 6 + 1) * 10;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n        \
+             return;\n    \
+             }\n    \
+             P_SpawnMissile(actor, actor.target, MT_HEADSHOT);\n\
+             }"
+        );
+    }
+
+    /// `A_BruisAttack` -- the one melee/missile attack in this group
+    /// with no `A_FaceTarget` call at all anywhere in its body, confirmed
+    /// directly against the real source rather than assumed missing --
+    /// translated exactly as the original has it, quirk and all.
+    #[test]
+    fn test_a_bruis_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BruisAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BruisAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut damage;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             if P_CheckMeleeRange(actor) {\n        \
+             S_StartSound(actor, sfx_claw);\n        \
+             damage = (P_Random() % 8 + 1) * 10;\n        \
+             P_DamageMobj(actor.target, actor, actor, damage);\n        \
+             return;\n    \
+             }\n    \
+             P_SpawnMissile(actor, actor.target, MT_BRUISERSHOT);\n\
+             }"
+        );
+    }
+
+    /// `A_VileStart` -- a single-statement sound call, same shape as
+    /// `A_XScream`.
+    #[test]
+    fn test_a_vile_start_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_VileStart",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_VileStart(actor: &mut Mobj, world: &mut World) {\n    S_StartSound(actor, sfx_vilatk);\n}"
+        );
+    }
+
+    /// `A_StartFire`/`A_FireCrackle` -- sound-then-forward-reference-call,
+    /// the same two-statement shape as `A_Hoof`/`A_Metal`, just calling
+    /// not-yet-translated `A_Fire` instead of `A_Chase`.
+    #[test]
+    fn test_a_start_fire_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_StartFire",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_StartFire(actor: &mut Mobj, world: &mut World) {\n    S_StartSound(actor, sfx_flamst);\n    A_Fire(actor);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_fire_crackle_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_FireCrackle",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FireCrackle(actor: &mut Mobj, world: &mut World) {\n    S_StartSound(actor, sfx_flame);\n    A_Fire(actor);\n}"
+        );
+    }
+
+    /// `A_BrainPain` -- a single `S_StartSound(NULL, ..)` call, `A_Look`'s
+    /// own "full volume" idiom, confirming `NULL` -> `None` still needs
+    /// no special casing when it's the *only* statement in the function.
+    #[test]
+    fn test_a_brain_pain_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainPain",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainPain(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(None, sfx_bospn);\n}"
+        );
+    }
+
+    /// `A_BrainDie` -- a single bare forward-referencing call with no
+    /// arguments at all, the simplest shape yet.
+    #[test]
+    fn test_a_brain_die_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainDie",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainDie(mo: &mut Mobj, world: &mut World) {\n    G_ExitLevel();\n}"
+        );
+    }
+
+    /// `A_SpawnSound` -- `A_Hoof`'s own sound-then-tail-call shape, just
+    /// calling `A_SpawnFly` instead of `A_Chase`.
+    #[test]
+    fn test_a_spawn_sound_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SpawnSound",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SpawnSound(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_boscub);\n    A_SpawnFly(mo);\n}"
+        );
+    }
+
+    /// `A_PlayerScream` -- the first function with a scalar local
+    /// declared *with* an initializer (`int sound = sfx_pldeth;`,
+    /// `render_decl`'s existing inline-initializer support, `EV_DoFloor`'s
+    /// own `minsize` precedent) outside any constructor context, plus a
+    /// `&&` of an unregistered global (`gamemode`, rendered as a bare
+    /// pass-through identifier) and a self-field comparison against a
+    /// negative literal.
+    #[test]
+    fn test_a_player_scream_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PlayerScream",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PlayerScream(mo: &mut Mobj, world: &mut World) {\n    \
+             let mut sound = sfx_pldeth;\n    \
+             if gamemode == commercial && mo.health < -50 {\n        \
+             sound = sfx_pdiehi;\n    \
+             }\n    \
+             S_StartSound(mo, sound);\n\
+             }"
         );
     }
 }
