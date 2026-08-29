@@ -142,6 +142,23 @@ impl<T> Arena<T> {
         self.slots.get_mut(handle.index as usize)?.as_mut()
     }
 
+    /// A read-only pass over every live slot, in insertion order --
+    /// mirrors the original's own raw `thinkercap` linked-list walk
+    /// (`for (th = thinkercap.next; th != &thinkercap; th = th->next)`,
+    /// `p_enemy.c`'s `A_PainShootSkull`/`A_KeenDie`/`A_BrainAwake`/
+    /// `A_BossDeath` all use this exact idiom to scan every live thinker
+    /// without ticking or mutating any of them). Since `insert` always
+    /// appends at the true end and a tombstoned slot stays permanently
+    /// `None` for the rest of this arena's lifetime (this module's own
+    /// doc comment), a plain forward `Vec` scan already visits live slots
+    /// in the same order the original's list traversal would -- no extra
+    /// bookkeeping needed, unlike `run`'s own take-then-put-back dance
+    /// (nothing here ever hands a slot's value back to the caller by
+    /// `&mut`, so there's no reentrancy hazard to guard against).
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().filter_map(|slot| slot.as_ref())
+    }
+
     /// One pass over every live slot, in insertion order -- mirrors
     /// `P_RunThinkers`' single forward traversal. `f` gets the item's own
     /// value, its handle, and the arena itself, so it can remove or insert
@@ -292,6 +309,17 @@ mod tests {
         let mut seen_next = Vec::new();
         arena.run(|v, _, _| seen_next.push(*v));
         assert_eq!(seen_next, vec![2]);
+    }
+
+    #[test]
+    fn test_iter_visits_live_slots_in_insertion_order_skipping_removed() {
+        let mut arena: Arena<i32> = Arena::new();
+        let a = arena.insert(1);
+        arena.insert(2);
+        arena.insert(3);
+        arena.remove(a);
+        let seen: Vec<i32> = arena.iter().copied().collect();
+        assert_eq!(seen, vec![2, 3]);
     }
 
     #[test]

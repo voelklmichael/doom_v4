@@ -240,6 +240,25 @@ struct FnBodyContext<'a> {
     /// itself (constructors/triggers/isolated-fragment tests never
     /// self-remove).
     self_removal_ident: &'a str,
+    /// Set only while rendering the real per-item condition/body inside
+    /// `render_thinker_list_scan`'s own `for thinker in thinkers.iter()`
+    /// loop -- `(original_name, binding_name)`, e.g. `("currentthinker",
+    /// "m")`. A bare reference to `original_name` anywhere in that scope
+    /// (always by itself, never `original_name->field` directly -- the
+    /// real corpus idiom always goes through an intermediate `(mobj_t*)`
+    /// cast first, e.g. `((mobj_t*)currentthinker)->type`, which `Expr::
+    /// Cast`'s own existing pure-passthrough rendering already reduces to
+    /// a bare `Expr::Ident` before this ever needs to look at it) resolves
+    /// to `binding_name` directly, no `Arena` lookup at all -- unlike
+    /// every other cross-reference alias this module tracks (`target`/
+    /// `tracer` locals, `P_SpawnMobj` locals), which all need a fresh
+    /// `thinkers.get`/`get_mut` call since they only ever hold a
+    /// `Handle<Thinker>`. This one is different: `thinker` here is
+    /// already `&Mobj` straight out of the `if let Thinker::Mobj(m) =
+    /// thinker` pattern match `render_thinker_list_scan` itself renders,
+    /// so the alias is a plain rename, not a dereference. `None`
+    /// everywhere else.
+    thinker_scan_alias: Option<(&'a str, &'a str)>,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -436,6 +455,20 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
     match e {
         Expr::IntLiteral(s) => Ok((s.clone(), false)),
         Expr::Ident(name) => {
+            // `currentthinker` inside `render_thinker_list_scan`'s own
+            // `for thinker in thinkers.iter() { if let Thinker::Mobj(m) =
+            // thinker { .. } }` -- a bare rename to the loop's own match
+            // binding (`m`), not an `Arena` lookup: `m` is already `&Mobj`
+            // straight out of the pattern match, unlike every other
+            // cross-reference alias this module tracks. `Expr::Cast`'s own
+            // pure-passthrough rendering (`(mobj_t*)currentthinker`)
+            // already reduces to this bare `Ident` before render_expr ever
+            // sees the cast, so no separate `Cast`-aware arm is needed.
+            if let Some((from, to)) = ctx.thinker_scan_alias
+                && name == from
+            {
+                return Ok((to.to_string(), false));
+            }
             if !ctx.ctor_var_handle_name.is_empty()
                 && !ctx.ctor_var.is_empty()
                 && name == ctx.ctor_var
@@ -1746,6 +1779,220 @@ fn render_while(
     Ok(lines)
 }
 
+/// Detects `curvar = thinkercap.next;` -- the initializer half of the
+/// real corpus's own raw intrusive-linked-list scan over every live
+/// thinker (`p_enemy.c`'s `A_PainShootSkull`/`A_KeenDie`/`A_BrainAwake`/
+/// `A_BossDeath` all open their own scan this exact way). Returns the
+/// initialized variable's name so the matching `while` loop just after
+/// it (`is_thinker_list_scan_while`) can be confirmed to walk the same
+/// variable, not assumed from adjacency alone.
+fn is_thinker_list_scan_init(stmt: &Stmt) -> Option<&str> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = stmt
+    else {
+        return None;
+    };
+    let Expr::Ident(var) = lhs.as_ref() else {
+        return None;
+    };
+    let Expr::Member {
+        base,
+        field,
+        arrow: false,
+    } = rhs.as_ref()
+    else {
+        return None;
+    };
+    if field != "next" {
+        return None;
+    }
+    matches!(base.as_ref(), Expr::Ident(n) if n == "thinkercap").then_some(var.as_str())
+}
+
+/// `while (curvar != &thinkercap)` -- the loop guard pairing with
+/// `is_thinker_list_scan_init`'s own initializer, confirmed to name the
+/// same variable rather than assumed from adjacency. Returns the loop's
+/// own body on a match.
+fn is_thinker_list_scan_while<'a>(stmt: &'a Stmt, var: &str) -> Option<&'a Stmt> {
+    let Stmt::While { cond, body } = stmt else {
+        return None;
+    };
+    let Expr::Binary {
+        op: BinaryOp::Ne,
+        lhs,
+        rhs,
+    } = cond
+    else {
+        return None;
+    };
+    if !matches!(lhs.as_ref(), Expr::Ident(n) if n == var) {
+        return None;
+    }
+    let matches_thinkercap = matches!(
+        rhs.as_ref(),
+        Expr::Unary { op: UnaryOp::AddrOf, expr }
+            if matches!(expr.as_ref(), Expr::Ident(n) if n == "thinkercap")
+    );
+    matches_thinkercap.then_some(body.as_ref())
+}
+
+/// `curvar->function.acp1 == (actionf_p1)P_MobjThinker` -- the tag check
+/// every real corpus scan uses to confirm a raw `thinker_t*` is actually
+/// a live `mobj_t` before casting to it. Stripped rather than rendered:
+/// matching `Thinker::Mobj(..)`'s own closed-enum variant already *is*
+/// this check, under this project's own polymorphism design (`docs/
+/// 03_TRANSPILER.md`'s Doom Action Pointers/Thinker entries) -- there's
+/// no C vtable left to compare a function pointer against.
+fn is_mobj_thinker_tag_check(expr: &Expr, var: &str) -> bool {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        lhs,
+        rhs,
+    } = expr
+    else {
+        return false;
+    };
+    let Expr::Member {
+        base,
+        field,
+        arrow: false,
+    } = lhs.as_ref()
+    else {
+        return false;
+    };
+    if field != "acp1" {
+        return false;
+    }
+    let Expr::Member {
+        base: inner_base,
+        field: inner_field,
+        arrow: true,
+    } = base.as_ref()
+    else {
+        return false;
+    };
+    if inner_field != "function" {
+        return false;
+    }
+    if !matches!(inner_base.as_ref(), Expr::Ident(n) if n == var) {
+        return false;
+    }
+    matches!(
+        rhs.as_ref(),
+        Expr::Cast { expr, .. } if matches!(expr.as_ref(), Expr::Ident(n) if n == "P_MobjThinker")
+    )
+}
+
+/// Renders the whole `curvar = thinkercap.next; while (curvar !=
+/// &thinkercap) { if (curvar->function.acp1 == (actionf_p1)P_MobjThinker
+/// && <real condition>) <real body>; curvar = curvar->next; }` idiom as
+/// one Rust `for` loop over `Arena::iter()` (`runtime/arena.rs`),
+/// consuming both source statements from the caller (`render_compound_
+/// items`) -- `Thinker::Mobj(m)`'s own pattern match already encodes the
+/// tag check, and `Arena::iter()`'s own forward scan over live slots
+/// already encodes the list walk, so nothing is left to render for
+/// either.
+///
+/// Scoped narrowly to the one real shape `A_PainShootSkull` uses (a
+/// single `if (tagcheck && cond) stmt;`, no early `continue`) -- deliberately
+/// not generalized to `A_KeenDie`/`A_BrainAwake`'s own sibling shape
+/// (`if (!tagcheck) continue; <rest of the loop body, unconditional>`),
+/// since both remain separately blocked regardless (a synthetic stack-
+/// local `line_t`, and global mutable-variable writes -- neither
+/// resolved by this piece alone), matching this module's usual "prove
+/// against one concretely-verified real function first" discipline
+/// rather than guessing the second shape's needs ahead of using it.
+fn render_thinker_list_scan(
+    var: &str,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let Stmt::Compound(c) = body else {
+        return Err(
+            "render_thinker_list_scan: only a compound loop body is supported so far".to_string(),
+        );
+    };
+    let Some((last, rest)) = c.items.split_last() else {
+        return Err("render_thinker_list_scan: empty loop body".to_string());
+    };
+    // `curvar = curvar->next;` -- the list-walk step, implicit in
+    // `Arena::iter()`'s own advancing, so it's consumed here rather than
+    // rendered.
+    let BlockItem::Stmt(Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    }))) = last
+    else {
+        return Err(
+            "render_thinker_list_scan: expected `curvar = curvar->next;` as the loop body's last statement"
+                .to_string(),
+        );
+    };
+    let step_ok = matches!(lhs.as_ref(), Expr::Ident(n) if n == var)
+        && matches!(
+            rhs.as_ref(),
+            Expr::Member { base, field, arrow: true }
+                if field == "next" && matches!(base.as_ref(), Expr::Ident(n) if n == var)
+        );
+    if !step_ok {
+        return Err(
+            "render_thinker_list_scan: expected `curvar = curvar->next;` as the loop body's last statement"
+                .to_string(),
+        );
+    }
+    let [
+        BlockItem::Stmt(Stmt::If {
+            cond,
+            then_branch,
+            else_branch: None,
+        }),
+    ] = rest
+    else {
+        return Err(
+            "render_thinker_list_scan: only a single `if (tagcheck && cond) stmt;` real body is supported so far"
+                .to_string(),
+        );
+    };
+    let Expr::Binary {
+        op: BinaryOp::LogAnd,
+        lhs: tag,
+        rhs: real_cond,
+    } = cond
+    else {
+        return Err(
+            "render_thinker_list_scan: expected `tagcheck && cond` as the `if`'s own condition"
+                .to_string(),
+        );
+    };
+    if !is_mobj_thinker_tag_check(tag, var) {
+        return Err("render_thinker_list_scan: unrecognized tag check".to_string());
+    }
+    let inner_ctx = FnBodyContext {
+        thinker_scan_alias: Some((var, "m")),
+        ..*ctx
+    };
+    let (cond_text, _) = render_expr(real_cond, &inner_ctx)?;
+    let mut lines = vec![format!(
+        "{}for thinker in thinkers.iter() {{",
+        indent(depth)
+    )];
+    lines.push(format!(
+        "{}if let Thinker::Mobj(m) = thinker {{",
+        indent(depth + 1)
+    ));
+    lines.push(format!("{}if {cond_text} {{", indent(depth + 2)));
+    lines.extend(render_stmt(then_branch, &inner_ctx, depth + 3)?);
+    lines.push(format!("{}}}", indent(depth + 2)));
+    lines.push(format!("{}}}", indent(depth + 1)));
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
+}
+
 /// Renders `for (init; cond; step) body` -- C's counted-loop idiom
 /// (`EV_DoFloor`'s own two otherwise-identical `for (i = 0; i <
 /// sec->linecount; i++)` adjacency scans). Only a plain-assignment init
@@ -2318,11 +2565,26 @@ fn render_compound_items(
     }
 
     let mut out = Vec::new();
-    for item in items {
-        match item {
+    let mut i = 0;
+    while i < items.len() {
+        // `curvar = thinkercap.next; while (curvar != &thinkercap) { .. }`
+        // (`render_thinker_list_scan`'s own doc comment) -- a two-
+        // statement idiom, so it needs its own lookahead here rather than
+        // fitting the plain per-item dispatch just below.
+        if let BlockItem::Stmt(init_stmt) = &items[i]
+            && let Some(var) = is_thinker_list_scan_init(init_stmt)
+            && let Some(BlockItem::Stmt(while_stmt)) = items.get(i + 1)
+            && let Some(body) = is_thinker_list_scan_while(while_stmt, var)
+        {
+            out.extend(render_thinker_list_scan(var, body, ctx, depth)?);
+            i += 2;
+            continue;
+        }
+        match &items[i] {
             BlockItem::Decl(d) => out.extend(render_decl(d, ctx, depth)?),
             BlockItem::Stmt(s) => out.extend(render_stmt(s, ctx, depth)?),
         }
+        i += 1;
     }
     Ok(out)
 }
@@ -2576,6 +2838,7 @@ fn render_fn_impl(
         plain_int_locals: &plain_int_locals,
         angle_t_locals: &angle_t_locals,
         self_removal_ident,
+        thinker_scan_alias: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let handle_part = if needs_self_removal && !composed_self_removal {
@@ -2659,6 +2922,7 @@ pub fn render_weapon_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &angle_t_locals,
+        thinker_scan_alias: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let needs_self_handle_deref =
@@ -3817,6 +4081,7 @@ pub fn render_spawn_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
+        thinker_scan_alias: None,
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -4173,6 +4438,7 @@ pub fn render_trigger_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
+        thinker_scan_alias: None,
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -4890,6 +5156,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -4979,6 +5246,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -5028,6 +5296,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -5098,6 +5367,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -5255,6 +5525,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -6407,6 +6678,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -6472,6 +6744,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -6563,6 +6836,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -6634,6 +6908,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -6706,6 +6981,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
         rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
@@ -6783,6 +7059,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -8235,6 +8512,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            thinker_scan_alias: None,
         };
         let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
@@ -8914,5 +9192,92 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
     }
 }";
         assert_eq!(rendered, expected);
+    }
+
+    /// Read-only `Arena<Thinker>` iteration, the gap flagged for many
+    /// rounds now (`A_PainShootSkull`/`A_Look`/`A_KeenDie`/`A_BrainAwake`/
+    /// `A_BossDeath` all scan the raw `thinkercap` intrusive list before
+    /// doing their own real work) -- surveyed all five real corpus
+    /// candidates before designing anything, matching this module's own
+    /// discipline. `A_PainShootSkull` is the only one of the five with no
+    /// *second*, unrelated blocker stacked on top: `A_KeenDie` also needs
+    /// a synthetic stack-local `line_t` passed by address into `EV_DoDoor`
+    /// (the same open design question `A_BossDeath` already carries);
+    /// `A_BrainAwake`/`A_BossDeath` also need global mutable-variable
+    /// writes (`numbraintargets`/`braintargeton`/`braintargets[]`),
+    /// nothing this renderer has ever written to before; `A_Look` needs
+    /// `goto`. `Arena::iter()` (`runtime/arena.rs`) is a plain forward
+    /// scan over live slots -- correct in the same insertion order the
+    /// original's own list traversal visits, since `insert` always
+    /// appends at the true end and a tombstoned slot stays dead forever
+    /// (this arena's own doc comment), no bookkeeping needed beyond
+    /// `filter_map`.
+    ///
+    /// `render_thinker_list_scan` (`FnBodyContext::thinker_scan_alias`)
+    /// renders the whole two-statement idiom (`curvar = thinkercap.next;
+    /// while (curvar != &thinkercap) { if (curvar->function.acp1 ==
+    /// (actionf_p1)P_MobjThinker && <cond>) <body>; curvar = curvar->
+    /// next; }`) as one `for thinker in thinkers.iter() { if let Thinker::
+    /// Mobj(m) = thinker { if <cond'> { <body'> } } }` -- the tag check
+    /// is stripped entirely (matching the `Mobj` variant already *is* the
+    /// check, under the closed-`enum` polymorphism design), and the
+    /// `((mobj_t*)curvar)->type` cast-then-dereference idiom needs no
+    /// dedicated `Cast`-aware rendering at all: `Expr::Cast`'s own
+    /// existing pure-passthrough arm already reduces it to a bare
+    /// `Ident(curvar)` before the new `thinker_scan_alias` rename (`m`)
+    /// ever needs to look at it.
+    ///
+    /// This whole function still can't render end-to-end -- `prestep`
+    /// (declared plain `int`, assigned a `FixedT`-valued expression, then
+    /// used as `FixedT` in `FixedMul`) is a fresh instance of the same
+    /// ambiguous-typing gap `A_SkullAttack`'s own `dist` and
+    /// `A_BrainExplode`'s `x`/`y`/`z` locals already surfaced, unresolved
+    /// generically; `P_TryMove`/`newmobj->x`/`.y` and `P_DamageMobj` add
+    /// nothing new on top of already-proven `P_SpawnMobj` write-access
+    /// machinery, but haven't been assembled together yet -- so this is
+    /// proven the same way `T_VerticalDoor`'s own self-removal/`NULL`/
+    /// shared-case-label pieces were before the whole function rendered:
+    /// against the *real* cloned AST subtree (`A_PainShootSkull`'s own
+    /// two statements, items 9 and 10 of its body -- 8 leading `Decl`s,
+    /// then `count = 0;`), not a fabricated stand-in.
+    #[test]
+    fn test_thinker_list_scan_against_real_a_pain_shoot_skull() {
+        let path = corpus_dir().join("p_enemy.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_enemy.c should parse");
+        let f = find_function_def(&unit.items, "A_PainShootSkull").expect("not found");
+        let BlockItem::Stmt(init_stmt) = &f.body.items[9] else {
+            panic!("expected item 9 to be `currentthinker = thinkercap.next;`");
+        };
+        assert_eq!(is_thinker_list_scan_init(init_stmt), Some("currentthinker"));
+        let no_extra_cross_refs = HashMap::new();
+        let ctx = FnBodyContext {
+            self_param: "mo",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &no_extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+            same_handle_write: None,
+            same_target_write: None,
+            plain_int_locals: &HashSet::new(),
+            angle_t_locals: &HashSet::new(),
+            self_removal_ident: "arena",
+            thinker_scan_alias: None,
+        };
+        let rendered = render_compound_items(&f.body.items[9..11], &ctx, 1)
+            .expect("should render cleanly")
+            .join("\n");
+        assert_eq!(
+            rendered,
+            "    for thinker in thinkers.iter() {\n        \
+             if let Thinker::Mobj(m) = thinker {\n            \
+             if m.r#type == MT_SKULL {\n                \
+             count += 1;\n            \
+             }\n        \
+             }\n    \
+             }"
+        );
     }
 }
