@@ -190,6 +190,19 @@ struct FnBodyContext<'a> {
     /// idiom) and every isolated-fragment test below that doesn't
     /// exercise this shape.
     same_handle_write: Option<&'a str>,
+    /// The identifier a self-removal statement (`is_self_removal_call`)
+    /// renders through: `"arena"` for the original, still-most-common
+    /// shape (self-removal alone, its own dedicated `arena: &mut
+    /// Arena<Thinker>` parameter), or `"thinkers"` when `render_fn_impl`
+    /// has composed self-removal with target/tracer dereferencing or a
+    /// spawned mobj's own mutable writes (`A_SpawnFly`'s own idiom) --
+    /// both operate on the very same real `Arena<Thinker>`, so a composed
+    /// function gets exactly one shared `thinkers: &mut Arena<Thinker>`
+    /// parameter rather than two independently-named ones aliasing the
+    /// same value. `"arena"` for every context that isn't `render_fn_impl`
+    /// itself (constructors/triggers/isolated-fragment tests never
+    /// self-remove).
+    self_removal_ident: &'a str,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -904,7 +917,7 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
@@ -1173,6 +1186,17 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         {
             continue;
         }
+        // `mobjtype_t type;` (`A_SpawnFly`'s own monster-selection local)
+        // -- a plain local literally named `type`, a real Rust keyword.
+        // Every declarator name reaching this point used to render
+        // unescaped (only a *field* access, via `rust_field_name`, or a
+        // bare-value *reference*, via `rust_ident_name`, went through
+        // escaping -- the binding site itself never did, since no
+        // corpus function had needed a keyword-colliding plain local
+        // until this one), so `let mut type;` would have been emitted,
+        // the same class of bug `EV_DoCeiling`'s own unescaped `type`
+        // *parameter* already got fixed for, just at a different site.
+        let name = rust_ident_name(&name)?;
         lines.push(format!("{}let mut {name}{init_text};", indent(depth)));
     }
     Ok(lines)
@@ -1701,15 +1725,31 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
     let Expr::Call { callee, args } = e else {
         return false;
     };
-    if !matches!(callee.as_ref(), Expr::Ident(n) if n == "P_RemoveThinker") {
-        return false;
-    }
     let [arg] = args.as_slice() else {
         return false;
     };
-    matches!(arg, Expr::Unary { op: UnaryOp::AddrOf, expr }
-        if matches!(expr.as_ref(), Expr::Member { base, field, arrow: true }
-            if field == "thinker" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
+    match callee.as_ref() {
+        Expr::Ident(n) if n == "P_RemoveThinker" => {
+            matches!(arg, Expr::Unary { op: UnaryOp::AddrOf, expr }
+                if matches!(expr.as_ref(), Expr::Member { base, field, arrow: true }
+                    if field == "thinker" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
+        }
+        // `P_RemoveMobj(mo)` (`A_SpawnFly`'s own idiom, `p_mobj.c`'s real
+        // declared shape `void P_RemoveMobj(mobj_t* mobj)`) -- a second,
+        // narrower real callee for the exact same "remove my own handle"
+        // shape as `P_RemoveThinker(&self->thinker)`, just called through
+        // the mobj-specific wrapper (which itself calls `P_RemoveThinker`
+        // internally, confirmed by reading `p_mobj.c` directly) instead
+        // of the raw thinker API. Matched only on the receiver's own bare
+        // name, not any other identifier -- `P_RemoveMobj(&other->mobj)`
+        // would need to *name* a different handle, a real but distinct,
+        // not-yet-attempted case, same as `P_RemoveThinker`'s own comment
+        // above.
+        Expr::Ident(n) if n == "P_RemoveMobj" => {
+            matches!(arg, Expr::Ident(n) if n == self_param)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `e` is built entirely from a known real `FixedT` source
@@ -1784,7 +1824,7 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     // docs/03_TRANSPILER.md), so this only renders correctly once a
     // caller supplies them by hand.
     if is_self_removal_call(e, ctx.self_param) {
-        return Ok("arena.remove(handle)".to_string());
+        return Ok(format!("{}.remove(handle)", ctx.self_removal_ident));
     }
     if let Expr::Assign { op, lhs, rhs } = e {
         // `door->field = expr;`, inside `render_existing_thinker_mutation`'s
@@ -2153,19 +2193,6 @@ fn render_fn_impl(
             .map(|(k, v)| (k.clone(), v.clone())),
     );
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
-    let ctx = FnBodyContext {
-        self_param: &param_name,
-        self_field_types,
-        extra_cross_ref_idents: &extra_cross_ref_idents,
-        ctor_var: "",
-        ctor_var_handle_name: "",
-        ctor_field_types: &HashMap::new(),
-        embedded_ctor: None,
-        mutating_handle: None,
-        same_handle_write: None,
-        plain_int_locals: &plain_int_locals,
-    };
-    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     // Only a tick function that actually removes itself somewhere in its
     // body (`is_self_removal_call`, possibly nested arbitrarily deep in
     // `switch`/`if` -- `T_VerticalDoor` buries several inside two levels
@@ -2207,21 +2234,55 @@ fn render_fn_impl(
     // parameter name without self-removal's own `arena` companion.
     let needs_self_handle_value =
         body_has_self_handle_value(&f.body.items, &param_name, &spawn_mobj_locals);
-    if needs_self_removal && (needs_target_deref || needs_spawn_mut || needs_self_handle_value) {
+    // `A_SpawnFly`'s own idiom (self-removal *and* target-alias
+    // dereferencing/spawned-mobj writes in the same body) is the first
+    // real function needing both at once -- previously rejected outright.
+    // Both self-removal's `arena.remove(handle)` and the target-deref/
+    // spawn-mut sites' `thinkers.get`/`get_mut` calls operate on the same
+    // real `Arena<Thinker>`, so a caller can't sensibly be asked for two
+    // independent `&mut Arena<Thinker>` parameters (that would demand two
+    // *disjoint* arenas, aliasing the same one being unsound) -- composing
+    // them means exactly one shared `thinkers: &mut Arena<Thinker>`
+    // parameter, with the self-removal statement itself rendering through
+    // that same name (`thinkers.remove(handle)`) instead of a second,
+    // separately-named `arena` parameter. `needs_self_handle_value`
+    // combined with self-removal has no real corpus example yet (unlike
+    // this one), so that combination is left rejected rather than guessed.
+    if needs_self_removal && needs_self_handle_value {
         return Err(format!(
-            "{fn_name}: needs both self-removal and target/tracer dereferencing or a spawned mobj's own handle -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
+            "{fn_name}: needs both self-removal and a spawned mobj's own handle value -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
         ));
     }
-    let handle_part = if needs_self_removal {
+    let composed_self_removal = needs_self_removal && (needs_target_deref || needs_spawn_mut);
+    let self_removal_ident = if composed_self_removal {
+        "thinkers"
+    } else {
+        "arena"
+    };
+    let ctx = FnBodyContext {
+        self_param: &param_name,
+        self_field_types,
+        extra_cross_ref_idents: &extra_cross_ref_idents,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
+        embedded_ctor: None,
+        mutating_handle: None,
+        same_handle_write: None,
+        plain_int_locals: &plain_int_locals,
+        self_removal_ident,
+    };
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    let handle_part = if needs_self_removal && !composed_self_removal {
         ", handle: Handle<Thinker>, arena: &mut Arena<Thinker>"
-    } else if needs_self_handle_value {
+    } else if needs_self_removal || needs_self_handle_value {
         ", handle: Handle<Thinker>"
     } else {
         ""
     };
-    let thinkers_part = if needs_self_removal {
+    let thinkers_part = if needs_self_removal && !composed_self_removal {
         ""
-    } else if needs_spawn_mut {
+    } else if needs_spawn_mut || composed_self_removal {
         ", thinkers: &mut Arena<Thinker>"
     } else if needs_target_deref {
         ", thinkers: &Arena<Thinker>"
@@ -2284,6 +2345,7 @@ pub fn render_weapon_fn(
         embedded_ctor: None,
         mutating_handle: None,
         same_handle_write: None,
+        self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -3139,6 +3201,7 @@ pub fn render_spawn_fn(
         embedded_ctor: None,
         mutating_handle: None,
         same_handle_write: None,
+        self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
     };
     let no_field_defaults = HashMap::new();
@@ -3492,6 +3555,7 @@ pub fn render_trigger_fn(
         embedded_ctor,
         mutating_handle: None,
         same_handle_write: None,
+        self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
     };
 
@@ -4206,6 +4270,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
@@ -4292,6 +4357,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -4338,6 +4404,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -4405,6 +4472,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
@@ -4486,6 +4554,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
@@ -5635,6 +5704,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
@@ -5697,6 +5767,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
@@ -5785,6 +5856,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
@@ -5853,6 +5925,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
@@ -5922,6 +5995,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
@@ -5996,6 +6070,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
@@ -7445,6 +7520,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             embedded_ctor: None,
             mutating_handle: None,
             same_handle_write: None,
+            self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
         };
         let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
@@ -7758,6 +7834,104 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.x += m.momx; };\n    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.y += m.momy; };\n    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.tracer = actor.target; };\n\
+             }"
+        );
+    }
+
+    /// `A_SpawnFly` (`p_enemy.c`) -- the function that motivated composing
+    /// self-removal with target-alias dereferencing and spawned-mobj
+    /// arena access in one signature: `--mo->reactiontime` (the same
+    /// countdown-to-zero idiom `T_FireFlicker`/`A_SkullAttack` already
+    /// use), `targ = mo->target;` then dereferencing through it
+    /// (`P_SpawnMobj(targ->x, targ->y, targ->z, ..)`), two independent
+    /// `P_SpawnMobj` locals (`fog`, `newmobj`), a bare `P_LookForPlayers`
+    /// call used directly as an `if` condition (a second real
+    /// `boolean`-returning corpus function, joining `P_CheckMeleeRange`/
+    /// `P_CheckSight` in `is_bool_returning_call`), a plain local
+    /// literally named `type` (`mobjtype_t type;`, needing `render_decl`'s
+    /// own binding-site escaping, previously only applied to a
+    /// *parameter*'s declaration and to any *field* access, never a plain
+    /// local's own `let`), and finally `P_RemoveMobj(mo)` -- a second real
+    /// callee `is_self_removal_call` now recognizes for "remove my own
+    /// handle" (`p_mobj.c` confirms it just calls `P_RemoveThinker`
+    /// internally), landing on the newly-composed `thinkers: &mut
+    /// Arena<Thinker>, handle: Handle<Thinker>` signature and rendering as
+    /// `thinkers.remove(handle)`, not the self-removal-alone shape's own
+    /// separately-named `arena` parameter.
+    #[test]
+    fn test_a_spawn_fly_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SpawnFly",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SpawnFly(mo: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
+             let mut newmobj;\n    \
+             let mut fog;\n    \
+             let mut targ;\n    \
+             let mut r;\n    \
+             let mut r#type;\n    \
+             mo.reactiontime -= 1;\n    \
+             if mo.reactiontime != 0 {\n        \
+             return;\n    \
+             }\n    \
+             targ = mo.target;\n    \
+             fog = P_SpawnMobj(match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() }, MT_SPAWNFIRE);\n    \
+             S_StartSound(fog, sfx_telept);\n    \
+             r = P_Random();\n    \
+             if r < 50 {\n        \
+             r#type = MT_TROOP;\n    \
+             } else {\n        \
+             if r < 90 {\n            \
+             r#type = MT_SERGEANT;\n        \
+             } else {\n            \
+             if r < 120 {\n                \
+             r#type = MT_SHADOWS;\n            \
+             } else {\n                \
+             if r < 130 {\n                    \
+             r#type = MT_PAIN;\n                \
+             } else {\n                    \
+             if r < 160 {\n                        \
+             r#type = MT_HEAD;\n                    \
+             } else {\n                        \
+             if r < 162 {\n                            \
+             r#type = MT_VILE;\n                        \
+             } else {\n                            \
+             if r < 172 {\n                                \
+             r#type = MT_UNDEAD;\n                            \
+             } else {\n                                \
+             if r < 192 {\n                                    \
+             r#type = MT_BABY;\n                                \
+             } else {\n                                    \
+             if r < 222 {\n                                        \
+             r#type = MT_FATSO;\n                                    \
+             } else {\n                                        \
+             if r < 246 {\n                                            \
+             r#type = MT_KNIGHT;\n                                        \
+             } else {\n                                            \
+             r#type = MT_BRUISER;\n                                        \
+             }\n                                    \
+             }\n                                \
+             }\n                            \
+             }\n                        \
+             }\n                    \
+             }\n                \
+             }\n            \
+             }\n        \
+             }\n    \
+             }\n    \
+             newmobj = P_SpawnMobj(match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() }, r#type);\n    \
+             if P_LookForPlayers(newmobj, true) {\n        \
+             P_SetMobjState(newmobj, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.seestate);\n    \
+             }\n    \
+             P_TeleportMove(newmobj, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
+             thinkers.remove(handle);\n\
              }"
         );
     }
