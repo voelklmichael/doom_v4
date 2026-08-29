@@ -53,7 +53,7 @@
 use crate::codegen::struct_fields::rust_field_name;
 use crate::parser::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, ForInit,
-    FunctionDef, IncDecOp, Initializer, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
+    FunctionDef, IncDecOp, Initializer, ParamDeclarator, SizeofArg, Stmt, TypeSpecifier, UnaryOp,
 };
 use crate::parser::grammar::declarator_name;
 use crate::parser::parse_full;
@@ -271,6 +271,47 @@ fn render_assign_op(op: AssignOp) -> &'static str {
     }
 }
 
+/// Whether `base` is `{self_param}.target` / `{self_param}.tracer` --
+/// self-struct fields registered `Option<Handle<Thinker>>`-typed (only
+/// `mobj_t` ever has either, per `struct_fields.rs`'s self-referential-
+/// field mapping). Shared by `render_expr`'s target/tracer chain-through
+/// arm and `body_has_target_deref`'s signature-extension scan below, so
+/// both agree on exactly the same shape.
+/// Whether `e` evaluates to a value of type `Option<Handle<Thinker>>`
+/// known (corpus-checked) to always be `Mobj`-shaped when present:
+/// either `{self_param}.target`/`.tracer` directly, or a plain local
+/// alias assigned straight from one of those (`dest = actor->target;`,
+/// `A_SkullAttack`'s own idiom, common corpus-wide -- tracked via
+/// `aliases`, populated by `collect_target_tracer_aliases`). Takes its
+/// dependencies as plain arguments rather than `&FnBodyContext` so it
+/// can be reused both by `render_expr` (which has a `ctx`) and by the
+/// `body_has_target_deref` family (which runs *before* `render_fn` has
+/// built one, to decide whether the signature needs it at all).
+/// Deliberately single-level: `aliases` itself is always built by
+/// scanning for a direct `self.target`/`self.tracer` assignment, not by
+/// resolving through another alias -- no corpus example so far aliases
+/// an alias.
+fn is_target_tracer_typed(
+    e: &Expr,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match e {
+        Expr::Member {
+            base: inner, field, ..
+        } if matches!(inner.as_ref(), Expr::Ident(n) if n == self_param) => {
+            (field == "target" || field == "tracer")
+                && self_field_types.get(field.as_str()).map(String::as_str)
+                    == Some("Option<Handle<Thinker>>")
+        }
+        Expr::Ident(name) => {
+            aliases.get(name.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>")
+        }
+        _ => false,
+    }
+}
+
 /// Renders `e`, returning `(text, is_unresolved_cross_ref)` -- the second
 /// element is only ever `true` for a `Member` result naming a direct
 /// cross-reference field of `self_param` (see module docs); every other
@@ -401,6 +442,39 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].frontsector"), true))
         }
+        // `actor->target->field` / `actor->tracer->field`, or the same
+        // chain through a local alias (`dest->field` once `dest = actor->
+        // target;`, `A_SkullAttack`'s own idiom) -- `target`/`tracer` are
+        // self-struct fields themselves `Option<Handle<Thinker>>`-typed
+        // (`struct_fields.rs`'s self-referential-field mapping), unlike
+        // every cross-reference field handled above (which is a plain
+        // index into `World`) -- dereferencing one needs a real `Arena`
+        // lookup, not `world[...]`. Corpus-checked: only `mobj_t` ever
+        // has `target`/`tracer`, so the looked-up thinker is always the
+        // `Mobj` variant, making `_ => unreachable!()` genuinely safe
+        // (matching `door->field`'s own `mutating_handle` arm's
+        // reasoning above) -- not a defensive catch-all. `.unwrap()` at
+        // the point of use, not a narrowed rebinding, the same `p->field`
+        // (`Option<PlayerId>`) precedent: every real corpus dereference
+        // site already guards this with its own adjacent `if (!actor->
+        // target) return;`.
+        Expr::Member { base, field, .. }
+            if is_target_tracer_typed(
+                base,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+            ) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!(
+                    "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
+                    rust_field_name(field)?
+                ),
+                false,
+            ))
+        }
         Expr::Member { base, field, .. } => {
             if !ctx.ctor_var.is_empty()
                 && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
@@ -529,6 +603,26 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let inner_text = parenthesize_if_needed(expr, &inner_text, u8::MAX, false);
             Ok((format!("&{inner_text}"), false))
         }
+        // `!actor->target` used as one operand of a `&&`/`||` chain
+        // (`A_CPosRefire`'s own `!actor->target || actor->target->health
+        // <= 0 || ...`) -- unlike `render_bool_expr`'s own top-level
+        // entry point (which already special-cases this), a `Binary`
+        // logical chain's operands render through this generic
+        // `render_expr` path (via `render_binary_operand`), not
+        // `render_bool_expr`, so the same `Option`-awareness needs its
+        // own arm here too rather than assuming every top-level condition
+        // is a single bare `!x`. The plain `!` fallback just below stays
+        // correct and unchanged for a genuinely `bool`-valued operand
+        // (`!player->cards[idx]`, already real Rust `bool` since
+        // `boolean` maps to it directly) -- only an `Option`-valued
+        // operand needs `.is_none()` instead of `!`, which doesn't even
+        // compile on an `Option`.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if is_option_valued(expr, ctx) => {
+            Ok((format!("{}.is_none()", render_expr(expr, ctx)?.0), false))
+        }
         Expr::Unary { op, expr } => {
             let op_text = match op {
                 UnaryOp::Minus => "-",
@@ -651,14 +745,32 @@ fn render_binary_operand(
 /// dereference (matching `render_expr`'s own `Expr::Member` special case
 /// for it). Narrowly by-name/by-shape, the same way `specialdata`'s own
 /// `Option`-awareness is, not a general type-inference pass.
+/// Whether `expr` is a call to a corpus function whose real declared C
+/// return type is `boolean` (already Rust's native `bool`, per
+/// `struct_fields.rs`), so it needs no `!= 0`/`== 0` truthiness cast at
+/// all, bare or negated -- narrowly matched by name (this codebase's
+/// usual "no callee-signature tracking, hand-match the real shape"
+/// style), not a general return-type inference. Extend this list only
+/// once a real corpus call site is found needing it, the same way
+/// `twoSided` stayed its own separate `int`-flag-shaped arm rather than
+/// being folded in here.
+fn is_bool_returning_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call { callee, .. }
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight"))
+}
+
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
     match expr {
-        Expr::Ident(n) => {
+        // Covers both a trigger function's own `Option<PlayerId>` local
+        // (`p`) and a `Mobj`-shaped action function's own local alias of
+        // `target`/`tracer` (`dest`, `A_SkullAttack`'s idiom) -- both
+        // tracked the same way, via `ctx.extra_cross_ref_idents`.
+        Expr::Ident(n) => matches!(
             ctx.extra_cross_ref_idents
                 .get(n.as_str())
-                .map(String::as_str)
-                == Some("Option<PlayerId>")
-        }
+                .map(String::as_str),
+            Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>")
+        ),
         Expr::Member { field, .. } if field == "player" => true,
         // `!actor->target` (`A_PosAttack` and friends) -- `target`'s
         // registered type (`Mobj.target: Option<Handle<Thinker>>`, per
@@ -706,6 +818,16 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             op: UnaryOp::Not,
             expr,
         } if is_option_valued(expr, ctx) => Ok(format!("{}.is_none()", render_expr(expr, ctx)?.0)),
+        // `! P_CheckSight (actor, actor->target)` (`P_CheckMeleeRange`) --
+        // unlike a plain `int`-valued operand (the generic `== 0` arm just
+        // below), a call to a real `boolean`-returning corpus function is
+        // already a real Rust `bool`, so plain `!` is correct here, the
+        // same "already `bool`, no cast" reasoning `is_bool_returning_call`
+        // callers below already use for the *bare* (non-negated) case.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if is_bool_returning_call(expr) => Ok(format!("!{}", render_expr(expr, ctx)?.0)),
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -731,6 +853,18 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Member { .. } if !is_option_valued(cond, ctx) => {
             Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
         }
+        // `if (actor->target->flags & MF_SHADOW)` (`A_FaceTarget`) -- a
+        // bare non-comparison `Binary` (here bitwise AND against a flag
+        // mask) used for C truthiness, the same "bare value, not a
+        // comparison/negation" idiom as the bare `Member` arm just above,
+        // just for a computed value instead of a direct field read.
+        // `is_comparison_or_logical`'s own arm at the top of this match
+        // already claims every `==`/`<`/`&&`/`||`/etc. shape, so this only
+        // ever fires for a genuinely non-bool-valued `Binary` result
+        // (`&`, `|`, `+`, ...) needing the ordinary `!= 0` cast.
+        Expr::Binary { op, .. } if !is_comparison_or_logical(*op) => {
+            Ok(format!("({}) != 0", render_expr(cond, ctx)?.0))
+        }
         // `if (twoSided (secnum, i))` -- `EV_DoFloor`'s own adjacency scan,
         // the first bare (non-negated) *call result* used for truthiness
         // rather than a comparison/field. `twoSided` genuinely returns a
@@ -746,18 +880,17 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         }
         // `if (P_CheckMeleeRange (actor))` (`A_TroopAttack` and several
         // other melee-attack action functions) -- unlike `twoSided`,
-        // `P_CheckMeleeRange`'s own real corpus declaration
-        // (`p_enemy.c`) returns `boolean`, not a plain `int`, and
-        // `boolean` already maps to Rust's native `bool`
-        // (`struct_fields.rs`'s own established decision) -- so a call
-        // to it is already a real `bool` value, used directly with no
-        // `!= 0` cast at all. Matched narrowly by name, the same "hand-
-        // match the one real corpus shape" style as `twoSided`, rather
-        // than inferring a callee's C return type generically (nothing
-        // else here tracks function signatures).
-        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange") => {
-            Ok(render_expr(cond, ctx)?.0)
-        }
+        // `P_CheckMeleeRange`/`P_CheckSight`'s own real corpus
+        // declarations (`p_enemy.c`/`p_local.h`) return `boolean`, not a
+        // plain `int`, and `boolean` already maps to Rust's native `bool`
+        // (`struct_fields.rs`'s own established decision) -- so a call to
+        // either is already a real `bool` value, used directly with no
+        // `!= 0` cast at all. Matched narrowly by name
+        // (`is_bool_returning_call`), the same "hand-match the one real
+        // corpus shape" style as `twoSided`, rather than inferring a
+        // callee's C return type generically (nothing else here tracks
+        // function signatures).
+        Expr::Call { .. } if is_bool_returning_call(cond) => Ok(render_expr(cond, ctx)?.0),
         _ => Err(format!(
             "render_bool_expr: unsupported condition shape: {cond:?}"
         )),
@@ -1512,12 +1645,31 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
+        // `actor->angle += (P_Random()-P_Random())<<21;` (`A_FaceTarget`)
+        // -- the reverse direction of the `angle_t`-into-plain-`int` bug
+        // just above: a *compound*-assign's RHS is ordinary `int`-typed
+        // arithmetic (no operand here is itself a registered `u32`
+        // field), but the LHS it's folded into is `angle_t`/`u32` --
+        // confirmed a real `rustc` rejection (`cannot add-assign i32 to
+        // u32`), not guessed at. Scoped to a *compound* op specifically
+        // (`+=`/`-=`/...), not plain `=`: a plain assignment's RHS in
+        // every real corpus case seen so far is already a call whose
+        // real C return type is itself `angle_t`
+        // (`R_PointToAngle2`) -- wrapping that in a redundant `as u32`
+        // would be a no-op cast `clippy` flags, not a fix for a real
+        // mismatch, so it's deliberately left alone unless a genuine
+        // counterexample shows up.
+        let lhs_is_u32_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
         let rhs_text = if lhs_is_specialdata && rhs_is_null {
             "None".to_string()
         } else if lhs_is_specialdata && rhs_is_ctor_var {
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
             format!("{rhs_text} as i32")
+        } else if lhs_is_u32_self_field && *op != AssignOp::Assign {
+            format!("({rhs_text}) as u32")
         } else {
             rhs_text
         };
@@ -1642,17 +1794,63 @@ pub fn render_fn(
     self_rust_type: &str,
     self_field_types: &HashMap<String, String>,
 ) -> Result<String, String> {
+    render_fn_impl(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        None,
+    )
+}
+
+/// `render_fn`'s own `boolean`-returning twin -- `P_CheckMeleeRange`/
+/// `P_CheckMissileRange` (`p_enemy.c`) are `boolean P_Check...(mobj_t*
+/// actor)`, the same single-self-struct-parameter shape `render_fn`
+/// already handles, just with a real return value instead of `void`.
+/// A thin wrapper over the same `render_fn_impl` rather than a new
+/// required parameter threaded through `render_fn`'s own 36 existing call
+/// sites (every one of them a real `void A_*`/tick function, never
+/// needing a return type) -- `boolean` already maps to Rust's native
+/// `bool` (`struct_fields.rs`'s own decision), so `"bool"` is the only
+/// return type this needs to support so far.
+pub fn render_bool_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+) -> Result<String, String> {
+    render_fn_impl(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        Some("bool"),
+    )
+}
+
+fn render_fn_impl(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
     let f = find_function_def(&unit.items, fn_name)
         .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
     let param_name = first_param_name(f)
         .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
-    let no_extra_cross_refs = HashMap::new();
+    let target_tracer_aliases =
+        collect_target_tracer_aliases(&f.body.items, &param_name, self_field_types);
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &param_name,
         self_field_types,
-        extra_cross_ref_idents: &no_extra_cross_refs,
+        extra_cross_ref_idents: &target_tracer_aliases,
         ctor_var: "",
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
@@ -1669,13 +1867,38 @@ pub fn render_fn(
     // (`T_VerticalDoor`) rather than added speculatively to every tick
     // function's signature ahead of real evidence, matching the same
     // "measure, don't guess" call already made for `World`.
-    let extra_params = if body_has_self_removal(&f.body.items, &param_name) {
+    // Same "measure, don't add speculatively" discipline as the self-
+    // removal check just above: only a function that actually
+    // dereferences *through* `target`/`tracer` (not just checks
+    // truthiness or passes it opaquely) gets the extra `thinkers: &Arena
+    // <Thinker>` read-only lookup parameter. Deliberately not combined
+    // with the self-removal case above (which would need a *mutable*
+    // `Arena<Thinker>` under a different parameter name) -- no real
+    // corpus function needs both at once yet, so which single `Arena`
+    // parameter name/mutability a function needing both should get is
+    // left undecided until real evidence exists, rather than guessed.
+    let needs_self_removal = body_has_self_removal(&f.body.items, &param_name);
+    let needs_target_deref = body_has_target_deref(
+        &f.body.items,
+        &param_name,
+        self_field_types,
+        &target_tracer_aliases,
+    );
+    if needs_self_removal && needs_target_deref {
+        return Err(format!(
+            "{fn_name}: needs both self-removal and target/tracer dereferencing -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
+        ));
+    }
+    let extra_params = if needs_self_removal {
         ", handle: Handle<Thinker>, arena: &mut Arena<Thinker>"
+    } else if needs_target_deref {
+        ", thinkers: &Arena<Thinker>"
     } else {
         ""
     };
+    let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
     Ok(format!(
-        "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}) {{\n{}\n}}",
+        "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -1765,6 +1988,240 @@ fn stmt_has_self_removal(s: &Stmt, self_param: &str) -> bool {
         Stmt::Case { stmt, .. } => stmt_has_self_removal(stmt, self_param),
         Stmt::Default(stmt) => stmt_has_self_removal(stmt, self_param),
         Stmt::While { body, .. } => stmt_has_self_removal(body, self_param),
+        _ => false,
+    }
+}
+
+/// Whether `e` (anywhere in its subtree) dereferences *through*
+/// `{self_param}.target`/`.tracer` to read one of the targeted mobj's own
+/// fields (`render_expr`'s `is_target_tracer_typed` chain-through arm)
+/// -- unlike `is_self_removal_call`'s single fixed top-level-statement
+/// shape, this can appear nested arbitrarily deep in any expression
+/// (a condition, a call argument, an assignment's RHS, ...), so it needs
+/// a real expression-tree walk rather than one statement-shaped check.
+/// Drives `render_fn`'s own signature extension: only a function that
+/// actually needs a real thinker lookup gets the extra `thinkers: &Arena
+/// <Thinker>` parameter, matching the same "measure, don't add
+/// speculatively" discipline `body_has_self_removal` already set.
+fn expr_has_target_deref(
+    e: &Expr,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    if let Expr::Member { base, .. } = e
+        && is_target_tracer_typed(base, self_param, self_field_types, aliases)
+    {
+        return true;
+    }
+    match e {
+        Expr::Unary { expr, .. }
+        | Expr::PreIncDec { expr, .. }
+        | Expr::PostIncDec { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Sizeof(SizeofArg::Expr(expr)) => {
+            expr_has_target_deref(expr, self_param, self_field_types, aliases)
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
+            expr_has_target_deref(lhs, self_param, self_field_types, aliases)
+                || expr_has_target_deref(rhs, self_param, self_field_types, aliases)
+        }
+        Expr::Assign { lhs, rhs, .. } => {
+            expr_has_target_deref(lhs, self_param, self_field_types, aliases)
+                || expr_has_target_deref(rhs, self_param, self_field_types, aliases)
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || expr_has_target_deref(then_expr, self_param, self_field_types, aliases)
+                || expr_has_target_deref(else_expr, self_param, self_field_types, aliases)
+        }
+        Expr::Call { callee, args } => {
+            expr_has_target_deref(callee, self_param, self_field_types, aliases)
+                || args
+                    .iter()
+                    .any(|a| expr_has_target_deref(a, self_param, self_field_types, aliases))
+        }
+        Expr::Index { base, index } => {
+            expr_has_target_deref(base, self_param, self_field_types, aliases)
+                || expr_has_target_deref(index, self_param, self_field_types, aliases)
+        }
+        Expr::Member { base, .. } => {
+            expr_has_target_deref(base, self_param, self_field_types, aliases)
+        }
+        _ => false,
+    }
+}
+
+/// Locals directly aliased from `{self_param}.target`/`.tracer`
+/// (`mobj_t* dest; ... dest = actor->target;`, `A_SkullAttack`'s own
+/// idiom, common corpus-wide) -- registers each such local's name with
+/// the same `"Option<Handle<Thinker>>"` type string `self_field_types`
+/// uses for `target`/`tracer` themselves, into the same map shape a
+/// trigger function's own `local_var_types` already produces
+/// (`FnBodyContext::extra_cross_ref_idents`), so `is_target_tracer_typed`
+/// resolves a self-field chain and a locally-aliased chain identically.
+/// Deliberately single-level (see `is_target_tracer_typed`'s own doc
+/// comment) -- scans for a *direct* `self.target`/`self.tracer`
+/// assignment only, passing an empty map as its own `aliases` argument.
+fn collect_target_tracer_aliases(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    collect_target_tracer_aliases_in(items, self_param, self_field_types, &mut aliases);
+    aliases
+}
+
+fn collect_target_tracer_aliases_in(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &mut HashMap<String, String>,
+) {
+    let no_aliases = HashMap::new();
+    for item in items {
+        match item {
+            BlockItem::Decl(d) => {
+                for decl in &d.declarators {
+                    if let Some(Initializer::Expr(e)) = &decl.initializer
+                        && is_target_tracer_typed(e, self_param, self_field_types, &no_aliases)
+                        && let Some(name) = declarator_name(&decl.declarator)
+                    {
+                        aliases.insert(name, "Option<Handle<Thinker>>".to_string());
+                    }
+                }
+            }
+            BlockItem::Stmt(s) => {
+                collect_target_tracer_aliases_stmt(s, self_param, self_field_types, aliases)
+            }
+        }
+    }
+}
+
+fn collect_target_tracer_aliases_stmt(
+    s: &Stmt,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &mut HashMap<String, String>,
+) {
+    let no_aliases = HashMap::new();
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && is_target_tracer_typed(rhs, self_param, self_field_types, &no_aliases)
+    {
+        aliases.insert(name.clone(), "Option<Handle<Thinker>>".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => {
+            collect_target_tracer_aliases_in(&c.items, self_param, self_field_types, aliases)
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_target_tracer_aliases_stmt(then_branch, self_param, self_field_types, aliases);
+            if let Some(eb) = else_branch {
+                collect_target_tracer_aliases_stmt(eb, self_param, self_field_types, aliases);
+            }
+        }
+        Stmt::Switch { body, .. } => {
+            collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
+        }
+        Stmt::Case { stmt, .. } => {
+            collect_target_tracer_aliases_stmt(stmt, self_param, self_field_types, aliases)
+        }
+        Stmt::Default(stmt) => {
+            collect_target_tracer_aliases_stmt(stmt, self_param, self_field_types, aliases)
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
+        }
+        Stmt::For { body, .. } => {
+            collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
+        }
+        _ => {}
+    }
+}
+
+fn body_has_target_deref(
+    items: &[BlockItem],
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Decl(d) => d.declarators.iter().any(|decl| {
+            matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_target_deref(e, self_param, self_field_types, aliases))
+        }),
+        BlockItem::Stmt(s) => stmt_has_target_deref(s, self_param, self_field_types, aliases),
+    })
+}
+
+fn stmt_has_target_deref(
+    s: &Stmt,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => expr_has_target_deref(e, self_param, self_field_types, aliases),
+        Stmt::Expr(None) => false,
+        Stmt::Compound(c) => body_has_target_deref(&c.items, self_param, self_field_types, aliases),
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(then_branch, self_param, self_field_types, aliases)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_target_deref(eb, self_param, self_field_types, aliases))
+        }
+        Stmt::Switch { cond, body } => {
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(body, self_param, self_field_types, aliases)
+        }
+        Stmt::Case { expr, stmt } => {
+            expr_has_target_deref(expr, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(stmt, self_param, self_field_types, aliases)
+        }
+        Stmt::Default(stmt) => stmt_has_target_deref(stmt, self_param, self_field_types, aliases),
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr_has_target_deref(cond, self_param, self_field_types, aliases)
+                || stmt_has_target_deref(body, self_param, self_field_types, aliases)
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::Decl(d) => d.declarators.iter().any(|decl| {
+                    matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_target_deref(e, self_param, self_field_types, aliases))
+                }),
+                ForInit::Expr(e) => expr_has_target_deref(e, self_param, self_field_types, aliases),
+            }) || cond
+                .as_ref()
+                .is_some_and(|e| expr_has_target_deref(e, self_param, self_field_types, aliases))
+                || step
+                    .as_ref()
+                    .is_some_and(|e| expr_has_target_deref(e, self_param, self_field_types, aliases))
+                || stmt_has_target_deref(body, self_param, self_field_types, aliases)
+        }
+        Stmt::Return(Some(e)) => expr_has_target_deref(e, self_param, self_field_types, aliases),
+        Stmt::Labeled { stmt, .. } => stmt_has_target_deref(stmt, self_param, self_field_types, aliases),
         _ => false,
     }
 }
@@ -2743,6 +3200,190 @@ pub fn T_Glow(g: &mut Glow, world: &mut World) {
             .collect()
     }
 
+    /// The first function needing real `Arena` read access from inside a
+    /// `Mobj`-shaped action function: `actor->target->x`/`.y`/`.flags`
+    /// dereference *through* the `Option<Handle<Thinker>>`-typed `target`
+    /// field, not just check its truthiness -- the architectural gap
+    /// `docs/03_TRANSPILER.md` flagged as the next step after the
+    /// target-attack batch. `render_fn` gains the extra `thinkers: &Arena
+    /// <Thinker>` read-only parameter (`body_has_target_deref`) only
+    /// because this function's body actually needs it -- the corpus
+    /// fact that only `mobj_t` ever has `target`/`tracer` makes `_ =>
+    /// unreachable!()` genuinely safe on the resulting lookup, not a
+    /// defensive catch-all. Also exercises two smaller, real gaps this
+    /// function's own body surfaced and got fixed alongside it: a bare
+    /// non-comparison `Binary` (`actor->target->flags & MF_SHADOW`) used
+    /// for C truthiness needed its own `render_bool_expr` arm (`!= 0`,
+    /// the same idiom the bare-`Member` truthiness arm already had); and
+    /// `actor->angle += (...)<<21;` needed an explicit `as u32` on the
+    /// compound-assign RHS -- confirmed a real `rustc` rejection (`cannot
+    /// add-assign i32 to u32`), the mirror image of the already-
+    /// documented `angle_t`-into-plain-`int` bug, just in the opposite
+    /// direction. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against hand-written stand-in `World`/
+    /// `Thinker`/`Arena`/`Handle`/`Mobj` shapes.
+    #[test]
+    fn test_a_face_target_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("flags", "i32"),
+            ("angle", "u32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_FaceTarget",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FaceTarget(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             actor.flags &= !MF_AMBUSH;\n    \
+             actor.angle = R_PointToAngle2(actor.x, actor.y, match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
+             if (match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_SHADOW) != 0 {\n        \
+             actor.angle += (P_Random() - P_Random() << 21) as u32;\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_CPosRefire`/`A_SpidRefire` -- identical shape, differing only
+    /// in the `P_Random()` threshold, both reading `actor->target->
+    /// health` inside a `||` chain alongside a bare `!actor->target` and
+    /// a bare `!P_CheckSight(..)`. Surfaces a real gap distinct from
+    /// `A_FaceTarget`'s own: `render_binary_operand`'s `&&`/`||` operands
+    /// render through the *generic* `render_expr` path, not
+    /// `render_bool_expr` -- so `!actor->target`'s own `Option`-aware
+    /// `.is_none()` treatment (already correct at `render_bool_expr`'s
+    /// top-level entry point) needed its own twin arm added directly to
+    /// `render_expr`'s `Unary::Not` handling, or it would try to apply
+    /// Rust's `!` operator to an `Option`, a real type error, not just a
+    /// wrong-but-compiling translation. `!P_CheckSight(..)` needed no new
+    /// code at all: `P_CheckSight`'s real corpus declaration
+    /// (`p_local.h`) returns `boolean` (already real Rust `bool`), so
+    /// plain `!` on its call result is already correct, unlike a plain-
+    /// `int`-flag callee. Verified compiling for real.
+    #[test]
+    fn test_a_cpos_refire_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("info", "&'static MobjInfo"),
+            ("health", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_CPosRefire",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CPosRefire(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             A_FaceTarget(actor);\n    \
+             if P_Random() < 40 {\n        \
+             return;\n    \
+             }\n    \
+             if actor.target.is_none() || match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 || !P_CheckSight(actor, actor.target) {\n        \
+             P_SetMobjState(actor, actor.info.seestate);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_a_spid_refire_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("info", "&'static MobjInfo"),
+            ("health", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SpidRefire",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SpidRefire(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             A_FaceTarget(actor);\n    \
+             if P_Random() < 10 {\n        \
+             return;\n    \
+             }\n    \
+             if actor.target.is_none() || match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 || !P_CheckSight(actor, actor.target) {\n        \
+             P_SetMobjState(actor, actor.info.seestate);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `P_CheckMeleeRange` -- the first `boolean`-returning function this
+    /// renderer produces (`render_bool_fn`, a thin `-> {return_type}`
+    /// wrapper over the same `render_fn_impl` every `void A_*` action
+    /// function already shares), and the first real corpus use of the
+    /// `dest = actor->target;` local-alias chain-through combined with a
+    /// *further* chain off the dereferenced result (`pl->info->radius`:
+    /// `pl->info` resolves through the alias to a real `&'static
+    /// MobjInfo`, then `.radius` chains off *that* through the ordinary
+    /// generic `Expr::Member` fallback -- no new code needed, since the
+    /// match-expression the alias arm produces is just an ordinary Rust
+    /// value any further `.field` can chain off). Also surfaces a real
+    /// bug, independent of anything built for `A_CPosRefire`'s own `&&`/
+    /// `||`-chain fix: `render_bool_expr`'s own top-level `Unary::Not`
+    /// handling (a *single* condition, not part of a logical chain) had
+    /// no `bool`-returning-callee awareness at all, so `if (!
+    /// P_CheckSight(..))` rendered as `P_CheckSight(..) == 0` -- syntactically
+    /// valid but semantically backwards-compiling nonsense once
+    /// `P_CheckSight` returns a real Rust `bool` (`== 0` doesn't even
+    /// type-check against `bool`, so this would have been caught at the
+    /// `rustc` smoke-compile step, but is fixed here before that point
+    /// via the new `is_bool_returning_call` helper, shared with the
+    /// already-existing bare (non-negated) `P_CheckMeleeRange` arm).
+    /// Verified compiling for real.
+    #[test]
+    fn test_p_check_melee_range_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("info", "&'static MobjInfo"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_CheckMeleeRange",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_CheckMeleeRange(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) -> bool {\n    \
+             let mut pl;\n    \
+             let mut dist;\n    \
+             if actor.target.is_none() {\n        \
+             return false;\n    \
+             }\n    \
+             pl = actor.target;\n    \
+             dist = P_AproxDistance(match thinkers.get(pl.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x, match thinkers.get(pl.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - actor.y);\n    \
+             if dist >= MELEERANGE - 20 * FRACUNIT + match thinkers.get(pl.unwrap()) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.radius {\n        \
+             return false;\n    \
+             }\n    \
+             if !P_CheckSight(actor, actor.target) {\n        \
+             return false;\n    \
+             }\n    \
+             return true;\n\
+             }"
+        );
+    }
+
     #[test]
     fn test_p_spawn_fire_flicker_renders_exactly() {
         let rendered = render_spawn_fn(
@@ -3217,6 +3858,75 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
+    }
+
+    /// `A_SkullAttack`'s `mobj_t* dest; ... dest = actor->target; ...
+    /// dest->x - actor->x ...` -- the local-alias generalization of the
+    /// `actor->target->field` chain-through arm (`is_target_tracer_typed`,
+    /// `collect_target_tracer_aliases`), verified against the real parsed
+    /// AST rather than a fabricated snippet. `A_SkullAttack` as a *whole*
+    /// function isn't attempted here -- it has its own separate, unrelated
+    /// gap (`dist`, declared plain `int`, is assigned `P_AproxDistance`'s
+    /// fixed-point-`FixedT` result and later compared/reassigned as if it
+    /// were still `int`; a different problem from anything this session's
+    /// target/tracer work touches, not investigated here), matching this
+    /// codebase's own "isolate the one clean new piece, leave the rest
+    /// open" precedent (`T_VerticalDoor`'s own countdown/`NULL`/self-
+    /// removal pieces before it rendered whole). `collect_target_tracer_
+    /// aliases` runs against `A_SkullAttack`'s real, complete body (not a
+    /// synthetic fragment) to confirm it actually discovers `dest` from
+    /// real corpus source, then just the one real `dest->x - actor->x`
+    /// sub-expression (pulled out of the real `P_AproxDistance(...)` call
+    /// argument list) is rendered in isolation.
+    #[test]
+    fn test_target_tracer_local_alias_against_real_a_skull_attack() {
+        let path = corpus_dir().join("p_enemy.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_enemy.c should parse");
+        let f = find_function_def(&unit.items, "A_SkullAttack").expect("A_SkullAttack not found");
+        let self_field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let aliases = collect_target_tracer_aliases(&f.body.items, "actor", &self_field_types);
+        assert_eq!(
+            aliases.get("dest").map(String::as_str),
+            Some("Option<Handle<Thinker>>")
+        );
+
+        let is_aprox_distance_call = |s: &Stmt| {
+            matches!(s, Stmt::Expr(Some(Expr::Assign { rhs, .. }))
+                if matches!(rhs.as_ref(), Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_AproxDistance")))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_aprox_distance_call),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `dist = P_AproxDistance(..)` statement in A_SkullAttack");
+        let Stmt::Expr(Some(Expr::Assign { rhs, .. })) = stmt else {
+            unreachable!("guarded by is_aprox_distance_call")
+        };
+        let Expr::Call { args, .. } = rhs.as_ref() else {
+            unreachable!("guarded by is_aprox_distance_call")
+        };
+        let first_arg = &args[0];
+
+        let ctx = FnBodyContext {
+            self_param: "actor",
+            self_field_types: &self_field_types,
+            extra_cross_ref_idents: &aliases,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+            plain_int_locals: &HashSet::new(),
+        };
+        let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x"
+        );
     }
 
     /// `T_VerticalDoor`'s innermost `switch(door->type) { case blazeClose:
