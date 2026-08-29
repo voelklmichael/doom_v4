@@ -4904,6 +4904,61 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         );
     }
 
+    /// `A_OpenShotgun2`/`A_LoadShotgun2`/`A_CloseShotgun2` (`p_enemy.c`) --
+    /// multi-line declarator style (`void\nA_OpenShotgun2\n( player_t*\t
+    /// player,\n  pspdef_t*\tpsp )`), confirming `render_weapon_fn` isn't
+    /// sensitive to that formatting. `player->mo` needs no entry at all in
+    /// `player_field_types`: the generic `Expr::Member` fallback only
+    /// treats a field as a cross-reference when its *registered* type is
+    /// one of `CROSS_REF_TYPES`, so an unregistered field already falls
+    /// through to plain, correct `player.mo` access. `A_CloseShotgun2`
+    /// also calls not-yet-translated `A_ReFire(player,psp)` -- the same
+    /// accepted forward-reference-call gap as `A_Hoof`'s own `A_Chase`.
+    #[test]
+    fn test_a_open_shotgun2_renders_exactly() {
+        let rendered = render_weapon_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_OpenShotgun2",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_OpenShotgun2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    S_StartSound(player.mo, sfx_dbopn);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_load_shotgun2_renders_exactly() {
+        let rendered = render_weapon_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_LoadShotgun2",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_LoadShotgun2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    S_StartSound(player.mo, sfx_dbload);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_close_shotgun2_renders_exactly() {
+        let rendered = render_weapon_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_CloseShotgun2",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CloseShotgun2(player: &mut Player, psp: &mut PlayerSpriteState) {\n    S_StartSound(player.mo, sfx_dbcls);\n    A_ReFire(player, psp);\n}"
+        );
+    }
+
     #[test]
     fn test_a_baby_metal_renders_exactly() {
         let rendered = render_fn(
