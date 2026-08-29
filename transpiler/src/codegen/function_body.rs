@@ -461,6 +461,20 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         Expr::Index { base, index } => {
             let (base_text, _) = render_expr(base, ctx)?;
             let (index_text, _) = render_expr(index, ctx)?;
+            // A struct field used as an index (`textureheight[side->
+            // bottomtexture]`, `EV_DoFloor`'s own `raiseToTexture` scan --
+            // `bottomtexture` is a concrete `i16`, fixed by `Side`'s own
+            // struct definition) needs an explicit cast: Rust arrays/`Vec`
+            // only implement `Index<usize>`, and unlike a fresh, still-
+            // type-inferred local (`sidenum[side ^ 1]`, where `side`'s own
+            // type gets inferred as `usize` straight from this same
+            // indexing use, needing no cast), a struct field's type is
+            // already fixed elsewhere and can't retroactively change.
+            let index_text = if matches!(index.as_ref(), Expr::Member { .. }) {
+                format!("{index_text} as usize")
+            } else {
+                index_text
+            };
             Ok((format!("{base_text}[{index_text}]"), false))
         }
         Expr::Unary {
@@ -4331,6 +4345,74 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             vec![
                 "if twoSided(secnum, i) != 0 {".to_string(),
                 "    side = getSide(secnum, i, 0);".to_string(),
+                "}".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s fourth piece: `textureheight[...]`, a genuinely new
+    /// kind of table -- unlike `mobjinfo[]`/`states[]` (compile-time
+    /// literal data straight from the corpus source, rendered as a
+    /// `pub static` array), `textureheight` (`r_data.c`) is allocated at
+    /// runtime (`Z_Malloc`) and filled from WAD data, so it has no
+    /// literal corpus initializer to embed -- for this function body's
+    /// own purposes it's just an opaque global identifier, indexed like
+    /// any other array (the *setup* code that allocates/fills it,
+    /// `R_InitTextures`, is a separate not-yet-transpiled function, the
+    /// same already-accepted kind of forward-reference gap as every
+    /// other not-yet-wired cross-function call). The one real new piece:
+    /// `textureheight[side->bottomtexture]` indexes by a *struct field*
+    /// (`bottomtexture: i16`, a concrete type fixed by `Side`'s own
+    /// definition) rather than a literal or a fresh, still-inferred local
+    /// (`sidenum[side ^ 1]`, already rendering fine with no cast) --
+    /// Rust's `Index<usize>` needs an explicit `as usize` here that the
+    /// generic `Expr::Index` fallback never had to add before. Clones the
+    /// real nested `if (side->bottomtexture >= 0) if (textureheight[..]
+    /// < minsize) minsize = textureheight[..];` straight out of
+    /// `EV_DoFloor`'s own parsed AST (whichever of the two identical
+    /// `getSide(..,0)`/`getSide(..,1)` occurrences `find_stmt` reaches
+    /// first) -- no synthetic wrapper needed this time, the whole
+    /// fragment renders as-is.
+    #[test]
+    fn test_textureheight_index_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_bottomtexture_check = |s: &Stmt| {
+            matches!(s, Stmt::If { cond: Expr::Binary { op: BinaryOp::Ge, lhs, .. }, .. }
+                if matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "bottomtexture"))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_bottomtexture_check),
+                BlockItem::Decl(_) => None,
+            })
+            .expect(
+                "expected an `if (side->bottomtexture >= 0)` statement somewhere in EV_DoFloor",
+            );
+
+        let extra_cross_refs = field_types(&[("side", "SideId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "if world[side].bottomtexture >= 0 {".to_string(),
+                "    if textureheight[world[side].bottomtexture as usize] < minsize {".to_string(),
+                "        minsize = textureheight[world[side].bottomtexture as usize];".to_string(),
+                "    }".to_string(),
                 "}".to_string(),
             ]
         );
