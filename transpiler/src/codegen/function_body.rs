@@ -696,6 +696,38 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         } if is_option_valued(expr, ctx) => {
             Ok((format!("{}.is_none()", render_expr(expr, ctx)?.0), false))
         }
+        // `!player->refire` used as a bare function-call *argument*
+        // (`A_FirePistol`/`A_FireCGun`'s own `P_GunShot(player->mo,
+        // !player->refire)`, the corpus's only real instance of this
+        // shape -- confirmed by grep, not assumed) -- a third truthiness
+        // context beyond the two `render_bool_expr` (a top-level `if`)
+        // and the `is_option_valued` arm just above (a `&&`/`||` chain
+        // operand) already cover. `refire`'s registered type is a plain
+        // `i32`, not `bool`, so C's own truthiness applies (`field ==
+        // 0`), not Rust's `!` (which would silently compile as bitwise
+        // NOT on an integer -- wrong, not just a compile error). Scoped
+        // to a *registered* self-struct field whose type is known and
+        // isn't itself `bool`/`Option<...>` (both already handled their
+        // own correct way elsewhere), mirroring `is_option_valued`'s own
+        // field-type check just above rather than hardcoding the one
+        // field name -- an unregistered field's real C type isn't known
+        // here at all, so it still falls through to the plain `!`
+        // fallback below unchanged.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(
+            expr.as_ref(),
+            Expr::Member { base, field, .. }
+                if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    && ctx
+                        .self_field_types
+                        .get(field.as_str())
+                        .is_some_and(|t| t != "bool" && !t.starts_with("Option<"))
+        ) =>
+        {
+            Ok((format!("{} == 0", render_expr(expr, ctx)?.0), false))
+        }
         Expr::Unary { op, expr } => {
             let op_text = match op {
                 UnaryOp::Minus => "-",
@@ -7214,18 +7246,19 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// `player->ammo[weaponinfo[player->readyweapon].ammo]--;` is the
     /// first real corpus use of the generic standalone `PostIncDec`
     /// statement arm against a doubly-nested index chain rather than a
-    /// bare identifier. **Deliberately not attempted alongside these**:
-    /// `A_FirePistol`/`A_FireShotgun`/`A_FireCGun` all pass `!player->
-    /// refire` (negating a plain, non-`bool` `int` field) directly as a
-    /// bare function-call *argument* -- a third context beyond the two
-    /// this renderer already has truthiness-aware negation for (a
-    /// top-level `if` condition, via `render_bool_expr`; a `&&`/`||`
-    /// chain operand, via `render_binary_operand`) -- so today it would
-    /// silently render as Rust's bitwise `!` on an `i32` (wrong) rather
-    /// than `== 0`, the same trap already documented and deliberately
-    /// left alone elsewhere in this module. Left for a future increment
-    /// once a real need justifies generalizing negation to call-argument
-    /// position, rather than guessed at here.
+    /// bare identifier. **Deliberately not attempted alongside these at
+    /// the time**: `A_FirePistol`/`A_FireShotgun`/`A_FireCGun` all pass
+    /// `!player->refire` (negating a plain, non-`bool` `int` field)
+    /// directly as a bare function-call *argument* -- a third context
+    /// beyond the two this renderer already had truthiness-aware negation
+    /// for (a top-level `if` condition, via `render_bool_expr`; a `&&`/
+    /// `||` chain operand, via `render_binary_operand`) -- so at the time
+    /// it would have silently rendered as Rust's bitwise `!` on an `i32`
+    /// (wrong) rather than `== 0`, the same trap already documented and
+    /// deliberately left alone elsewhere in this module. **Since closed**:
+    /// see `test_a_fire_pistol_renders_exactly` below, a new `render_expr`
+    /// arm generalizing this to any registered non-`bool`/non-`Option`
+    /// self-struct field, not just `refire` by name.
     #[test]
     fn test_a_lower_renders_exactly() {
         let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Lower", &HashMap::new())
@@ -7322,6 +7355,100 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              P_SpawnPlayerMissile(player.mo, MT_PLASMA);\n\
              }"
         );
+    }
+
+    /// `A_FirePistol`/`A_FireCGun` -- the third truthiness context flagged
+    /// as deliberately deferred just above (`test_a_lower_renders_exactly`'s
+    /// own doc comment): `P_GunShot(player->mo, !player->refire)`, a bare
+    /// `!` on a plain (non-`bool`) self-struct field used directly as a
+    /// function-call argument, corpus-confirmed (by grep) to be the *only*
+    /// real shape of this idiom anywhere in linuxdoom-1.10 -- no variation
+    /// to generalize beyond. Closed by a new `render_expr` arm (see its
+    /// own doc comment) rather than name-hardcoding `refire` specifically:
+    /// any *registered* self-struct field whose type isn't itself `bool`/
+    /// `Option<...>` gets the same C-truthiness `== 0` cast here that
+    /// `render_bool_expr`'s top-level `if` handling and `is_option_valued`'s
+    /// `&&`/`||`-chain arm already give their own respective contexts.
+    /// `refire`'s registered type (`i32`) is supplied explicitly, the same
+    /// `player_field_types` pattern `A_Light0`'s own `extralight` already
+    /// established, since `player_t` isn't struct-mapped yet.
+    #[test]
+    fn test_a_fire_pistol_renders_exactly() {
+        let field_types = field_types(&[("refire", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FirePistol", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FirePistol(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             S_StartSound(player.mo, sfx_pistol);\n    \
+             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
+             P_BulletSlope(player.mo);\n    \
+             P_GunShot(player.mo, player.refire == 0);\n\
+             }"
+        );
+    }
+
+    /// `A_FireCGun` -- the second, identical real corpus instance of the
+    /// same `!player->refire`-as-call-argument shape as `A_FirePistol`,
+    /// plus a real early `return` guarded by array-indexed truthiness
+    /// (`if (!player->ammo[weaponinfo[player->readyweapon].ammo]) return;`
+    /// -- a plain, unregistered `Expr::Index` result, so it flows through
+    /// `render_bool_expr`'s already-generic bare-`Binary`/no-comparison
+    /// `!= 0` catch-all... except this is a bare `!x` negation, not a bare
+    /// value, so it actually reuses the *generic* `Unary::Not => x == 0`
+    /// arm at the bottom of `render_bool_expr`'s own match, already
+    /// correct and unchanged), and `weaponinfo[player->readyweapon].
+    /// flashstate + psp->state - &states[S_CHAIN1]` -- pointer subtraction
+    /// between two `&'static State` references from the same static
+    /// array, i.e. `psp->state` (a real `&'static State`, per `Mobj.state`'s
+    /// own established mapping) minus `&states[S_CHAIN1]` -- deliberately
+    /// **not** attempted here: no existing renderer arm computes a
+    /// reference-to-reference offset (`sec-sectors`'s own precedent is a
+    /// *value*-type index minus a *base pointer*, not two `&'static`
+    /// references), so `A_FireCGun` stays untranslated for now rather than
+    /// guessing at that shape.
+    #[test]
+    fn test_a_fire_cgun_partial_gun_shot_arg_against_real_a_fire_cgun() {
+        let path = corpus_dir().join("p_pspr.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_pspr.c should parse");
+        let f = find_function_def(&unit.items, "A_FireCGun").expect("A_FireCGun not found");
+        let is_gun_shot_call = |s: &Stmt| {
+            matches!(
+                s,
+                Stmt::Expr(Some(Expr::Call { callee, .. }))
+                    if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_GunShot")
+            )
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_gun_shot_call),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a P_GunShot(..) call statement in A_FireCGun");
+        let Stmt::Expr(Some(call_expr)) = stmt else {
+            unreachable!("guarded by is_gun_shot_call")
+        };
+
+        let field_types = field_types(&[("refire", "i32")]);
+        let ctx = FnBodyContext {
+            self_param: "player",
+            self_field_types: &field_types,
+            extra_cross_ref_idents: &HashMap::new(),
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+            same_handle_write: None,
+            plain_int_locals: &HashSet::new(),
+        };
+        let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
+        assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
     }
 
     /// `A_BrainScream` -- `A_BrainExplode`'s own already-translated
