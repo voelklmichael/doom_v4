@@ -640,6 +640,22 @@ fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
                 == Some("Option<PlayerId>")
         }
         Expr::Member { field, .. } if field == "player" => true,
+        // `!actor->target` (`A_PosAttack` and friends) -- `target`'s
+        // registered type (`Mobj.target: Option<Handle<Thinker>>`, per
+        // `struct_fields.rs`'s own self-referential-field mapping) is the
+        // general case `field == "player"` above only special-cased by
+        // name for: any self-struct field whose `self_field_types` entry
+        // is itself `Option<...>`-shaped gets the same `.is_none()`
+        // treatment, not just that one hardcoded name.
+        Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx
+                    .self_field_types
+                    .get(field.as_str())
+                    .is_some_and(|t| t.starts_with("Option<")) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -1146,7 +1162,19 @@ fn render_switch(
                 }
             }
         }
-        let falls_through = !saw_break && i < stmts.len();
+        // `case 0: return;` (`A_Scream`) -- an arm can end in an
+        // unconditional `return` with no `break` at all, reaching the
+        // next label only because nothing else follows it in the source,
+        // not because it falls through. Confirmed against the real
+        // parsed AST before fixing rather than assumed: without this, the
+        // naive "no `break` seen before the next label" rule would have
+        // wrongly folded the *next* arm's own statements in as dead code
+        // after the `return` -- harmless to runtime behavior (`return`
+        // still exits first), but not the honest, clean-`match` output
+        // this renderer is otherwise held to, and `cargo clippy` flags
+        // the resulting unreachable code.
+        let terminates = saw_break || matches!(own_stmts.last(), Some(Stmt::Return(_)));
+        let falls_through = !terminates && i < stmts.len();
         arms.push(RawArm {
             labels,
             own_stmts,
@@ -4972,6 +5000,128 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         assert_eq!(
             rendered,
             "pub fn A_BabyMetal(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_bspwlk);\n    A_Chase(mo);\n}"
+        );
+    }
+
+    /// `A_PosAttack`/`A_SPosAttack`/`A_CPosAttack` (`p_enemy.c`) -- the
+    /// first functions to check `!actor->target` (`Mobj.target: Option
+    /// <Handle<Thinker>>`, per `struct_fields.rs`'s own self-referential-
+    /// field mapping), generalizing `is_option_valued`'s `Expr::Member`
+    /// handling beyond the one hardcoded `player`-named field: any self-
+    /// struct field whose registered `self_field_types` entry is itself
+    /// `Option<...>`-shaped now gets the same `.is_none()` treatment.
+    /// Neither function dereferences *through* `target` any further than
+    /// this truthiness check (that needs real `Arena` read access from
+    /// inside a `Mobj`-shaped action function -- not yet built, see
+    /// `A_FaceTarget`'s own deferred investigation in the module docs),
+    /// so both stay within the fully generic call/arithmetic paths
+    /// otherwise: a forward-referencing call to not-yet-translated
+    /// `A_FaceTarget`, and C's familiar `(P_Random()-P_Random())<<20`/
+    /// `((P_Random()%5)+1)*3` damage-roll idiom, exercised here for the
+    /// first time with `%` inside an already-parenthesized sub-
+    /// expression rather than at the top level.
+    #[test]
+    fn test_a_pos_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PosAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PosAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut angle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             A_FaceTarget(actor);\n    \
+             angle = actor.angle;\n    \
+             slope = P_AimLineAttack(actor, angle, MISSILERANGE);\n    \
+             S_StartSound(actor, sfx_pistol);\n    \
+             angle += P_Random() - P_Random() << 20;\n    \
+             damage = (P_Random() % 5 + 1) * 3;\n    \
+             P_LineAttack(actor, angle, MISSILERANGE, slope, damage);\n\
+             }"
+        );
+    }
+
+    /// `A_SPosAttack` -- the same `!actor->target` check plus a real
+    /// `for` loop (`render_for`'s existing plain-assignment-init shape,
+    /// `EV_DoFloor`'s own precedent) firing three shots.
+    #[test]
+    fn test_a_spos_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SPosAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SPosAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut i;\n    \
+             let mut angle;\n    \
+             let mut bangle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             S_StartSound(actor, sfx_shotgn);\n    \
+             A_FaceTarget(actor);\n    \
+             bangle = actor.angle;\n    \
+             slope = P_AimLineAttack(actor, bangle, MISSILERANGE);\n    \
+             i = 0;\n    \
+             while i < 3 {\n        \
+             angle = bangle + (P_Random() - P_Random() << 20);\n        \
+             damage = (P_Random() % 5 + 1) * 3;\n        \
+             P_LineAttack(actor, angle, MISSILERANGE, slope, damage);\n        \
+             i += 1;\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `A_CPosAttack` -- `A_SPosAttack`'s own single-shot sibling (no
+    /// loop, otherwise byte-for-byte the same damage-roll shape).
+    #[test]
+    fn test_a_cpos_attack_renders_exactly() {
+        let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_CPosAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_CPosAttack(actor: &mut Mobj, world: &mut World) {\n    \
+             let mut angle;\n    \
+             let mut bangle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             if actor.target.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             S_StartSound(actor, sfx_shotgn);\n    \
+             A_FaceTarget(actor);\n    \
+             bangle = actor.angle;\n    \
+             slope = P_AimLineAttack(actor, bangle, MISSILERANGE);\n    \
+             angle = bangle + (P_Random() - P_Random() << 20);\n    \
+             damage = (P_Random() % 5 + 1) * 3;\n    \
+             P_LineAttack(actor, angle, MISSILERANGE, slope, damage);\n\
+             }"
         );
     }
 }
