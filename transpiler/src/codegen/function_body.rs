@@ -5414,4 +5414,141 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }"
         );
     }
+
+    /// `A_VileStart` -- a single-statement sound call, same shape as
+    /// `A_XScream`.
+    #[test]
+    fn test_a_vile_start_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_VileStart",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_VileStart(actor: &mut Mobj, world: &mut World) {\n    S_StartSound(actor, sfx_vilatk);\n}"
+        );
+    }
+
+    /// `A_StartFire`/`A_FireCrackle` -- sound-then-forward-reference-call,
+    /// the same two-statement shape as `A_Hoof`/`A_Metal`, just calling
+    /// not-yet-translated `A_Fire` instead of `A_Chase`.
+    #[test]
+    fn test_a_start_fire_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_StartFire",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_StartFire(actor: &mut Mobj, world: &mut World) {\n    S_StartSound(actor, sfx_flamst);\n    A_Fire(actor);\n}"
+        );
+    }
+
+    #[test]
+    fn test_a_fire_crackle_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_FireCrackle",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FireCrackle(actor: &mut Mobj, world: &mut World) {\n    S_StartSound(actor, sfx_flame);\n    A_Fire(actor);\n}"
+        );
+    }
+
+    /// `A_BrainPain` -- a single `S_StartSound(NULL, ..)` call, `A_Look`'s
+    /// own "full volume" idiom, confirming `NULL` -> `None` still needs
+    /// no special casing when it's the *only* statement in the function.
+    #[test]
+    fn test_a_brain_pain_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainPain",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainPain(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(None, sfx_bospn);\n}"
+        );
+    }
+
+    /// `A_BrainDie` -- a single bare forward-referencing call with no
+    /// arguments at all, the simplest shape yet.
+    #[test]
+    fn test_a_brain_die_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainDie",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainDie(mo: &mut Mobj, world: &mut World) {\n    G_ExitLevel();\n}"
+        );
+    }
+
+    /// `A_SpawnSound` -- `A_Hoof`'s own sound-then-tail-call shape, just
+    /// calling `A_SpawnFly` instead of `A_Chase`.
+    #[test]
+    fn test_a_spawn_sound_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_SpawnSound",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_SpawnSound(mo: &mut Mobj, world: &mut World) {\n    S_StartSound(mo, sfx_boscub);\n    A_SpawnFly(mo);\n}"
+        );
+    }
+
+    /// `A_PlayerScream` -- the first function with a scalar local
+    /// declared *with* an initializer (`int sound = sfx_pldeth;`,
+    /// `render_decl`'s existing inline-initializer support, `EV_DoFloor`'s
+    /// own `minsize` precedent) outside any constructor context, plus a
+    /// `&&` of an unregistered global (`gamemode`, rendered as a bare
+    /// pass-through identifier) and a self-field comparison against a
+    /// negative literal.
+    #[test]
+    fn test_a_player_scream_renders_exactly() {
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PlayerScream",
+            "Mobj",
+            &HashMap::new(),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PlayerScream(mo: &mut Mobj, world: &mut World) {\n    \
+             let mut sound = sfx_pldeth;\n    \
+             if gamemode == commercial && mo.health < -50 {\n        \
+             sound = sfx_pdiehi;\n    \
+             }\n    \
+             S_StartSound(mo, sound);\n\
+             }"
+        );
+    }
 }
