@@ -1041,15 +1041,19 @@ fn render_block(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<Strin
 }
 
 fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String>, String> {
-    // `int amount;` (a plain scalar) and `sector_t* sec;` (a single
-    // pointer to an already-known cross-reference type, e.g.
-    // `EV_StartLightStrobing`'s own loop variable) both render the same
-    // way: Rust infers the type from later use, so no annotation is
-    // needed regardless of which C type it was. Anything else (arrays,
-    // multiple declarators, an initializer) isn't supported yet.
+    // `int amount;` (a plain scalar), `unsigned an;` (`A_Fire`'s own
+    // local, bit-shifted then used as a `finecosine`/`finesine` index --
+    // same deferred-inference treatment as `int`, just a different bare
+    // specifier with no declarator of its own to distinguish), and
+    // `sector_t* sec;` (a single pointer to an already-known cross-
+    // reference type, e.g. `EV_StartLightStrobing`'s own loop variable)
+    // all render the same way: Rust infers the type from later use, so
+    // no annotation is needed regardless of which C type it was. Anything
+    // else (arrays, multiple declarators, an initializer) isn't supported
+    // yet.
     if !matches!(
         d.specifiers.type_specifiers.as_slice(),
-        [TypeSpecifier::Int] | [TypeSpecifier::TypedefName(_)]
+        [TypeSpecifier::Int] | [TypeSpecifier::Unsigned] | [TypeSpecifier::TypedefName(_)]
     ) {
         return Err(format!(
             "render_decl: only a bare `int` or single-pointer known-type declaration is supported so far, got {:?}",
@@ -7148,6 +7152,50 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              x += FRACUNIT * 8;\n    \
              }\n    \
              S_StartSound(None, sfx_bosdth);\n\
+             }"
+        );
+    }
+
+    /// `A_Fire` -- `A_StartFire`/`A_FireCrackle`'s own shared tail call,
+    /// itself never directly translated before. `dest = actor->tracer;`
+    /// is the already-established target/tracer local-alias idiom
+    /// (`collect_target_tracer_aliases`), and `dest->angle`/`.x`/`.y`/
+    /// `.z` confirm that alias-dereference generalizes to *any* field,
+    /// not just the `x`/`y`/`z` triple `A_SkullAttack` already exercised.
+    /// `unsigned an;` motivates `render_decl`'s own small generalization
+    /// (a bare `unsigned` specifier, not just `int`); `finecosine[an]`/
+    /// `finesine[an]` reuse the already-established by-name `as usize`
+    /// cast unchanged.
+    #[test]
+    fn test_a_fire_renders_exactly() {
+        let field_types = field_types(&[
+            ("target", "Option<Handle<Thinker>>"),
+            ("tracer", "Option<Handle<Thinker>>"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("angle", "u32"),
+        ]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Fire", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Fire(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             let mut dest;\n    \
+             let mut an;\n    \
+             dest = actor.tracer;\n    \
+             if dest.is_none() {\n        \
+             return;\n    \
+             }\n    \
+             if !P_CheckSight(actor.target, dest) {\n        \
+             return;\n    \
+             }\n    \
+             an = match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } >> ANGLETOFINESHIFT;\n    \
+             P_UnsetThingPosition(actor);\n    \
+             actor.x = match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } + FixedMul(24 * FRACUNIT, finecosine[an as usize]);\n    \
+             actor.y = match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } + FixedMul(24 * FRACUNIT, finesine[an as usize]);\n    \
+             actor.z = match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() };\n    \
+             P_SetThingPosition(actor);\n\
              }"
         );
     }
