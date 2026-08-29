@@ -52,8 +52,8 @@
 
 use crate::codegen::struct_fields::rust_field_name;
 use crate::parser::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, FunctionDef,
-    IncDecOp, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, ForInit,
+    FunctionDef, IncDecOp, Initializer, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
 };
 use crate::parser::grammar::declarator_name;
 use crate::parser::parse_full;
@@ -363,6 +363,24 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `line->frontsector` -- unlike a self-struct field
+        // (`self_field_types`) or a constructor-in-progress field
+        // (`ctor_field_types`), a trigger function's own parameter (`line:
+        // LineId`, tracked only in `extra_cross_ref_idents`) has no
+        // generic field-type registry to say one of *its* fields is
+        // itself cross-reference-typed -- hand-matched narrowly by name,
+        // the same "no general struct-field-type registry yet" reasoning
+        // as `sides[i].sector` above, so a further chain (`line->
+        // frontsector->floorpic`, `EV_DoFloor`'s own
+        // `raiseFloor24AndChange` case) resolves through `world[...]`
+        // correctly instead of stopping one level short.
+        Expr::Member { base, field, .. }
+            if field == "frontsector"
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("LineId")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].frontsector"), true))
+        }
         Expr::Member { base, field, .. } => {
             if !ctx.ctor_var.is_empty()
                 && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
@@ -461,6 +479,20 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         Expr::Index { base, index } => {
             let (base_text, _) = render_expr(base, ctx)?;
             let (index_text, _) = render_expr(index, ctx)?;
+            // A struct field used as an index (`textureheight[side->
+            // bottomtexture]`, `EV_DoFloor`'s own `raiseToTexture` scan --
+            // `bottomtexture` is a concrete `i16`, fixed by `Side`'s own
+            // struct definition) needs an explicit cast: Rust arrays/`Vec`
+            // only implement `Index<usize>`, and unlike a fresh, still-
+            // type-inferred local (`sidenum[side ^ 1]`, where `side`'s own
+            // type gets inferred as `usize` straight from this same
+            // indexing use, needing no cast), a struct field's type is
+            // already fixed elsewhere and can't retroactively change.
+            let index_text = if matches!(index.as_ref(), Expr::Member { .. }) {
+                format!("{index_text} as usize")
+            } else {
+                index_text
+            };
             Ok((format!("{base_text}[{index_text}]"), false))
         }
         Expr::Unary {
@@ -514,9 +546,21 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             for a in args {
                 rendered_args.push(render_expr(a, ctx)?.0);
             }
+            // `getSide`/`getSector` (`p_spec.c`) return `side_t*`/
+            // `sector_t*` -> `SideId`/`SectorId` under the existing
+            // memory-model decision, matched narrowly by name (the same
+            // "not yet fully modeled callee" treatment `twoSided` already
+            // gets above) -- needed so a `.field` chained *directly* off
+            // the call result (`getSide(secnum,i,0)->sector`, `EV_DoFloor`'s
+            // own `lowerAndChange` case) resolves through `world[...]`
+            // correctly, not just once the result is first bound to an
+            // already-known-typed local the way `side = getSide(..);`
+            // already works.
+            let is_crossref =
+                matches!(callee.as_ref(), Expr::Ident(n) if n == "getSide" || n == "getSector");
             Ok((
                 format!("{callee_text}({})", rendered_args.join(", ")),
-                false,
+                is_crossref,
             ))
         }
         _ => Err(format!("render_expr: unsupported expression shape: {e:?}")),
@@ -640,6 +684,19 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Member { field, .. } if field == "specialdata" => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
+        // `if (twoSided (secnum, i))` -- `EV_DoFloor`'s own adjacency scan,
+        // the first bare (non-negated) *call result* used for truthiness
+        // rather than a comparison/field. `twoSided` genuinely returns a
+        // plain C `int` (a bitmasked flag, `flags & ML_TWOSIDED`, `p_spec.c`),
+        // so this is ordinary `int` truthiness, not `Option`-valued like
+        // `specialdata` above -- narrowly matched by name (this codebase's
+        // usual style) rather than a general "any call is int-valued"
+        // fallback, since a differently-shaped callee could just as easily
+        // return something `Option`-valued the way `thing->player` already
+        // does elsewhere.
+        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "twoSided") => {
+            Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
+        }
         _ => Err(format!(
             "render_bool_expr: unsupported condition shape: {cond:?}"
         )),
@@ -733,9 +790,21 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
     // to.
     let mut lines = Vec::new();
     for decl in &d.declarators {
-        if decl.initializer.is_some() {
-            return Err("render_decl: an initializer is not supported so far".to_string());
-        }
+        // `int minsize = MAXINT;` (`EV_DoFloor`'s own `raiseToTexture`
+        // case) -- a plain expression initializer, rendered inline on the
+        // same `let mut` this renderer already always uses for a
+        // deferred-inference local (unconditionally `mut`, the same as
+        // every uninitialized decl below, rather than analyzing whether
+        // this particular one is ever reassigned).
+        let init_text = match &decl.initializer {
+            None => String::new(),
+            Some(Initializer::Expr(e)) => format!(" = {}", render_expr(e, ctx)?.0),
+            Some(Initializer::List(_)) => {
+                return Err(
+                    "render_decl: a brace-list initializer is not supported so far".to_string(),
+                );
+            }
+        };
         if !matches!(decl.declarator.direct, DirectDeclarator::Ident(_)) {
             return Err(
                 "render_decl: only a plain (non-array, non-function) declarator is supported so far"
@@ -758,7 +827,7 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         {
             continue;
         }
-        lines.push(format!("{}let mut {name};", indent(depth)));
+        lines.push(format!("{}let mut {name}{init_text};", indent(depth)));
     }
     Ok(lines)
 }
@@ -922,9 +991,33 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             }
             Ok(lines)
         }
+        // A `case`'s own body wrapped in real braces (`case raiseToTexture:
+        // { int minsize = MAXINT; side_t* side; ... } break;`, `EV_DoFloor`'s
+        // own `p_floor.c`) parses as one bare `Stmt::Compound`, unlike
+        // every other case in the same `switch` (flat, brace-less
+        // siblings) -- `render_switch` hands each arm's own statements to
+        // `render_stmt` directly, so this needed the same dispatch
+        // `render_block` already has for a `Compound`, just reachable as
+        // an ordinary statement rather than only an `if`/`while` body.
+        // Rust's own `match` arm already provides equivalent block
+        // scoping for `minsize`/`side`, so the case's extra braces need
+        // no separate nesting of their own here.
+        Stmt::Compound(c) => render_compound_items(&c.items, ctx, depth),
         Stmt::Switch { cond, body } => render_switch(cond, body, ctx, depth),
         Stmt::While { cond, body } => render_while(cond, body, ctx, depth),
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => render_for(init, cond, step, body, ctx, depth),
         Stmt::Continue => Ok(vec![format!("{}continue;", indent(depth))]),
+        // A real loop-exiting `break` (`EV_DoFloor`'s own `lowerAndChange`
+        // case, several levels inside a `for` loop's own body) -- distinct
+        // from the switch-case-delimiter `break` `render_switch` consumes
+        // itself while splitting arms apart (that one is peeled off
+        // before individual statements ever reach `render_stmt` at all).
+        Stmt::Break => Ok(vec![format!("{}break;", indent(depth))]),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
 }
@@ -1137,6 +1230,106 @@ fn render_while(
     lines.extend(render_block(body, ctx, depth + 1)?);
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
+}
+
+/// Renders `for (init; cond; step) body` -- C's counted-loop idiom
+/// (`EV_DoFloor`'s own two otherwise-identical `for (i = 0; i <
+/// sec->linecount; i++)` adjacency scans). Only a plain-assignment init
+/// (the loop counter is already declared earlier in the function -- the
+/// only shape any real corpus `for` found so far uses, and the only one
+/// C89 itself allows) and an `x++`/`x--` step are supported; both become
+/// an ordinary statement, with the step appended *after* the body inside
+/// a Rust `while` -- correct as long as the body itself never
+/// `continue`s (rejected below), since C's own `for` still runs its step
+/// on `continue`, unlike a bare Rust `while`/`loop`, which would jump
+/// straight back to the condition and skip it.
+fn render_for(
+    init: &Option<ForInit>,
+    cond: &Option<Expr>,
+    step: &Option<Expr>,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let Some(ForInit::Expr(init_expr)) = init else {
+        return Err(format!("render_for: unsupported init shape: {init:?}"));
+    };
+    let Some(cond) = cond else {
+        return Err("render_for: a missing condition is not supported yet".to_string());
+    };
+    let Some(step) = step else {
+        return Err("render_for: a missing step is not supported yet".to_string());
+    };
+    let bare_continue = match body {
+        Stmt::Compound(c) => body_has_bare_continue(&c.items),
+        other => stmt_has_bare_continue(other),
+    };
+    if bare_continue {
+        return Err(
+            "render_for: `continue` inside a for-loop body is not supported yet (the translated `while` would skip the step, unlike C's `for`)"
+                .to_string(),
+        );
+    }
+
+    let init_text = render_expr_stmt(init_expr, ctx)?;
+    let cond_text = render_bool_expr(cond, ctx)?;
+    let step_text = render_for_step(step, ctx)?;
+
+    let mut lines = vec![format!("{}{init_text};", indent(depth))];
+    lines.push(format!("{}while {cond_text} {{", indent(depth)));
+    lines.extend(render_block(body, ctx, depth + 1)?);
+    lines.push(format!("{}{step_text};", indent(depth + 1)));
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
+}
+
+/// `i++`/`i--` -- a `for` loop's own step, the only shape any real
+/// corpus loop has needed so far.
+fn render_for_step(step: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
+    match step {
+        Expr::PostIncDec { expr, op } | Expr::PreIncDec { expr, op } => {
+            let (target_text, _) = render_expr(expr, ctx)?;
+            let op_text = match op {
+                IncDecOp::Inc => "+= 1",
+                IncDecOp::Dec => "-= 1",
+            };
+            Ok(format!("{target_text} {op_text}"))
+        }
+        other => Err(format!("render_for: unsupported step shape: {other:?}")),
+    }
+}
+
+/// Detects a `continue` reaching a `for` loop's own body directly --
+/// stops descending at a nested `while`/`for`, since that inner loop
+/// consumes its own `continue` rather than letting it reach the outer
+/// one. Mirrors `body_has_self_removal`'s own recursive-scan shape.
+fn body_has_bare_continue(items: &[BlockItem]) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_bare_continue(s),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn stmt_has_bare_continue(s: &Stmt) -> bool {
+    match s {
+        Stmt::Continue => true,
+        Stmt::Compound(c) => body_has_bare_continue(&c.items),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_has_bare_continue(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_bare_continue(eb))
+        }
+        Stmt::Switch { body, .. } => stmt_has_bare_continue(body),
+        Stmt::Case { stmt, .. } => stmt_has_bare_continue(stmt),
+        Stmt::Default(stmt) => stmt_has_bare_continue(stmt),
+        Stmt::While { .. } | Stmt::For { .. } => false,
+        _ => false,
+    }
 }
 
 /// `P_RemoveThinker(&door->thinker);` -- a tick function removing
@@ -2736,6 +2929,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             Stmt::Case { stmt, .. } => find_stmt(stmt, pred),
             Stmt::Default(stmt) => find_stmt(stmt, pred),
             Stmt::While { body, .. } => find_stmt(body, pred),
+            Stmt::For { body, .. } => find_stmt(body, pred),
             _ => None,
         }
     }
@@ -4063,6 +4257,445 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         assert_eq!(
             rendered,
             "floor.floordestheight -= 8 * FRACUNIT * (floortype == raiseFloorCrush) as i32"
+        );
+    }
+
+    /// `EV_DoFloor`'s second piece: the `for (i = 0; i < sec->linecount;
+    /// i++)` header both `raiseToTexture` and `lowerAndChange` use to scan
+    /// a sector's own lines (a genuinely new statement shape -- no
+    /// function translated so far has needed a real `for` loop). Pulls
+    /// the real `Stmt::For` straight out of `EV_DoFloor`'s own parsed AST
+    /// (whichever of the two identical-header loops `find_stmt` reaches
+    /// first), then re-wraps its real `init`/`cond`/`step` around a
+    /// synthetic empty body -- the same "clone the real subtree, swap in
+    /// a synthetic body/wrapper" approach already used for the shared-
+    /// case-labels test against `T_VerticalDoor`, since the loop bodies
+    /// themselves depend on pieces (`twoSided`/`getSide`/`textureheight[]`)
+    /// not modeled yet and tracked separately in docs/03_TRANSPILER.md.
+    #[test]
+    fn test_for_loop_header_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_for_loop = |s: &Stmt| matches!(s, Stmt::For { .. });
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_for_loop),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `for` loop somewhere in EV_DoFloor");
+        let Stmt::For {
+            init, cond, step, ..
+        } = stmt
+        else {
+            unreachable!("guarded by is_for_loop")
+        };
+        let synthetic = Stmt::For {
+            init: init.clone(),
+            cond: cond.clone(),
+            step: step.clone(),
+            body: Box::new(Stmt::Compound(crate::parser::ast::CompoundStmt {
+                items: Vec::new(),
+            })),
+        };
+
+        let extra_cross_refs = field_types(&[("sec", "SectorId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "i = 0;".to_string(),
+                "while i < world[sec].linecount {".to_string(),
+                "    i += 1;".to_string(),
+                "}".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s third piece: `raiseToTexture`'s adjacency scan,
+    /// `if (twoSided (secnum, i)) { side = getSide(secnum,i,0); ... }` --
+    /// `p_spec.c`'s `twoSided`/`getSide`/`getSector` helpers, real corpus
+    /// functions (not macros) over the same sector/line/side adjacency
+    /// used already-translated corpus-wide (`sides[i].sector`), not yet
+    /// modeled at all before this. `twoSided` genuinely returns a plain
+    /// `int`, used here as a bare (non-negated) call-result condition for
+    /// the first time -- needs `render_bool_expr`'s new `twoSided` arm.
+    /// `getSide` returns `side_t*` -> `SideId` under the existing memory-
+    /// model decision, exactly like `sec: sector_t*` already does, so
+    /// `side = getSide(...)` and a later `side->field` need no new code at
+    /// all once the caller supplies `side`'s own declared type via
+    /// `extra_cross_ref_idents` -- the same generic mechanism `sec`
+    /// already exercises. Clones the real `cond` plus the real first
+    /// statement of the real `then_branch` (`side = getSide(secnum,i,0);`)
+    /// out of `EV_DoFloor`'s own parsed AST, re-wrapped around a synthetic
+    /// one-statement body -- the rest of that `if`'s body still depends on
+    /// `textureheight[...]` (not modeled yet, tracked separately in
+    /// docs/03_TRANSPILER.md), so it's deliberately left out here.
+    #[test]
+    fn test_two_sided_adjacency_scan_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_two_sided_if = |s: &Stmt| {
+            matches!(s, Stmt::If { cond: Expr::Call { callee, .. }, .. }
+                if matches!(callee.as_ref(), Expr::Ident(n) if n == "twoSided"))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_two_sided_if),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected an `if (twoSided(..))` statement somewhere in EV_DoFloor");
+        let Stmt::If {
+            cond, then_branch, ..
+        } = stmt
+        else {
+            unreachable!("guarded by is_two_sided_if")
+        };
+        let Stmt::Compound(then_body) = then_branch.as_ref() else {
+            panic!("expected the `if (twoSided(..))` body to be a compound statement");
+        };
+        let first_stmt = then_body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => Some(s),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected at least one statement in the `if (twoSided(..))` body");
+
+        let synthetic = Stmt::If {
+            cond: cond.clone(),
+            then_branch: Box::new(Stmt::Compound(crate::parser::ast::CompoundStmt {
+                items: vec![BlockItem::Stmt(first_stmt.clone())],
+            })),
+            else_branch: None,
+        };
+
+        let extra_cross_refs = field_types(&[("side", "SideId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "if twoSided(secnum, i) != 0 {".to_string(),
+                "    side = getSide(secnum, i, 0);".to_string(),
+                "}".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s fourth piece: `textureheight[...]`, a genuinely new
+    /// kind of table -- unlike `mobjinfo[]`/`states[]` (compile-time
+    /// literal data straight from the corpus source, rendered as a
+    /// `pub static` array), `textureheight` (`r_data.c`) is allocated at
+    /// runtime (`Z_Malloc`) and filled from WAD data, so it has no
+    /// literal corpus initializer to embed -- for this function body's
+    /// own purposes it's just an opaque global identifier, indexed like
+    /// any other array (the *setup* code that allocates/fills it,
+    /// `R_InitTextures`, is a separate not-yet-transpiled function, the
+    /// same already-accepted kind of forward-reference gap as every
+    /// other not-yet-wired cross-function call). The one real new piece:
+    /// `textureheight[side->bottomtexture]` indexes by a *struct field*
+    /// (`bottomtexture: i16`, a concrete type fixed by `Side`'s own
+    /// definition) rather than a literal or a fresh, still-inferred local
+    /// (`sidenum[side ^ 1]`, already rendering fine with no cast) --
+    /// Rust's `Index<usize>` needs an explicit `as usize` here that the
+    /// generic `Expr::Index` fallback never had to add before. Clones the
+    /// real nested `if (side->bottomtexture >= 0) if (textureheight[..]
+    /// < minsize) minsize = textureheight[..];` straight out of
+    /// `EV_DoFloor`'s own parsed AST (whichever of the two identical
+    /// `getSide(..,0)`/`getSide(..,1)` occurrences `find_stmt` reaches
+    /// first) -- no synthetic wrapper needed this time, the whole
+    /// fragment renders as-is.
+    #[test]
+    fn test_textureheight_index_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_bottomtexture_check = |s: &Stmt| {
+            matches!(s, Stmt::If { cond: Expr::Binary { op: BinaryOp::Ge, lhs, .. }, .. }
+                if matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "bottomtexture"))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_bottomtexture_check),
+                BlockItem::Decl(_) => None,
+            })
+            .expect(
+                "expected an `if (side->bottomtexture >= 0)` statement somewhere in EV_DoFloor",
+            );
+
+        let extra_cross_refs = field_types(&[("side", "SideId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "if world[side].bottomtexture >= 0 {".to_string(),
+                "    if textureheight[world[side].bottomtexture as usize] < minsize {".to_string(),
+                "        minsize = textureheight[world[side].bottomtexture as usize];".to_string(),
+                "    }".to_string(),
+                "}".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s fifth piece: `raiseFloor24AndChange`'s own
+    /// `sec->floorpic = line->frontsector->floorpic; sec->special =
+    /// line->frontsector->special;` -- crossref chained through crossref
+    /// via a *different* base shape than the already-built `sides[i].
+    /// sector`: `line`'s own field `frontsector` (`LineId` -> `SectorId`)
+    /// is a trigger function's own *parameter*, tracked only in
+    /// `extra_cross_ref_idents` (no generic field-type registry exists
+    /// for a parameter's own fields the way `self_field_types`/
+    /// `ctor_field_types` cover `self`/a constructor-in-progress), so
+    /// `line->frontsector` needed its own narrow by-name special case to
+    /// let the *further* `.floorpic`/`.special` chain resolve through
+    /// `world[...]` correctly. Clones both real assignment statements
+    /// straight out of `EV_DoFloor`'s own parsed AST.
+    #[test]
+    fn test_frontsector_crossref_chain_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_frontsector_field_assign = |field_name: &'static str| {
+            move |s: &Stmt| {
+                matches!(s, Stmt::Expr(Some(Expr::Assign { lhs, rhs, .. }))
+                    if matches!(lhs.as_ref(), Expr::Member { field, .. } if field == field_name)
+                    && matches!(rhs.as_ref(), Expr::Member { base, field, .. }
+                        if field == field_name
+                        && matches!(base.as_ref(), Expr::Member { field, .. } if field == "frontsector")))
+            }
+        };
+        let find_one = |field_name: &'static str| -> &Stmt {
+            let pred = is_frontsector_field_assign(field_name);
+            f.body
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    BlockItem::Stmt(s) => find_stmt(s, &pred),
+                    BlockItem::Decl(_) => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("expected a `{field_name} = line->frontsector->{field_name};` statement somewhere in EV_DoFloor")
+                })
+        };
+        let floorpic_stmt = find_one("floorpic").clone();
+        let special_stmt = find_one("special").clone();
+
+        let extra_cross_refs = field_types(&[("sec", "SectorId"), ("line", "LineId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
+        rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
+        assert_eq!(
+            rendered,
+            vec![
+                "world[sec].floorpic = world[world[line].frontsector].floorpic;".to_string(),
+                "world[sec].special = world[world[line].frontsector].special;".to_string(),
+            ]
+        );
+    }
+
+    /// `EV_DoFloor`'s sixth and final piece: `lowerAndChange`'s own
+    /// `if (getSide(secnum,i,0)->sector-sectors == secnum) { sec =
+    /// getSector(secnum,i,1); ... } else { sec = getSector(secnum,i,0);
+    /// ... }` -- pointer arithmetic (the already-built `X-sectors` idiom,
+    /// `EV_VerticalDoor`'s own `secnum = sec-sectors;`) nested inside a
+    /// comparison for the first time, chained directly off a call result
+    /// rather than a local (`getSide(secnum,i,0)->sector`, needing the
+    /// `Expr::Call` arm's new `getSide`/`getSector` -> cross-ref-typed
+    /// special case, mirroring `twoSided`'s own by-name treatment), plus
+    /// `sec` genuinely reassigned mid-construction (`sec = getSector(..);`,
+    /// a plain local rebind -- harmless since `floor->sector = sec;`
+    /// earlier in the case already copied the *old* value by-value, a
+    /// `SectorId` being `Copy`, exactly like C's own pointer-copy
+    /// semantics). Also surfaced a real, separate gap: a loop-exiting
+    /// `break` reached as an ordinary statement (not `render_switch`'s own
+    /// case-delimiter, which is peeled off before individual statements
+    /// ever reach `render_stmt`) had no generic arm at all -- `Stmt::Break`
+    /// now renders the same way `Stmt::Continue` already did. Clones the
+    /// real `if`/`else` straight out of `EV_DoFloor`'s own parsed AST.
+    /// **Combined with the five pieces above, `EV_DoFloor`'s entire body
+    /// is now covered piece-by-piece** (not yet assembled/compiled as one
+    /// whole function -- see docs/03_TRANSPILER.md).
+    #[test]
+    fn test_lower_and_change_sec_reassignment_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_side_sector_check = |s: &Stmt| {
+            matches!(s, Stmt::If { cond: Expr::Binary { op: BinaryOp::Eq, lhs, rhs }, else_branch: Some(_), .. }
+                if matches!(rhs.as_ref(), Expr::Ident(n) if n == "secnum")
+                && matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Sub, rhs: sub_rhs, .. }
+                    if matches!(sub_rhs.as_ref(), Expr::Ident(n) if n == "sectors")))
+        };
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_side_sector_check),
+                BlockItem::Decl(_) => None,
+            })
+            .expect(
+                "expected an `if (getSide(..)->sector-sectors == secnum)` statement somewhere in EV_DoFloor",
+            );
+
+        let self_field_types = field_types(&[
+            ("floordestheight", "FixedT"),
+            ("texture", "i16"),
+            ("newspecial", "i32"),
+        ]);
+        let extra_cross_refs = field_types(&[("sec", "SectorId")]);
+        let ctx = FnBodyContext {
+            self_param: "floor",
+            self_field_types: &self_field_types,
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "if world[getSide(secnum, i, 0)].sector.0 as i32 == secnum {".to_string(),
+                "    sec = getSector(secnum, i, 1);".to_string(),
+                "    if world[sec].floorheight == floor.floordestheight {".to_string(),
+                "        floor.texture = world[sec].floorpic;".to_string(),
+                "        floor.newspecial = world[sec].special;".to_string(),
+                "        break;".to_string(),
+                "    }".to_string(),
+                "} else {".to_string(),
+                "    sec = getSector(secnum, i, 0);".to_string(),
+                "    if world[sec].floorheight == floor.floordestheight {".to_string(),
+                "        floor.texture = world[sec].floorpic;".to_string(),
+                "        floor.newspecial = world[sec].special;".to_string(),
+                "        break;".to_string(),
+                "    }".to_string(),
+                "}".to_string(),
+            ]
+        );
+    }
+
+    /// Attempting `EV_DoFloor`'s full end-to-end assembly (via
+    /// `render_trigger_fn`, the same integration point `EV_DoCeiling`/
+    /// `EV_DoDoor`/`EV_DoPlat` already went through) surfaces a genuine
+    /// latent bug in the original C, the same class already documented
+    /// for `P_SpawnDoorCloseIn30`: `floor->newspecial` is *only* ever set
+    /// deep inside the `lowerAndChange` case's own `for` loop, inside an
+    /// `if (sec->floorheight == floor->floordestheight)` that isn't
+    /// guaranteed to match any adjacent sector -- unlike `floor->texture`
+    /// (also refined there, but *first* given an unconditional value
+    /// right before the loop, `floor->texture = sec->floorpic;`).
+    /// `T_MoveFloor` (already translated, `p_floor.c`) reads
+    /// `floor->newspecial` unconditionally once a `lowerAndChange` floor
+    /// reaches `pastdest`, regardless of whether that `for` loop ever
+    /// found a match -- so a `lowerAndChange` floor whose sector has no
+    /// two-sided neighbor at exactly its own destination height reads
+    /// genuinely uninitialized `Z_Malloc` memory in the real original
+    /// game, real reachable UB (confirmed by tracing the real call sites
+    /// of both functions, not assumed). Since there's no well-defined C
+    /// value to be faithful *to* here, `render_ctor_body`'s rejection is
+    /// the correct, honest answer, not a gap to route around with a
+    /// fabricated default -- unlike this test's *other* four switch-only
+    /// fields (`direction`/`sector`/`speed`/`floordestheight`), which
+    /// really are set by every one of `floor_e`'s 12 real call-site
+    /// values across the whole corpus (grepped directly, not assumed);
+    /// only the 13th variant, `donutRaise`, would reach the switch's own
+    /// empty `default:` arm unset, and `EV_DoFloor` is never actually
+    /// called with it anywhere in the corpus -- provably dead code, the
+    /// same "never observed" reasoning already used for `EV_DoCeiling`'s
+    /// own `Ceiling.olddirection`, so those four get real placeholder
+    /// defaults instead.
+    #[test]
+    fn test_ev_do_floor_detects_missing_newspecial_default() {
+        let params = field_types(&[("line", "LineId"), ("floortype", "i32")]);
+        let locals = field_types(&[("sec", "SectorId")]);
+        let ctor_field_types = field_types(&[
+            ("r#type", "i32"),
+            ("crush", "bool"),
+            ("sector", "SectorId"),
+            ("direction", "i32"),
+            ("newspecial", "i32"),
+            ("texture", "i16"),
+            ("floordestheight", "FixedT"),
+            ("speed", "FixedT"),
+        ]);
+        let field_defaults = field_types(&[
+            ("direction", "0"),
+            ("sector", "sec"),
+            ("speed", "FLOORSPEED"),
+            ("floordestheight", "world[sec].floorheight"),
+            ("texture", "world[sec].floorpic"),
+        ]);
+        let err = render_trigger_fn(
+            &corpus_dir(),
+            "p_floor.c",
+            "EV_DoFloor",
+            &params,
+            &locals,
+            Some(CtorSpec {
+                ctor_var: "floor",
+                ctor_rust_type: "FloorMove",
+                ctor_field_types: &ctor_field_types,
+                field_defaults: &field_defaults,
+            }),
+            Some("i32"),
+        )
+        .expect_err("newspecial should be detected as missing a safe default");
+        assert!(
+            err.contains("newspecial"),
+            "expected `newspecial` in: {err}"
         );
     }
 }
