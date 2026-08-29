@@ -52,8 +52,8 @@
 
 use crate::codegen::struct_fields::rust_field_name;
 use crate::parser::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, FunctionDef,
-    IncDecOp, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, ForInit,
+    FunctionDef, IncDecOp, ParamDeclarator, Stmt, TypeSpecifier, UnaryOp,
 };
 use crate::parser::grammar::declarator_name;
 use crate::parser::parse_full;
@@ -924,6 +924,12 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         }
         Stmt::Switch { cond, body } => render_switch(cond, body, ctx, depth),
         Stmt::While { cond, body } => render_while(cond, body, ctx, depth),
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => render_for(init, cond, step, body, ctx, depth),
         Stmt::Continue => Ok(vec![format!("{}continue;", indent(depth))]),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
@@ -1137,6 +1143,106 @@ fn render_while(
     lines.extend(render_block(body, ctx, depth + 1)?);
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
+}
+
+/// Renders `for (init; cond; step) body` -- C's counted-loop idiom
+/// (`EV_DoFloor`'s own two otherwise-identical `for (i = 0; i <
+/// sec->linecount; i++)` adjacency scans). Only a plain-assignment init
+/// (the loop counter is already declared earlier in the function -- the
+/// only shape any real corpus `for` found so far uses, and the only one
+/// C89 itself allows) and an `x++`/`x--` step are supported; both become
+/// an ordinary statement, with the step appended *after* the body inside
+/// a Rust `while` -- correct as long as the body itself never
+/// `continue`s (rejected below), since C's own `for` still runs its step
+/// on `continue`, unlike a bare Rust `while`/`loop`, which would jump
+/// straight back to the condition and skip it.
+fn render_for(
+    init: &Option<ForInit>,
+    cond: &Option<Expr>,
+    step: &Option<Expr>,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let Some(ForInit::Expr(init_expr)) = init else {
+        return Err(format!("render_for: unsupported init shape: {init:?}"));
+    };
+    let Some(cond) = cond else {
+        return Err("render_for: a missing condition is not supported yet".to_string());
+    };
+    let Some(step) = step else {
+        return Err("render_for: a missing step is not supported yet".to_string());
+    };
+    let bare_continue = match body {
+        Stmt::Compound(c) => body_has_bare_continue(&c.items),
+        other => stmt_has_bare_continue(other),
+    };
+    if bare_continue {
+        return Err(
+            "render_for: `continue` inside a for-loop body is not supported yet (the translated `while` would skip the step, unlike C's `for`)"
+                .to_string(),
+        );
+    }
+
+    let init_text = render_expr_stmt(init_expr, ctx)?;
+    let cond_text = render_bool_expr(cond, ctx)?;
+    let step_text = render_for_step(step, ctx)?;
+
+    let mut lines = vec![format!("{}{init_text};", indent(depth))];
+    lines.push(format!("{}while {cond_text} {{", indent(depth)));
+    lines.extend(render_block(body, ctx, depth + 1)?);
+    lines.push(format!("{}{step_text};", indent(depth + 1)));
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
+}
+
+/// `i++`/`i--` -- a `for` loop's own step, the only shape any real
+/// corpus loop has needed so far.
+fn render_for_step(step: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
+    match step {
+        Expr::PostIncDec { expr, op } | Expr::PreIncDec { expr, op } => {
+            let (target_text, _) = render_expr(expr, ctx)?;
+            let op_text = match op {
+                IncDecOp::Inc => "+= 1",
+                IncDecOp::Dec => "-= 1",
+            };
+            Ok(format!("{target_text} {op_text}"))
+        }
+        other => Err(format!("render_for: unsupported step shape: {other:?}")),
+    }
+}
+
+/// Detects a `continue` reaching a `for` loop's own body directly --
+/// stops descending at a nested `while`/`for`, since that inner loop
+/// consumes its own `continue` rather than letting it reach the outer
+/// one. Mirrors `body_has_self_removal`'s own recursive-scan shape.
+fn body_has_bare_continue(items: &[BlockItem]) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_bare_continue(s),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn stmt_has_bare_continue(s: &Stmt) -> bool {
+    match s {
+        Stmt::Continue => true,
+        Stmt::Compound(c) => body_has_bare_continue(&c.items),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_has_bare_continue(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_bare_continue(eb))
+        }
+        Stmt::Switch { body, .. } => stmt_has_bare_continue(body),
+        Stmt::Case { stmt, .. } => stmt_has_bare_continue(stmt),
+        Stmt::Default(stmt) => stmt_has_bare_continue(stmt),
+        Stmt::While { .. } | Stmt::For { .. } => false,
+        _ => false,
+    }
 }
 
 /// `P_RemoveThinker(&door->thinker);` -- a tick function removing
@@ -2736,6 +2842,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             Stmt::Case { stmt, .. } => find_stmt(stmt, pred),
             Stmt::Default(stmt) => find_stmt(stmt, pred),
             Stmt::While { body, .. } => find_stmt(body, pred),
+            Stmt::For { body, .. } => find_stmt(body, pred),
             _ => None,
         }
     }
@@ -4063,6 +4170,71 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         assert_eq!(
             rendered,
             "floor.floordestheight -= 8 * FRACUNIT * (floortype == raiseFloorCrush) as i32"
+        );
+    }
+
+    /// `EV_DoFloor`'s second piece: the `for (i = 0; i < sec->linecount;
+    /// i++)` header both `raiseToTexture` and `lowerAndChange` use to scan
+    /// a sector's own lines (a genuinely new statement shape -- no
+    /// function translated so far has needed a real `for` loop). Pulls
+    /// the real `Stmt::For` straight out of `EV_DoFloor`'s own parsed AST
+    /// (whichever of the two identical-header loops `find_stmt` reaches
+    /// first), then re-wraps its real `init`/`cond`/`step` around a
+    /// synthetic empty body -- the same "clone the real subtree, swap in
+    /// a synthetic body/wrapper" approach already used for the shared-
+    /// case-labels test against `T_VerticalDoor`, since the loop bodies
+    /// themselves depend on pieces (`twoSided`/`getSide`/`textureheight[]`)
+    /// not modeled yet and tracked separately in docs/03_TRANSPILER.md.
+    #[test]
+    fn test_for_loop_header_against_real_ev_do_floor() {
+        let path = corpus_dir().join("p_floor.c");
+        let (_, unit) = parse_full(path.to_str().unwrap()).expect("p_floor.c should parse");
+        let f = find_function_def(&unit.items, "EV_DoFloor").expect("EV_DoFloor not found");
+        let is_for_loop = |s: &Stmt| matches!(s, Stmt::For { .. });
+        let stmt = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Stmt(s) => find_stmt(s, &is_for_loop),
+                BlockItem::Decl(_) => None,
+            })
+            .expect("expected a `for` loop somewhere in EV_DoFloor");
+        let Stmt::For {
+            init, cond, step, ..
+        } = stmt
+        else {
+            unreachable!("guarded by is_for_loop")
+        };
+        let synthetic = Stmt::For {
+            init: init.clone(),
+            cond: cond.clone(),
+            step: step.clone(),
+            body: Box::new(Stmt::Compound(crate::parser::ast::CompoundStmt {
+                items: Vec::new(),
+            })),
+        };
+
+        let extra_cross_refs = field_types(&[("sec", "SectorId")]);
+        let ctx = FnBodyContext {
+            self_param: "",
+            self_field_types: &HashMap::new(),
+            extra_cross_ref_idents: &extra_cross_refs,
+            ctor_var: "",
+            ctor_var_handle_name: "",
+            ctor_field_types: &HashMap::new(),
+            embedded_ctor: None,
+            mutating_handle: None,
+        };
+        let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            vec![
+                "i = 0;".to_string(),
+                "while i < world[sec].linecount {".to_string(),
+                "    i += 1;".to_string(),
+                "}".to_string(),
+            ]
         );
     }
 }
