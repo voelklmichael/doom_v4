@@ -7451,6 +7451,45 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
         assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
     }
 
+    /// `A_FireShotgun` -- the third weapon-family function this same
+    /// truthiness fix unlocks, though not through the fix itself: its own
+    /// `P_GunShot(player->mo, false)` passes the plain boolean *literal*
+    /// `false`, not a negated field, which already rendered correctly
+    /// beforehand (`rust_ident_name` already special-cases `true`/`false`
+    /// as real Rust literals, not identifiers needing escaping). What
+    /// actually blocked it was never call-argument truthiness at all --
+    /// it's the first real corpus `for` loop with a *brace-less* single-
+    /// statement body (`for (i=0 ; i<7 ; i++)\n\tP_GunShot (...);`, no
+    /// `{ }`), confirmed to need no new code: `render_for` already
+    /// delegates its body to `render_block`, which already dispatches a
+    /// bare (non-`Compound`) statement straight to `render_stmt` -- the
+    /// same fallback `EV_StartLightStrobing`'s own `while` loop already
+    /// exercises for its brace-less body, just not yet exercised by a real
+    /// `for` loop until now. `int i;` (no initializer) is `render_decl`'s
+    /// already-ordinary bare-`int` case.
+    #[test]
+    fn test_a_fire_shotgun_renders_exactly() {
+        let rendered =
+            render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireShotgun", &HashMap::new())
+                .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FireShotgun(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             let mut i;\n    \
+             S_StartSound(player.mo, sfx_shotgn);\n    \
+             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
+             P_BulletSlope(player.mo);\n    \
+             i = 0;\n    \
+             while i < 7 {\n        \
+             P_GunShot(player.mo, false);\n        \
+             i += 1;\n    \
+             }\n\
+             }"
+        );
+    }
+
     /// `A_BrainScream` -- `A_BrainExplode`'s own already-translated
     /// idiom (spawn a rocket-shaped mobj, give it a random downward tics
     /// countdown clamped to at least 1) repeated across a horizontal
