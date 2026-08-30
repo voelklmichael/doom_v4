@@ -115,6 +115,36 @@ pub struct StatesTable {
     pub imports: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// `state_index` -- hand-rendered literal text, not corpus-mapped, the
+/// same category as `world.rs`'s own `render_world_struct` (new,
+/// invented Rust-only infrastructure with no direct corpus counterpart).
+/// Needed the first time a real function body computes real C pointer
+/// arithmetic between two `state_t*` values (`A_FireCGun`'s own
+/// `weaponinfo[player->readyweapon].flashstate + psp->state -
+/// &states[S_CHAIN1]`, `p_pspr.c`): unlike `sector_t*`/`side_t*`/etc.
+/// (plain index newtypes under this project's own memory model, so
+/// "index of this pointer" is a free `.0` field read, see `EV_
+/// VerticalDoor`'s own `sec-sectors`), `state_t*` maps to a real
+/// `&'static State` reference into the `STATES` table (`struct_
+/// fields.rs`'s own established decision -- `mobjinfo_t`/`state_t*`
+/// point at a static, program-lifetime, read-only table, so a real
+/// reference is simpler than another index newtype), which has no
+/// index of its own to read back out. Computed via plain pointer-to-
+/// `usize` address arithmetic -- safe, well-defined Rust for two
+/// pointers known to be elements of the *same* array (no dereferencing
+/// of a possibly-invalid pointer happens at all, only integer
+/// arithmetic on addresses), matching the byte-distance-divided-by-
+/// element-size semantics C's own pointer subtraction has, without
+/// needing an `unsafe` block.
+pub fn render_state_index_fn() -> String {
+    "\
+pub fn state_index(s: &'static State) -> i32 {
+    ((s as *const State as usize - &STATES[0] as *const State as usize)
+        / std::mem::size_of::<State>()) as i32
+}"
+    .to_string()
+}
+
 /// Renders `states[]` against the real corpus at `corpus_dir`. `Err` names
 /// the first entry/field this can't render, rather than emitting a
 /// partial or wrong table.
@@ -298,6 +328,18 @@ mod tests {
         assert_eq!(
             index.get("A_OpenShotgun2").map(|(m, c)| (m.as_str(), *c)),
             Some(("p_enemy", 2))
+        );
+    }
+
+    #[test]
+    fn test_renders_state_index_fn() {
+        let rendered = render_state_index_fn();
+        assert_eq!(
+            rendered,
+            "pub fn state_index(s: &'static State) -> i32 {\n    \
+             ((s as *const State as usize - &STATES[0] as *const State as usize)\n        \
+             / std::mem::size_of::<State>()) as i32\n\
+             }"
         );
     }
 }

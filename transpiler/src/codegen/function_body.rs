@@ -852,6 +852,79 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (lhs_text, _) = render_expr(lhs, ctx)?;
             Ok((format!("{lhs_text}.0 as i32"), false))
         }
+        // `weaponinfo[player->readyweapon].flashstate + psp->state -
+        // &states[S_CHAIN1]` (`A_FireCGun`, `p_pspr.c`) -- real C pointer
+        // arithmetic between two `state_t*` values, a genuinely
+        // *different* shape than `sec-sectors`'s own trick just above:
+        // that one subtracts a base pointer from a value that's
+        // *already* an index newtype (`SectorId`), but `state_t*` maps
+        // to a real `&'static State` reference (`struct_fields.rs`'s own
+        // decision -- `states[]` is a static, program-lifetime,
+        // read-only table, so a real reference is simpler than another
+        // index), which has no index of its own to read back out.
+        // Algebraically simplified before rendering, not translated
+        // statement-for-statement: C's `int + state_ptr - state_ptr` is
+        // "advance a state pointer by N states, then measure its
+        // distance from a known base," and since `&states[S_CHAIN1]`'s
+        // own index *is* `S_CHAIN1` by construction (no arithmetic
+        // needed to know it), the whole expression reduces to
+        // `flashstate + state_index(psp.state) - S_CHAIN1` -- one real
+        // pointer-to-index lookup (`states_data.rs`'s new hand-rendered
+        // `state_index`, the same "new, invented Rust-only
+        // infrastructure with no direct corpus counterpart" category as
+        // `World`/`Handle`/`Arena`), not two. The state-pointer operand
+        // of the inner `+` is identified by its own field name,
+        // `"state"` (this codebase's usual by-name style), since both
+        // operands are plain `Member` reads and can't be told apart by
+        // AST shape alone.
+        Expr::Binary {
+            op: BinaryOp::Sub,
+            lhs: sub_lhs,
+            rhs: sub_rhs,
+        } if matches!(sub_rhs.as_ref(), Expr::Unary { op: UnaryOp::AddrOf, expr }
+                if matches!(expr.as_ref(), Expr::Index { base, index }
+                    if matches!(base.as_ref(), Expr::Ident(n) if n == "states")
+                        && matches!(index.as_ref(), Expr::Ident(_))))
+            && matches!(sub_lhs.as_ref(), Expr::Binary { op: BinaryOp::Add, lhs: add_lhs, rhs: add_rhs, .. }
+                if matches!(add_lhs.as_ref(), Expr::Member { field, .. } if field == "state")
+                    != matches!(add_rhs.as_ref(), Expr::Member { field, .. } if field == "state")) =>
+        {
+            let Expr::Unary {
+                expr: addrof_expr, ..
+            } = sub_rhs.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let Expr::Index {
+                index: base_index, ..
+            } = addrof_expr.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let Expr::Ident(base_name) = base_index.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let Expr::Binary {
+                lhs: add_lhs,
+                rhs: add_rhs,
+                ..
+            } = sub_lhs.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let (state_expr, offset_expr) = if matches!(add_lhs.as_ref(), Expr::Member { field, .. } if field == "state")
+            {
+                (add_lhs.as_ref(), add_rhs.as_ref())
+            } else {
+                (add_rhs.as_ref(), add_lhs.as_ref())
+            };
+            let (offset_text, _) = render_expr(offset_expr, ctx)?;
+            let (state_text, _) = render_expr(state_expr, ctx)?;
+            Ok((
+                format!("{offset_text} + state_index({state_text}) - {base_name}"),
+                false,
+            ))
+        }
         // `-ANG90/20` (`A_Saw`'s own angle-adjustment idiom, `p_pspr.c`)
         // -- `ANGxx` macros render as opaque `u32`-typed pass-through
         // text (matching every other place one's used directly against
@@ -10070,6 +10143,54 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n    \
              }\n    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.flags |= MF_JUSTATTACKED; };\n\
+             }"
+        );
+    }
+
+    /// `A_FireCGun` -- closed out, the pointer-arithmetic gap between
+    /// two `&'static State` references that `A_FirePistol`'s own entry
+    /// left open. `weaponinfo[player->readyweapon].flashstate +
+    /// psp->state - &states[S_CHAIN1]` renders through the new
+    /// `state_index`-based arm (see its own doc comment on
+    /// `render_expr`'s `Binary::Sub` match arm) as
+    /// `weaponinfo[player.readyweapon as usize].flashstate +
+    /// state_index(psp.state) - S_CHAIN1`. Everything else in the
+    /// function was already proven correct in isolation by the earlier
+    /// fragment test, kept alongside this whole-function one: the
+    /// `!player->ammo[weaponinfo[player->readyweapon].ammo]` early
+    /// return (a negated `Expr::Index`, already generic, needing no
+    /// dedicated arm at all) and `P_GunShot(player->mo, !player->refire)`
+    /// (the call-argument truthiness fix `A_FirePistol` itself closed).
+    /// A genuinely simpler signature than `A_Punch`/`A_Saw`: unlike its
+    /// two siblings, `player->mo` is only ever passed opaquely here
+    /// (`S_StartSound`/`P_SetMobjState`/`P_BulletSlope`/`P_GunShot` all
+    /// just forward it, never dereference through it), and `psp->state`
+    /// needs no `Arena` lookup at all (`state_index` takes the real
+    /// `&'static State` reference directly) -- so `render_weapon_fn`'s
+    /// own signature-extension logic correctly adds neither `world` nor
+    /// `thinkers` at all, confirming those flags really do measure real
+    /// body need rather than defaulting to "on" for every weapon
+    /// function. Verified compiling for real (rustc, edition 2021,
+    /// crate-type lib) against a hand-written stand-in including a real
+    /// `state_index` matching `states_data.rs`'s own rendering, and stub
+    /// forward-referenced functions -- zero errors.
+    #[test]
+    fn test_a_fire_cgun_renders_exactly() {
+        let field_types = field_types(&[("mo", "Handle<Thinker>"), ("refire", "i32")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireCGun", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_FireCGun(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+             S_StartSound(player.mo, sfx_pistol);\n    \
+             if player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] == 0 {\n        \
+             return;\n    \
+             }\n    \
+             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + state_index(psp.state) - S_CHAIN1);\n    \
+             P_BulletSlope(player.mo);\n    \
+             P_GunShot(player.mo, player.refire == 0);\n\
              }"
         );
     }
