@@ -1003,6 +1003,27 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].sector"), true))
         }
+        // `mo->player->viewheight` (`P_ZMovement`'s own idiom) -- reading
+        // through a self-struct field itself `Option<PlayerId>`-typed,
+        // the same "one more level of chaining through a self field"
+        // shape `line->frontsector`/`actor->subsector->sector` already
+        // established just above, just landing on `PlayerId` (`World`-
+        // indexed directly, no `Arena` lookup needed at all, unlike
+        // `target`/`tracer`'s own `Handle<Thinker>`) instead of another
+        // `SectorId`. `.unwrap()` at the point of use, the same
+        // defensive-redundancy precedent every other `Option<PlayerId>`/
+        // `Option<SectorId>` dereference in this module already follows.
+        Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                if matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    && ctx.self_field_types.get(bf.as_str()).map(String::as_str) == Some("Option<PlayerId>")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!("world[{base_text}.unwrap()].{}", rust_field_name(field)?),
+                false,
+            ))
+        }
         // `actor->target->info` read inside the RHS of a write to a
         // *different* field of that same `actor->target` (`A_VileAttack`'s
         // own `actor->target->momz = 1000*FRACUNIT/actor->target->info->
@@ -1423,6 +1444,55 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let mut lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
             let mut rhs_text = render_binary_operand(rhs, *op, prec, true, ctx)?;
             if is_fixed_t_local_ident(lhs, ctx) {
+                rhs_text = format!("FixedT({rhs_text})");
+            } else {
+                lhs_text = format!("FixedT({lhs_text})");
+            }
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
+        // `mo->momz < 0`/`== 0`/`> 0` (`P_ZMovement`) -- a comparison
+        // between a genuinely `FixedT`-valued *self-struct field* and a
+        // bare integer literal. Deliberately its own narrower arm, not a
+        // blanket widening of the one just above to `expr_is_fixed_t_
+        // valued` on both sides: that was tried first and is a real
+        // regression, not just extra caution -- `T_PlatRaise`'s own
+        // `plat.sector.floorheight == plat.low` compares two genuinely
+        // `FixedT` values, but `expr_is_fixed_t_valued` has no way to
+        // recognize a cross-reference *chain* (`plat.sector.floorheight`,
+        // reached through `Sector`, a different struct than `self_param`'s
+        // own `Plat`) as already-`FixedT` -- only `plat.low` (a *direct*
+        // self field) is recognized, so a blanket `expr_is_fixed_t_valued`
+        // XOR wrongly wraps the *already-correct* other side in a second,
+        // invalid `FixedT(FixedT(..))`. A bare `Expr::IntLiteral`, unlike
+        // an unrecognized `Member`, is never ambiguous -- it can *never*
+        // itself be genuinely `FixedT`-valued -- so requiring the *other*
+        // side to be one specifically (rather than "anything `expr_is_
+        // fixed_t_valued` doesn't recognize") avoids the whole class of
+        // bug the wider check hit, while still closing the one real gap
+        // (a self field has never been wrapped against a plain literal
+        // before, since `is_fixed_t_local_ident` only ever recognizes a
+        // bare local, never a self-struct field).
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+            ) && (is_self_fixed_t_field(lhs, ctx)
+                && matches!(rhs.as_ref(), Expr::IntLiteral(_))
+                || is_self_fixed_t_field(rhs, ctx)
+                    && matches!(lhs.as_ref(), Expr::IntLiteral(_))) =>
+        {
+            let prec = binary_prec(*op);
+            let mut lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
+            let mut rhs_text = render_binary_operand(rhs, *op, prec, true, ctx)?;
+            if is_self_fixed_t_field(lhs, ctx) {
                 rhs_text = format!("FixedT({rhs_text})");
             } else {
                 lhs_text = format!("FixedT({lhs_text})");
@@ -1990,6 +2060,16 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // `.is_some()`, not the `== 0` truthiness every other (plain
         // `int`) value gets.
         Expr::Member { field, .. } if field == "specialdata" => {
+            Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
+        }
+        // `if (mo->player && ...)` (`P_ZMovement`) -- a bare, non-negated
+        // self-struct field itself `Option<...>`-typed (`is_option_valued`'s
+        // own generic self-field arm, not just the hardcoded `specialdata`
+        // name above) used for truthiness -- the un-negated sibling of the
+        // negated `!actor->target`/`!mo->player` arm this module already
+        // has (`is_option_valued(expr, ctx)` at the top of this match), just
+        // never needed bare until this first real corpus example.
+        Expr::Member { .. } if is_option_valued(cond, ctx) => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
         // `if (linetarget)` (`A_Punch`) -- a bare, non-negated `Option`-
@@ -3352,6 +3432,19 @@ fn is_fixed_t_local_ident(e: &Expr, ctx: &FnBodyContext) -> bool {
     matches!(e, Expr::Ident(n) if ctx.fixed_t_locals.contains(n.as_str()))
 }
 
+/// A *direct* self-struct field registered `"FixedT"` (`mo->momz`, not a
+/// further chain through it like `plat->sector->floorheight`) -- used by
+/// the literal-comparison-wrap arm below, deliberately narrower than
+/// `expr_is_fixed_t_valued`'s own (already-correct, more permissive)
+/// notion of "definitely `FixedT`", since that arm's safety specifically
+/// depends on the *other* side being an unambiguous `Expr::IntLiteral`,
+/// not on this side being exhaustively recognized.
+fn is_self_fixed_t_field(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Member { base, field, .. }
+        if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+            && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT"))
+}
+
 fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
     match e {
         // `P_AproxDistance`'s own bare `dx`/`dy` -- a plain function
@@ -3371,7 +3464,21 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
         {
             true
         }
-        Expr::Ident(n) => n == "FRACUNIT",
+        // `delta`/`dist` (`P_ZMovement`'s own `fixed_t`-declared locals,
+        // `FnBodyContext::fixed_t_locals`) -- genuinely `FixedT`-valued
+        // the same way a self-struct field is, just never checked here
+        // before now: every earlier caller of this function either didn't
+        // have a `fixed_t`-declared local in the expression at all, or
+        // (`is_fixed_t_local_ident`'s own separate, narrower callers)
+        // only ever needed to recognize a *bare* fixed_t local, not one
+        // buried inside a larger arithmetic expression (`-(delta*3)`) --
+        // confirmed a real gap by tracing `P_ZMovement`'s own `dist <
+        // -(delta*3)` through by hand: without this, `-(delta*3)` looks
+        // *not* already `FixedT`-valued, so the comparison-wrap arm below
+        // would double-wrap an already-genuine `FixedT` expression in
+        // `FixedT(..)` a second time, the identical class of bug
+        // `corpsehit->momy`'s own arm just above was built to prevent.
+        Expr::Ident(n) => n == "FRACUNIT" || ctx.fixed_t_locals.contains(n.as_str()),
         Expr::Member { base, field, .. } => {
             // `corpsehit->momy` (`PIT_VileCheck`) -- a third real source,
             // alongside `self_param`'s own fields and a spawned `Handle<
@@ -3585,6 +3692,33 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             };
             return Ok(format!(
                 "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({name}) {{ m.{field} {} {rhs_text}; }}",
+                render_assign_op(*op)
+            ));
+        }
+        // `mo->player->viewheight -= ..;` / `.deltaviewheight = ..;`
+        // (`P_ZMovement`'s own idiom) -- writing through a self-struct
+        // field itself `Option<PlayerId>`-typed. Unlike every
+        // `Handle<Thinker>`-mediated write in this function, this needs
+        // no `Arena` borrow-scoping dance at all: `World::players` is a
+        // plain, ordinary Rust array (`runtime/player.rs`'s own fixed-
+        // size design), not an arena with a `get`/`get_mut` API, so
+        // `world[mo.player.unwrap()].field op= rhs;` is just a normal
+        // indexed write, safe regardless of what else the same RHS reads
+        // (no live borrow to conflict with, unlike `thinkers.get_mut`).
+        if let Expr::Member {
+            base,
+            field: lhs_field,
+            ..
+        } = lhs.as_ref()
+            && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                if matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    && ctx.self_field_types.get(bf.as_str()).map(String::as_str) == Some("Option<PlayerId>"))
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            return Ok(format!(
+                "world[{base_text}.unwrap()].{field} {} {rhs_text}",
                 render_assign_op(*op)
             ));
         }
@@ -14337,6 +14471,144 @@ pub fn P_LineOpening(linedef: &Line, world: &mut World) {
         world.lowfloor = world[front].floorheight;
     }
     world.openrange = world.opentop - world.openbottom;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ZMovement` (`p_mobj.c`) -- a plain self-struct tick function
+    /// (`render_fn`'s existing shape), needing four new, narrowly-scoped
+    /// pieces, none of them speculative -- each measured against this
+    /// real body before being trusted. (1) `mo->player->viewheight`/
+    /// `.deltaviewheight` -- the first read/write *through* a self-struct
+    /// field itself `Option<PlayerId>`-typed (`Mobj.player`, unlike
+    /// `EV_DoLockedDoor`'s own `player_t*` *parameter*): two new,
+    /// deliberately simple `render_expr`/`render_expr_stmt` arms, needing
+    /// no `Arena` borrow-scoping dance at all (`World::players` is a
+    /// plain array, not an arena with a `get`/`get_mut` API, so multiple
+    /// accesses to the same player within one statement's RHS pose no
+    /// Rust borrow conflict the way a `Handle<Thinker>` access would).
+    /// (2) `if (mo->player && ...)` -- the bare, un-negated truthiness
+    /// counterpart of the already-known negated `!mo->player` arm:
+    /// `render_bool_expr` had no arm at all for a bare (not hardcoded
+    /// `"specialdata"`) self-struct `Option<...>`-typed *field*, only a
+    /// bare `Ident` (`linetarget`) -- confirmed a real `render_bool_expr`
+    /// `Err` otherwise, not assumed. (3) `dist < -(delta*3)` --
+    /// `expr_is_fixed_t_valued`'s own `Ident` arm never checked `ctx.
+    /// fixed_t_locals` at all (only self-struct fields/`FRACUNIT`/
+    /// registered parameters), so `delta` (a genuinely `fixed_t`-declared
+    /// local) buried inside a larger arithmetic expression looked *not*
+    /// already `FixedT`-valued, which would have double-wrapped an
+    /// already-real `FixedT` value in `FixedT(..)` a second time -- fixed
+    /// by extending that one `Ident` arm, not by touching the comparison-
+    /// wrap arm itself. (4) `mo->momz < 0`/`== 0`/`> 0` -- a comparison
+    /// between a genuinely `FixedT`-valued self-struct field and a bare
+    /// integer literal, needing its own new, deliberately narrow arm
+    /// (`is_self_fixed_t_field`) rather than a blanket widening of the
+    /// existing `fixed_t_locals`-vs-literal comparison-wrap arm to
+    /// `expr_is_fixed_t_valued` on both sides -- tried first, and a real
+    /// regression, not just extra caution: `T_PlatRaise`'s own already-
+    /// shipped `plat.sector.floorheight == plat.low` compares two
+    /// genuinely `FixedT` values, but `expr_is_fixed_t_valued` has no way
+    /// to recognize a cross-reference *chain* (`plat.sector.floorheight`,
+    /// reached through `Sector`, a different struct than `self_param`'s
+    /// own `Plat`) as already-`FixedT` -- a blanket XOR wrongly wrapped
+    /// that already-correct side a second time, caught by the full test
+    /// suite itself (not inspection) before landing the narrower fix.
+    /// Everything else in the function -- the target-dereference chain
+    /// (`mo->target->x`/`.y`/`.z`, already proven), `Shr<i32>`/`Shl`-free
+    /// `FixedT` arithmetic, the bare unconditional `{ mo->z = ..; }` block
+    /// after an `if` with no `else` (`render_stmt`'s existing bare-
+    /// `Compound` dispatch, `EV_DoFloor`'s own precedent), and every
+    /// opaque macro identifier (`FLOATSPEED`/`GRAVITY`/`VIEWHEIGHT`,
+    /// assumed correctly `FixedT`-typed wherever the real generated crate
+    /// eventually defines them, the same `MISSILERANGE`/`CEILSPEED`
+    /// precedent) -- reused wholly pre-existing machinery. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Mobj`/`World`/`Player`/`Handle`/`Arena`/
+    /// `FixedT` stand-in and stub forward-referenced functions -- zero
+    /// errors. 420/420 tests passing.
+    #[test]
+    fn test_p_zmovement_renders_exactly() {
+        let field_types = field_types(&[
+            ("player", "Option<PlayerId>"),
+            ("z", "FixedT"),
+            ("floorz", "FixedT"),
+            ("ceilingz", "FixedT"),
+            ("momz", "FixedT"),
+            ("height", "FixedT"),
+            ("flags", "i32"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_ZMovement",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ZMovement(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {
+    let mut dist;
+    let mut delta;
+    if mo.player.is_some() && mo.z < mo.floorz {
+        world[mo.player.unwrap()].viewheight -= mo.floorz - mo.z;
+        world[mo.player.unwrap()].deltaviewheight = VIEWHEIGHT - world[mo.player.unwrap()].viewheight >> 3;
+    }
+    mo.z += mo.momz;
+    if (mo.flags & MF_FLOAT) != 0 && mo.target.is_some() {
+        if mo.flags & MF_SKULLFLY == 0 && mo.flags & MF_INFLOAT == 0 {
+            dist = P_AproxDistance(mo.x - match thinkers.get(mo.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, mo.y - match thinkers.get(mo.target.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });
+            delta = match thinkers.get(mo.target.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + (mo.height >> 1) - mo.z;
+            if delta < FixedT(0) && dist < -(delta * 3) {
+                mo.z -= FLOATSPEED;
+            } else {
+                if delta > FixedT(0) && dist < delta * 3 {
+                    mo.z += FLOATSPEED;
+                }
+            }
+        }
+    }
+    if mo.z <= mo.floorz {
+        if (mo.flags & MF_SKULLFLY) != 0 {
+            mo.momz = -mo.momz;
+        }
+        if mo.momz < FixedT(0) {
+            if mo.player.is_some() && mo.momz < -GRAVITY * 8 {
+                world[mo.player.unwrap()].deltaviewheight = mo.momz >> 3;
+                S_StartSound(mo, sfx_oof);
+            }
+            mo.momz = FixedT(0);
+        }
+        mo.z = mo.floorz;
+        if (mo.flags & MF_MISSILE) != 0 && mo.flags & MF_NOCLIP == 0 {
+            P_ExplodeMissile(mo);
+            return;
+        }
+    } else {
+        if mo.flags & MF_NOGRAVITY == 0 {
+            if mo.momz == FixedT(0) {
+                mo.momz = -GRAVITY * 2;
+            } else {
+                mo.momz -= GRAVITY;
+            }
+        }
+    }
+    if mo.z + mo.height > mo.ceilingz {
+        if mo.momz > FixedT(0) {
+            mo.momz = FixedT(0);
+        }
+        mo.z = mo.ceilingz - mo.height;
+        if (mo.flags & MF_SKULLFLY) != 0 {
+            mo.momz = -mo.momz;
+        }
+        if (mo.flags & MF_MISSILE) != 0 && mo.flags & MF_NOCLIP == 0 {
+            P_ExplodeMissile(mo);
+            return;
+        }
+    }
 }";
         assert_eq!(rendered, expected);
     }
