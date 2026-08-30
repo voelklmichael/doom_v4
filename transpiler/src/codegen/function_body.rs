@@ -16648,4 +16648,50 @@ pub fn P_BulletSlope(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>
 }";
         assert_eq!(rendered, expected);
     }
+
+    /// `P_SetupPsprites` (`p_pspr.c`) translated -- an ordinary `Player`-
+    /// shaped self-struct function, needing no new mechanism at all now
+    /// that `psprites` is a known by-name self-array-field (`P_BringUpWeapon`'s
+    /// own entry): `player->psprites[i].state = NULL;` needs no cast
+    /// beyond the existing `psprites`-by-name `as usize` index-cast rule
+    /// (which fires on *any* index shape into `psprites`, bare loop
+    /// counter included, not just an enum-constant one), and `Expr::Ident
+    /// ("NULL")`'s existing generic `-> None` rendering (`getNextSector`'s
+    /// own precedent) covers the write with nothing new. `player->
+    /// pendingweapon = player->readyweapon;` reuses `P_BringUpWeapon`'s
+    /// own already-proven plain self-field write. `P_BringUpWeapon
+    /// (player);` is itself already a real translated function (this same
+    /// round's own earlier entry), called here as an ordinary forward
+    /// reference. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Player`/`PlayerSpriteState`
+    /// stand-in and a stub `P_BringUpWeapon` -- zero errors.
+    /// `test_p_setup_psprites_renders_exactly`.
+    #[test]
+    fn test_p_setup_psprites_renders_exactly() {
+        let field_types = field_types(&[
+            ("psprites", "[PlayerSpriteState; NUMPSPRITES]"),
+            ("pendingweapon", "i32"),
+            ("readyweapon", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_SetupPsprites",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SetupPsprites(player: &mut Player, world: &mut World) {
+    let mut i;
+    i = 0;
+    while i < NUMPSPRITES {
+        player.psprites[i as usize].state = None;
+        i += 1;
+    }
+    player.pendingweapon = player.readyweapon;
+    P_BringUpWeapon(player);
+}";
+        assert_eq!(rendered, expected);
+    }
 }
