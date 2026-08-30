@@ -3817,8 +3817,30 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
                     ctx.self_field_types,
                     ctx.extra_cross_ref_idents,
                 );
-            base_is_self_or_handle_local
+            if base_is_self_or_handle_local
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT")
+            {
+                return true;
+            }
+            // `other->floorheight`/`sec->ceilingheight`
+            // (`P_FindLowestFloorSurrounding`/`P_FindHighestFloorSurrounding`'s
+            // own idiom) -- a *different* real source again, this time a
+            // plain `SectorId`/`Option<SectorId>`-typed parameter or local
+            // (registered in `extra_cross_ref_idents`, not `self_param`'s
+            // own fields) dereferencing one of `Sector`'s two corpus-
+            // verified `FixedT` fields (`r_defs.h`). Hand-matched by field
+            // name, the same "no general struct-field-type registry"
+            // discipline `sides[i].sector`/`line->frontsector` already
+            // established, rather than a general cross-ref-field-type
+            // lookup nothing else here has needed yet. Confirmed a real
+            // gap (not just extra caution) by direct `rustc` reproduction:
+            // without this, comparing a bare `fixed_t` local (`floor`)
+            // against `other->floorheight` wrongly took the bare-`fixed_t`-
+            // local-vs-plain-`int` comparison-wrap arm above, double-
+            // wrapping an already-genuine `FixedT` value in `FixedT(..)` a
+            // second time.
+            matches!(field.as_str(), "floorheight" | "ceilingheight")
+                && matches!(base.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("SectorId") | Some("Option<SectorId>")))
         }
         Expr::Binary {
             op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
@@ -14958,6 +14980,126 @@ pub fn getNextSector(line: &Line, sec: SectorId) -> Option<SectorId> {
         return line.backsector;
     }
     return Some(line.frontsector);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FindLowestFloorSurrounding`/`P_FindHighestFloorSurrounding`
+    /// (`p_spec.c`) translated -- `getNextSector`'s own direct sibling
+    /// family (same file, same `sec->linecount`/`sec->lines[i]`/
+    /// `getNextSector(check,sec)` for-loop shape `P_RecursiveSound`'s own
+    /// `check`/`other` alias idiom already anticipated), needing **zero**
+    /// new renderer code at all: `render_world_fn` already merges
+    /// `collect_line_sector_aliases` into `extra_cross_ref_idents`
+    /// (`P_RecursiveSound`'s own entry), and that collector's existing
+    /// `Expr::Index{base: Member{field:"lines"}}` -> `"LineId"` and
+    /// `Expr::Call{callee: "getNextSector"}` -> `"Option<SectorId>"` rules
+    /// match this family's `check = sec->lines[i]; other =
+    /// getNextSector(check,sec);` idiom by expression *shape* alone, not
+    /// variable name, so they fire unchanged. `sec->floorheight` (`FixedT`,
+    /// confirmed by direct read of `r_defs.h`) resolves through the wholly
+    /// generic `Expr::Member` fallback (`render_expr`'s own bottom arm)
+    /// once `sec` itself is a registered `"SectorId"` parameter -- no
+    /// `frontsector`-style hand-matched field name needed, since that
+    /// fallback already wraps any cross-ref-typed base in `world[..]`
+    /// generically. `fixed_t floor = sec->floorheight;` (a self-struct-free
+    /// cross-ref field read) and `= -500*FRACUNIT;` (a `FRACUNIT`-scaled
+    /// literal, `expr_is_fixed_t_valued`'s existing `FRACUNIT` recognition
+    /// making the commutative `Mul<FixedT> for i32` resolve the same way
+    /// `4*FRACUNIT` already does) are both already-proven initializer
+    /// shapes needing nothing new. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written
+    /// `Sector`/`Line`/`World`/`FixedT`/stub-`getNextSector` stand-in for
+    /// both functions -- zero errors.
+    /// `test_p_find_lowest_floor_surrounding_renders_exactly`,
+    /// `test_p_find_highest_floor_surrounding_renders_exactly`.
+    ///
+    /// **`P_FindLowestCeilingSurrounding`/`P_FindHighestCeilingSurrounding`
+    /// (same file, same shape) deliberately NOT translated this round**: a
+    /// genuine new gap, confirmed by direct `rustc` reproduction rather
+    /// than assumed -- both declare `fixed_t height = MAXINT;` / `= 0;`,
+    /// initializing a `fixed_t`-declared local straight from an opaque
+    /// macro constant / bare integer literal with no cross-ref or
+    /// `FRACUNIT` involvement at all. `render_decl` has no wrap for this
+    /// shape (only a self-struct-field *write*'s literal RHS gets the
+    /// `FixedT(..)` wrap treatment, e.g. `P_ExplodeMissile`'s own `momz =
+    /// 0;` -- a plain local's own *declaration* initializer is rendered
+    /// wholly inline, never wrapped): the local's Rust type gets fixed by
+    /// its initializer (`i32`, `MAXINT`'s/the literal's own real type),
+    /// then conflicts the moment the loop body assigns a real `FixedT`
+    /// (`world[other.unwrap()].ceilingheight`) into the same binding, or
+    /// `return`s it against the function's own `FixedT` return type --
+    /// confirmed a real `E0308` (not a style nit) with a minimal
+    /// `FixedT`/`MAXINT` stand-in reproducing exactly this shape. Left for
+    /// a future round to design a real fix (an initializer-wrap for
+    /// `fixed_t`-declared locals, mirroring the self-struct-field-write
+    /// wrap but for `render_decl` instead) rather than forced in now.
+    #[test]
+    fn test_p_find_lowest_floor_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindLowestFloorSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindLowestFloorSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut floor = world[sec].floorheight;
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].floorheight < floor {
+            floor = world[other.unwrap()].floorheight;
+        }
+        i += 1;
+    }
+    return floor;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn test_p_find_highest_floor_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindHighestFloorSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindHighestFloorSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut floor = -500 * FRACUNIT;
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].floorheight > floor {
+            floor = world[other.unwrap()].floorheight;
+        }
+        i += 1;
+    }
+    return floor;
 }";
         assert_eq!(rendered, expected);
     }
