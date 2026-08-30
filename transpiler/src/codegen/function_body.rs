@@ -12464,4 +12464,36 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }"
         );
     }
+
+    /// `P_TryWalk` (`p_enemy.c`) -- another clean, already-fully-
+    /// provisioned function: a `boolean`-returning single-self-struct
+    /// helper (`render_bool_fn`, the same shape `P_CheckMeleeRange`
+    /// already proved), forward-referencing the not-yet-translated
+    /// `P_Move` through the same by-name-call convention every other
+    /// cross-function reference in this corpus already relies on
+    /// (`P_Move` itself is already registered in `is_bool_returning_call`,
+    /// so its negated-condition use, `if (!P_Move(actor))`, renders
+    /// correctly without needing its own body translated first).
+    #[test]
+    fn test_p_try_walk_renders_exactly() {
+        let field_types = field_types(&[("movecount", "i32")]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_TryWalk",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_TryWalk(actor: &mut Mobj, world: &mut World) -> bool {\n    \
+             if !P_Move(actor) {\n        \
+             return false;\n    \
+             }\n    \
+             actor.movecount = P_Random() & 15;\n    \
+             return true;\n\
+             }"
+        );
+    }
 }
