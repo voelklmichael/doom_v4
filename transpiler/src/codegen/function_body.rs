@@ -70,6 +70,20 @@ fn is_cross_ref(rust_type: &str) -> bool {
     CROSS_REF_TYPES.contains(&rust_type)
 }
 
+/// A bare, file-scope `fixed_t` global hand-registered as a `World`
+/// field and hand-matched by name in `render_expr`'s own `Expr::Ident`
+/// arm (`viletryx`/`viletryy`, `PIT_VileCheck`/`A_VileChase`'s idiom;
+/// `opentop`/`openbottom`/`openrange`/`lowfloor`, `P_LineOpening`'s own).
+/// Used by `render_expr_stmt`'s literal-wrap gate so `openrange = 0;`
+/// gets the same `FixedT(0)` wrap a self-struct `FixedT` field already
+/// does, rather than a bare `0` that doesn't build against the newtype.
+fn is_world_fixed_t_global(name: &str) -> bool {
+    matches!(
+        name,
+        "viletryx" | "viletryy" | "opentop" | "openbottom" | "openrange" | "lowfloor"
+    )
+}
+
 /// Like `rust_field_name`, but for a bare identifier appearing as a
 /// *value* (a parameter/local reference, `type != lowerToFloor`), not a
 /// struct field name: `true`/`false` are C's own `boolean.h` literal
@@ -787,6 +801,26 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "viletryy" {
                 return Ok(("world.viletryy".to_string(), false));
             }
+            // `opentop`/`openbottom`/`openrange`/`lowfloor`
+            // (`p_maputl.c`'s own file-scope `fixed_t opentop; fixed_t
+            // openbottom; fixed_t openrange; fixed_t lowfloor;`,
+            // `P_LineOpening`'s idiom) -- the same "genuine mutable game
+            // state a callback and its caller communicate through"
+            // category `viletryx`/`viletryy` already established, just
+            // the four values `P_LineOpening` itself computes rather than
+            // reads.
+            if name == "opentop" {
+                return Ok(("world.opentop".to_string(), false));
+            }
+            if name == "openbottom" {
+                return Ok(("world.openbottom".to_string(), false));
+            }
+            if name == "openrange" {
+                return Ok(("world.openrange".to_string(), false));
+            }
+            if name == "lowfloor" {
+                return Ok(("world.lowfloor".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -915,8 +949,14 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // binding -- every real caller already guards each dereference
         // with its own `if (!p) return ...;` right next to it, so this
         // stays a close, simple translation of that same defensive style
-        // rather than a fancier one nothing here needs yet.
-        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")) =>
+        // rather than a fancier one nothing here needs yet. Generalized to
+        // `Option<SectorId>` too (`P_LineOpening`'s own `back` local,
+        // assigned from `linedef->backsector` -- `sector_t* back;`, never
+        // null-checked itself since the corpus's own caller,
+        // `PIT_CheckLine`, already guards `if (!ld->backsector) return
+        // false;` before ever calling this) -- identical rendering either
+        // way, since `World` indexes both `PlayerId` and `SectorId`.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("Option<PlayerId>") | Some("Option<SectorId>"))) =>
         {
             let Expr::Ident(name) = base.as_ref() else {
                 unreachable!("guarded above")
@@ -3787,6 +3827,15 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let lhs_is_fixed_t_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT"));
+        // `openrange = 0;` (`P_LineOpening`'s own single-sided-line early
+        // return) -- the same raw-`int`-literal-into-`FixedT` gap
+        // `lhs_is_fixed_t_self_field` closes for a self-struct field, just
+        // for a bare identifier that renames to one of `World`'s own
+        // hand-matched-by-name `FixedT` globals (`opentop`/`openbottom`/
+        // `openrange`/`lowfloor`/`viletryx`/`viletryy`) instead of a
+        // struct field.
+        let lhs_is_world_fixed_t_global =
+            matches!(lhs.as_ref(), Expr::Ident(n) if is_world_fixed_t_global(n));
         // `dist = 200;`/`dist = 160;` (`P_CheckMissileRange`, clamping a
         // genuinely `fixed_t`-declared local) -- the same raw-`int`-
         // literal-into-`FixedT` gap `lhs_is_fixed_t_self_field` closes for
@@ -4036,7 +4085,8 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
         } else if *op == AssignOp::Assign
-            && ((lhs_is_fixed_t_self_field || lhs_is_fixed_t_local) && rhs_is_int_literal
+            && ((lhs_is_fixed_t_self_field || lhs_is_fixed_t_local || lhs_is_world_fixed_t_global)
+                && rhs_is_int_literal
                 || lhs_is_fixed_t_typed_ident && rhs_is_abs_call)
         {
             format!("FixedT({rhs_text})")
@@ -5409,6 +5459,86 @@ fn collect_target_tracer_aliases_stmt(
         Stmt::For { body, .. } => {
             collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
         }
+        _ => {}
+    }
+}
+
+/// Locals directly assigned a line's own `frontsector`/`backsector`
+/// (`front = linedef->frontsector; back = linedef->backsector;`,
+/// `P_LineOpening`'s own idiom) -- registers `front` as `"SectorId"`
+/// (bare, matching `frontsector`'s own corpus-verified non-nullable
+/// mapping) and `back` as `"Option<SectorId>"` (matching `backsector`'s
+/// own genuinely-nullable one), into the same `extra_cross_ref_idents`
+/// map shape every other alias collector in this module already
+/// produces. Deliberately hand-matched by *field name* alone (`"no
+/// general struct-field-type registry yet"`, the same style
+/// `line->frontsector`'s own dedicated `Expr::Member` arm already
+/// established for a self-struct chain), not by the base expression's
+/// own type -- correct for every real corpus call site, since
+/// `frontsector`/`backsector` are only ever read off a real `line_t*`
+/// value regardless of how that value itself was obtained.
+fn collect_line_sector_aliases(items: &[BlockItem]) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    collect_line_sector_aliases_in(items, &mut aliases);
+    aliases
+}
+
+fn line_sector_field_alias_type(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::Member { field, .. } if field == "frontsector" => Some("SectorId"),
+        Expr::Member { field, .. } if field == "backsector" => Some("Option<SectorId>"),
+        _ => None,
+    }
+}
+
+fn collect_line_sector_aliases_in(items: &[BlockItem], aliases: &mut HashMap<String, String>) {
+    for item in items {
+        match item {
+            BlockItem::Decl(d) => {
+                for decl in &d.declarators {
+                    if let Some(Initializer::Expr(e)) = &decl.initializer
+                        && let Some(t) = line_sector_field_alias_type(e)
+                        && let Some(name) = declarator_name(&decl.declarator)
+                    {
+                        aliases.insert(name, t.to_string());
+                    }
+                }
+            }
+            BlockItem::Stmt(s) => collect_line_sector_aliases_stmt(s, aliases),
+        }
+    }
+}
+
+fn collect_line_sector_aliases_stmt(s: &Stmt, aliases: &mut HashMap<String, String>) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && let Some(t) = line_sector_field_alias_type(rhs)
+    {
+        aliases.insert(name.clone(), t.to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_line_sector_aliases_in(&c.items, aliases),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_line_sector_aliases_stmt(then_branch, aliases);
+            if let Some(eb) = else_branch {
+                collect_line_sector_aliases_stmt(eb, aliases);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_line_sector_aliases_stmt(body, aliases),
+        Stmt::Case { stmt, .. } => collect_line_sector_aliases_stmt(stmt, aliases),
+        Stmt::Default(stmt) => collect_line_sector_aliases_stmt(stmt, aliases),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_line_sector_aliases_stmt(body, aliases)
+        }
+        Stmt::For { body, .. } => collect_line_sector_aliases_stmt(body, aliases),
         _ => {}
     }
 }
@@ -7090,10 +7220,19 @@ pub fn render_world_fn(
     let rendered_params = render_params(f, fn_name, param_types)?;
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
+    // `front`/`back` (`P_LineOpening`'s own `sector_t* front; sector_t*
+    // back;`, assigned from `linedef->frontsector`/`.backsector`) --
+    // merged into `param_types` the same way `render_fn_impl` merges
+    // `target_tracer_aliases` on top of `self_field_types`, so a real
+    // `Line`-typed parameter's own `frontsector`/`backsector` fields can
+    // be aliased into a plain local and dereferenced through `World`
+    // afterward, not just read opaquely.
+    let mut extra_cross_ref_idents = param_types.clone();
+    extra_cross_ref_idents.extend(collect_line_sector_aliases(&f.body.items));
     let ctx = FnBodyContext {
         self_param: "",
         self_field_types: &HashMap::new(),
-        extra_cross_ref_idents: param_types,
+        extra_cross_ref_idents: &extra_cross_ref_idents,
         ctor_var: "",
         ctor_var_handle_name: "",
         ctor_field_types: &HashMap::new(),
@@ -14134,6 +14273,70 @@ pub fn P_RemoveMobj(mobj: &mut Mobj, world: &mut World, handle: Handle<Thinker>,
     P_UnsetThingPosition(mobj);
     S_StopSound(mobj);
     arena.remove(handle);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_LineOpening` (`p_maputl.c`) -- the first function needing
+    /// `World::lines`/`World::vertices` (added this round, alongside the
+    /// four new hand-matched-by-name `FixedT` globals it computes:
+    /// `opentop`/`openbottom`/`openrange`/`lowfloor`). Its own `linedef`
+    /// parameter is a real `&Line` reference (`getNextSector`'s own
+    /// precedent, not the `LineId` a trigger function's own signature
+    /// uses -- this is `render_world_fn`'s shape, no `World` needed to
+    /// resolve the parameter itself, just to resolve the *sectors* it
+    /// points at). `front = linedef->frontsector; back = linedef->
+    /// backsector;` needed one new alias collector
+    /// (`collect_line_sector_aliases`, merged into `render_world_fn`'s
+    /// own `extra_cross_ref_idents` the same way `render_fn_impl` merges
+    /// `target_tracer_aliases`): `front` resolves as a bare `SectorId`
+    /// through wholly pre-existing machinery (the generic `Expr::Member`
+    /// fallback already wraps any `extra_cross_ref_idents`-registered
+    /// cross-ref-typed base in `world[..]`), while `back` -- genuinely
+    /// nullable (`backsector: Option<SectorId>`, corpus-verified,
+    /// `struct_fields.rs`'s own asymmetric mapping) -- needed the
+    /// existing `Option<PlayerId>` unwrap arm generalized to also accept
+    /// `Option<SectorId>` (identical rendering either way, since `World`
+    /// indexes both). `openrange = 0;` needed one more new piece: a bare
+    /// integer literal written into a `World` global (not a self-struct
+    /// field, the only shape `P_ExplodeMissile`'s own `FixedT`-literal
+    /// wrap previously covered) -- `is_world_fixed_t_global` closes it,
+    /// scoped to exactly the six hand-matched-by-name `FixedT` globals
+    /// this module already knows about. `linedef->sidenum[1] == -1`,
+    /// the `if`/`else` single-statement branches, and `openrange =
+    /// opentop - openbottom;` (plain `FixedT - FixedT`, no new runtime
+    /// arithmetic needed at all) all reuse wholly pre-existing machinery.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Line`/`Sector`/`World`/`FixedT`
+    /// stand-in -- zero errors.
+    #[test]
+    fn test_p_line_opening_renders_exactly() {
+        let params = field_types(&[("linedef", "&Line")]);
+        let rendered = render_world_fn(&corpus_dir(), "p_maputl.c", "P_LineOpening", &params, None)
+            .expect("should render cleanly");
+        let expected = "\
+pub fn P_LineOpening(linedef: &Line, world: &mut World) {
+    let mut front;
+    let mut back;
+    if linedef.sidenum[1] == -1 {
+        world.openrange = FixedT(0);
+        return;
+    }
+    front = linedef.frontsector;
+    back = linedef.backsector;
+    if world[front].ceilingheight < world[back.unwrap()].ceilingheight {
+        world.opentop = world[front].ceilingheight;
+    } else {
+        world.opentop = world[back.unwrap()].ceilingheight;
+    }
+    if world[front].floorheight > world[back.unwrap()].floorheight {
+        world.openbottom = world[front].floorheight;
+        world.lowfloor = world[back.unwrap()].floorheight;
+    } else {
+        world.openbottom = world[back.unwrap()].floorheight;
+        world.lowfloor = world[front].floorheight;
+    }
+    world.openrange = world.opentop - world.openbottom;
 }";
         assert_eq!(rendered, expected);
     }

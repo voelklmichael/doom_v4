@@ -92,6 +92,23 @@
 //! a pair of fixed-size arrays (one of `MapThing` values, one of `i32`
 //! timestamps) alongside their own head/tail counters instead of a
 //! single value or a shorter special-purpose array.
+//! `lines`/`vertices` join `sectors`/`sides`/`subsectors` as the fourth
+//! and fifth per-level geometry tables, same "bulk-allocated once per
+//! level, never individually freed" shape (`LineId`/`VertexId`, already
+//! defined in `runtime/geometry.rs`, just had nowhere to resolve into
+//! yet) -- added proactively (mirroring the exact `sectors`/`sides`
+//! pattern, not a new shape) since multiple already-surveyed functions
+//! (`PIT_CheckLine`, `P_LineOpening`, `EV_TurnTagLightsOff`/
+//! `EV_LightTurnOn`, `P_PointOnLineSide`) all independently need a real
+//! `Line`/`Vertex` lookup and none of them need anything else new about
+//! `World` itself.
+//! `opentop`/`openbottom`/`openrange`/`lowfloor` joined once
+//! `P_LineOpening` (`p_maputl.c`) needed somewhere to hold its own
+//! file-scope `fixed_t opentop; fixed_t openbottom; fixed_t openrange;
+//! fixed_t lowfloor;` -- the same "genuine mutable game state a callback
+//! and its caller communicate through" category `viletryx`/`viletryy`
+//! already established, just the window-through-a-two-sided-line values
+//! this particular function computes rather than reads.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -108,6 +125,8 @@ pub struct World {
     pub sectors: Vec<Sector>,
     pub sides: Vec<Side>,
     pub subsectors: Vec<Subsector>,
+    pub lines: Vec<Line>,
+    pub vertices: Vec<Vertex>,
     pub players: [Player; MAXPLAYERS],
     pub linetarget: Option<Handle<Thinker>>,
     pub braintargets: [Option<Handle<Thinker>>; 32],
@@ -124,6 +143,10 @@ pub struct World {
     pub itemrespawntime: [i32; 128],
     pub iquehead: i32,
     pub iquetail: i32,
+    pub opentop: FixedT,
+    pub openbottom: FixedT,
+    pub openrange: FixedT,
+    pub lowfloor: FixedT,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -165,6 +188,32 @@ impl std::ops::IndexMut<SubsectorId> for World {
     }
 }
 
+impl std::ops::Index<LineId> for World {
+    type Output = Line;
+    fn index(&self, id: LineId) -> &Line {
+        &self.lines[id.0 as usize]
+    }
+}
+
+impl std::ops::IndexMut<LineId> for World {
+    fn index_mut(&mut self, id: LineId) -> &mut Line {
+        &mut self.lines[id.0 as usize]
+    }
+}
+
+impl std::ops::Index<VertexId> for World {
+    type Output = Vertex;
+    fn index(&self, id: VertexId) -> &Vertex {
+        &self.vertices[id.0 as usize]
+    }
+}
+
+impl std::ops::IndexMut<VertexId> for World {
+    fn index_mut(&mut self, id: VertexId) -> &mut Vertex {
+        &mut self.vertices[id.0 as usize]
+    }
+}
+
 impl std::ops::Index<PlayerId> for World {
     type Output = Player;
     fn index(&self, id: PlayerId) -> &Player {
@@ -191,6 +240,8 @@ mod tests {
         assert!(rendered.contains("pub sectors: Vec<Sector>,"));
         assert!(rendered.contains("pub sides: Vec<Side>,"));
         assert!(rendered.contains("pub subsectors: Vec<Subsector>,"));
+        assert!(rendered.contains("pub lines: Vec<Line>,"));
+        assert!(rendered.contains("pub vertices: Vec<Vertex>,"));
         assert!(rendered.contains("pub players: [Player; MAXPLAYERS],"));
         assert!(rendered.contains("pub linetarget: Option<Handle<Thinker>>,"));
         assert!(rendered.contains("pub braintargets: [Option<Handle<Thinker>>; 32],"));
@@ -207,12 +258,20 @@ mod tests {
         assert!(rendered.contains("pub itemrespawntime: [i32; 128],"));
         assert!(rendered.contains("pub iquehead: i32,"));
         assert!(rendered.contains("pub iquetail: i32,"));
+        assert!(rendered.contains("pub opentop: FixedT,"));
+        assert!(rendered.contains("pub openbottom: FixedT,"));
+        assert!(rendered.contains("pub openrange: FixedT,"));
+        assert!(rendered.contains("pub lowfloor: FixedT,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SideId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SubsectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SubsectorId> for World"));
+        assert!(rendered.contains("impl std::ops::Index<LineId> for World"));
+        assert!(rendered.contains("impl std::ops::IndexMut<LineId> for World"));
+        assert!(rendered.contains("impl std::ops::Index<VertexId> for World"));
+        assert!(rendered.contains("impl std::ops::IndexMut<VertexId> for World"));
         assert!(rendered.contains("impl std::ops::Index<PlayerId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<PlayerId> for World"));
     }
