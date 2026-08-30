@@ -537,6 +537,18 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "linetarget" {
                 return Ok(("world.linetarget".to_string(), false));
             }
+            // `mobjinfo` (`info.c`'s own global table, `A_PainShootSkull`'s
+            // own `mobjinfo[MT_SKULL].radius`) -- unlike `weaponinfo`/
+            // `finecosine`/etc. (opaque, not-yet-wired globals with no
+            // decided real name), `mobjinfo[]` already has a real,
+            // decided rendering (`mobjinfo_data.rs`'s own `pub static
+            // MOBJINFO: [MobjInfo; 137]`) -- so a bare reference here
+            // needs the *same* rename, not the lowercase C spelling every
+            // other still-undecided global keeps, to actually match what
+            // this table is really called in the generated crate.
+            if name == "mobjinfo" {
+                return Ok(("MOBJINFO".to_string(), false));
+            }
             let is_crossref = ctx
                 .extra_cross_ref_idents
                 .get(name.as_str())
@@ -1051,8 +1063,15 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // local Rust can retroactively infer as `usize` here either)
             // -- scoped to `player->powers[..]` by the base field's own
             // name, the same "hand-match the one real array" style.
+            // `mobjinfo[MT_SKULL]` (`A_PainShootSkull`) is the same
+            // shape once more: `MT_SKULL` is a bare `mobjtype_t` enum
+            // constant, fixed `i32` in the generated crate, and
+            // `mobjinfo` itself is checked against its *source* C name
+            // here (`render_expr`'s own `Expr::Ident` arm renames the
+            // rendered *text* to `MOBJINFO` separately -- this guard
+            // runs against the un-renamed AST node, so it still matches).
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo")
                 || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")
             {
                 format!("{index_text} as usize")
@@ -1316,7 +1335,7 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
@@ -2953,6 +2972,24 @@ fn render_compound_items(
         return Ok(out);
     }
 
+    // `thinker_t* currentthinker;` (`A_PainShootSkull`'s own declaration,
+    // sitting *before* the `curvar = thinkercap.next; while (..) { .. }`
+    // pair the lookahead just below replaces wholesale with a real Rust
+    // `for thinker in thinkers.iter() { .. }` loop -- one that introduces
+    // its own `thinker`/`m` bindings, never a `currentthinker`-named
+    // local at all) -- a real gap only surfaced by rendering the *whole*
+    // function, not the isolated two-statement fragment the scan pattern
+    // was originally proven against: with nothing consuming it, `let mut
+    // currentthinker;` would be dead code Rust can't even assign a type
+    // to (no initializer, no later use to infer one from), a genuine
+    // `rustc` rejection, not just an unused-variable lint. Pre-scanned
+    // once per block (mirroring `count_ctor_field_assigns`'s own
+    // recursion-free, single-purpose style) so the ordinary per-item
+    // `Decl` dispatch below can skip a declaration whose only declarator
+    // is about to be swallowed by the scan lookahead, the same "drop a
+    // provably-dead local" treatment `render_decl` already gives an
+    // `embedded_ctor` variable.
+    let scan_vars = thinker_scan_var_names(items);
     let mut out = Vec::new();
     let mut i = 0;
     while i < items.len() {
@@ -2969,6 +3006,13 @@ fn render_compound_items(
             i += 2;
             continue;
         }
+        if let BlockItem::Decl(d) = &items[i]
+            && d.declarators.len() == 1
+            && declarator_name(&d.declarators[0].declarator).is_some_and(|n| scan_vars.contains(&n))
+        {
+            i += 1;
+            continue;
+        }
         match &items[i] {
             BlockItem::Decl(d) => out.extend(render_decl(d, ctx, depth)?),
             BlockItem::Stmt(s) => out.extend(render_stmt(s, ctx, depth)?),
@@ -2976,6 +3020,24 @@ fn render_compound_items(
         i += 1;
     }
     Ok(out)
+}
+
+/// Every variable name the thinker-list-scan lookahead (just below) would
+/// swallow anywhere in `items` -- see the doc comment at its own call
+/// site for why a matching bare declaration needs to be dropped, not
+/// rendered.
+fn thinker_scan_var_names(items: &[BlockItem]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for pair in items.windows(2) {
+        if let BlockItem::Stmt(init_stmt) = &pair[0]
+            && let Some(var) = is_thinker_list_scan_init(init_stmt)
+            && let BlockItem::Stmt(while_stmt) = &pair[1]
+            && is_thinker_list_scan_while(while_stmt, var).is_some()
+        {
+            names.insert(var.to_string());
+        }
+    }
+    names
 }
 
 /// The first top-level `label:` found in `items`, if any (`A_Look`'s own
@@ -3139,6 +3201,47 @@ pub fn render_fn(
         self_rust_type,
         self_field_types,
         None,
+        None,
+    )
+}
+
+/// `render_fn`'s own twin for a genuinely different shape: a helper
+/// function that isn't itself a `state_t.action` entry, called with a
+/// *second*, plain-scalar parameter alongside the usual self-struct
+/// receiver -- `A_PainShootSkull (mobj_t* actor, angle_t angle)`
+/// (`p_enemy.c`, called by the already-translated `A_PainAttack`/
+/// `A_PainDie`), the first real function needing this. Every signature-
+/// extension flag `render_fn_impl` already computes (self-removal,
+/// target-deref, ...) is about the self-struct receiver specifically and
+/// stays completely unaffected by a second scalar parameter -- it needs
+/// no cross-reference/`Option` tracking of its own the way a self-struct
+/// field does (`FnBodyContext` doesn't need a new field for it at all),
+/// since a bare reference to it renders as plain identifier text and
+/// Rust's own static typing (from its declared parameter type) already
+/// makes every use of it correct with no renderer-side awareness beyond
+/// getting its own name and type into the signature. A thin wrapper
+/// over the same `render_fn_impl` rather than a new required parameter
+/// threaded through `render_fn`'s own many existing call sites (every
+/// one of them genuinely single-parameter) -- the caller supplies the
+/// second parameter's own Rust type (`"u32"` for `angle_t`) the same way
+/// `self_field_types` is always caller-supplied, since this renderer has
+/// no general C-type-to-Rust-type inference of its own.
+pub fn render_fn_with_scalar_param(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    scalar_param_type: &str,
+) -> Result<String, String> {
+    render_fn_impl(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        None,
+        Some(scalar_param_type),
     )
 }
 
@@ -3166,6 +3269,7 @@ pub fn render_bool_fn(
         self_rust_type,
         self_field_types,
         Some("bool"),
+        None,
     )
 }
 
@@ -3176,12 +3280,27 @@ fn render_fn_impl(
     self_rust_type: &str,
     self_field_types: &HashMap<String, String>,
     return_type: Option<&str>,
+    scalar_param_type: Option<&str>,
 ) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
     let f = find_function_def(&unit.items, fn_name)
         .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
     let param_name = first_param_name(f)
         .ok_or_else(|| format!("{fn_name}: first parameter has no plain name"))?;
+    // `A_PainShootSkull`'s own second, plain-scalar parameter (`angle:
+    // angle_t`) -- its own real name always comes straight from the C
+    // source (`nth_param_name`, already used by `render_weapon_fn` for
+    // its own second parameter), so the caller only supplies the Rust
+    // *type* (`scalar_param_type`), the same "caller supplies what this
+    // renderer can't infer on its own" pattern `self_field_types` already
+    // uses.
+    let scalar_param = scalar_param_type
+        .map(|ty| {
+            let name = nth_param_name(f, 1)
+                .ok_or_else(|| format!("{fn_name}: second parameter has no plain name"))?;
+            Ok::<_, String>((name, ty))
+        })
+        .transpose()?;
     let target_tracer_aliases =
         collect_target_tracer_aliases(&f.body.items, &param_name, self_field_types);
     let spawn_mobj_locals = collect_spawn_mobj_locals(&f.body.items);
@@ -3307,8 +3426,11 @@ fn render_fn_impl(
     };
     let extra_params = format!("{thinkers_part}{handle_part}");
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    let scalar_part = scalar_param
+        .map(|(name, ty)| format!(", {name}: {ty}"))
+        .unwrap_or_default();
     Ok(format!(
-        "pub fn {fn_name}({param_name}: &mut {self_rust_type}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
+        "pub fn {fn_name}({param_name}: &mut {self_rust_type}{scalar_part}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -10191,6 +10313,123 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + state_index(psp.state) - S_CHAIN1);\n    \
              P_BulletSlope(player.mo);\n    \
              P_GunShot(player.mo, player.refire == 0);\n\
+             }"
+        );
+    }
+
+    /// `A_PainShootSkull` -- closed out end-to-end, the last function
+    /// this module's docs had been carrying since the `states[]` entry.
+    /// Three real pieces, none guessed at: (1) `render_fn_with_scalar_
+    /// param` -- `A_PainShootSkull(mobj_t* actor, angle_t angle)` isn't
+    /// itself a `state_t.action` entry (it's a plain helper called by
+    /// the already-translated `A_PainAttack`/`A_PainDie`), and its
+    /// second, genuinely-scalar parameter needed `render_fn`'s own
+    /// signature generation extended for the first time -- confirmed to
+    /// need *no* new `FnBodyContext` tracking at all (a bare reference to
+    /// `angle` already renders correctly via Rust's own static typing,
+    /// unlike a self-struct field, which needs real cross-reference/
+    /// `Option` awareness). (2) `thinker_scan_var_names` -- rendering the
+    /// *whole* function (not just the already-proven two-statement scan
+    /// fragment) surfaced a real gap the isolated fragment test could
+    /// never have caught: `thinker_t* currentthinker;`'s own declaration,
+    /// sitting *before* the scan pair that replaces it with a real Rust
+    /// `for` loop introducing its own `thinker`/`m` bindings, would
+    /// otherwise render as `let mut currentthinker;` with nothing ever
+    /// assigning or reading it -- a genuine `rustc` "type annotations
+    /// needed" rejection (confirmed, not assumed, by first rendering the
+    /// naive version and compiling it), not just dead code. Fixed by
+    /// pre-scanning each block for every such variable and skipping its
+    /// matching declaration, the same "drop a provably-dead local"
+    /// treatment `render_decl` already gives an `embedded_ctor`
+    /// variable, just resolved one level up (`render_compound_items`
+    /// itself, since `render_decl` has no visibility into a *later*
+    /// sibling statement). (3) `mobjinfo[MT_SKULL].radius` -- `mobjinfo`
+    /// already has a real, decided rendering elsewhere in this codebase
+    /// (`mobjinfo_data.rs`'s own `pub static MOBJINFO`), so a bare
+    /// reference now renames to match it (`render_expr`'s `Expr::Ident`
+    /// arm) instead of keeping the still-undecided-elsewhere lowercase
+    /// spelling `weaponinfo`/`finecosine` keep; the bare `MT_SKULL` index
+    /// needs the same `as usize` cast `pw_strength`'s own array-index use
+    /// already established (`Expr::Index`'s by-name list). `P_TryMove`
+    /// (`p_local.h`'s own real `boolean P_TryMove(mobj_t*, fixed_t,
+    /// fixed_t)` declaration, confirmed by direct read) joins `is_bool_
+    /// returning_call`'s list, the same way `P_LookForPlayers` did.
+    /// **`prestep`'s own ambiguous plain-`int`-vs-`FixedT` typing --
+    /// this module's docs had flagged it as the function's last
+    /// remaining blocker, but tracing its actual arithmetic through
+    /// shows it never needed anything at all**: unlike `A_SkullAttack`'s
+    /// `dist` (mixing `FixedT`- and plain-`int`-typed uses of the same
+    /// local, needing an explicit unwrap), `prestep` is assigned once
+    /// (`4*FRACUNIT + 3*(actor->info->radius + mobjinfo[MT_SKULL].
+    /// radius)/2` -- `mobjinfo_t.radius` is plain `int` in the corpus
+    /// itself, confirmed by direct read, not `fixed_t`, so the inner
+    /// `3*(...)/2` term stays genuine `i32` throughout, and only the
+    /// outer `+` combines it with the `FixedT`-valued `4*FRACUNIT` via
+    /// the already-established `Add<i32> for FixedT` overload) and used
+    /// only as `FixedT` afterward (`FixedMul(prestep, ..)`), the exact
+    /// same pattern `x`/`y`/`z`'s own `fixed_t`-declared locals already
+    /// have -- Rust's ordinary deferred-`let` inference resolves it
+    /// correctly with zero renderer-side casting, the same way it
+    /// already does for them. `newmobj->x`/`.y` (a spawned local's own
+    /// fields, read opaquely as `P_TryMove` arguments) and `newmobj->
+    /// target = actor->target;` (a spawned local's field write, RHS
+    /// already `Option`-typed so no `Some(..)` wrap) both reuse machinery
+    /// proven by `A_Tracer`/`A_FatAttack1` verbatim. Verified compiling
+    /// *and running* for real (`rustc --edition 2021 --crate-type bin`)
+    /// against the real `Arena`/`Handle` plus hand-written `Mobj`/
+    /// `MobjInfo`/`World`/`Thinker` stand-ins and stub forward-referenced
+    /// functions -- zero errors. `test_a_pain_shoot_skull_renders_exactly`;
+    /// the earlier isolated-fragment test
+    /// (`test_thinker_list_scan_against_real_a_pain_shoot_skull`) is kept
+    /// alongside it, since it still pinpoints the scan piece on its own.
+    #[test]
+    fn test_a_pain_shoot_skull_renders_exactly() {
+        let field_types = field_types(&[
+            ("info", "&'static MobjInfo"),
+            ("target", "Option<Handle<Thinker>>"),
+        ]);
+        let rendered = render_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_PainShootSkull",
+            "Mobj",
+            &field_types,
+            "u32",
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_PainShootSkull(actor: &mut Mobj, angle: u32, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut x;\n    \
+             let mut y;\n    \
+             let mut z;\n    \
+             let mut newmobj;\n    \
+             let mut an;\n    \
+             let mut prestep;\n    \
+             let mut count;\n    \
+             count = 0;\n    \
+             for thinker in thinkers.iter() {\n        \
+             if let Thinker::Mobj(m) = thinker {\n            \
+             if m.r#type == MT_SKULL {\n                \
+             count += 1;\n            \
+             }\n        \
+             }\n    \
+             }\n    \
+             if count > 20 {\n        \
+             return;\n    \
+             }\n    \
+             an = angle >> ANGLETOFINESHIFT;\n    \
+             prestep = 4 * FRACUNIT + 3 * (actor.info.radius + MOBJINFO[MT_SKULL as usize].radius) / 2;\n    \
+             x = actor.x + FixedMul(prestep, finecosine[an as usize]);\n    \
+             y = actor.y + FixedMul(prestep, finesine[an as usize]);\n    \
+             z = actor.z + 8 * FRACUNIT;\n    \
+             newmobj = P_SpawnMobj(x, y, z, MT_SKULL);\n    \
+             if !P_TryMove(newmobj, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }) {\n        \
+             P_DamageMobj(newmobj, actor, actor, 10000);\n        \
+             return;\n    \
+             }\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(newmobj) { m.target = actor.target; };\n    \
+             A_SkullAttack(newmobj);\n\
              }"
         );
     }
