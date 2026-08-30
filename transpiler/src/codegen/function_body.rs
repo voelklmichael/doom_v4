@@ -16146,4 +16146,32 @@ pub fn P_CalcSwing(player: &mut Player, world: &mut World) {
 }";
         assert_eq!(rendered, expected);
     }
+
+    /// `P_DropWeapon` (`p_pspr.c`) -- a one-statement `Player`-shaped
+    /// self-struct function (`render_fn`), needing no new mechanism at
+    /// all: `weaponinfo[player->readyweapon].downstate` reuses the
+    /// already-established `weaponinfo[..].field` array-of-struct access
+    /// (`A_WeaponReady`'s own precedent) unchanged, generic over
+    /// `ctx.self_param` regardless of whether the caller is `render_fn`
+    /// or `render_weapon_fn`. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written `Player`/
+    /// `World` stand-in and a stub `weaponinfo`/`P_SetPsprite` -- zero
+    /// errors. `test_p_drop_weapon_renders_exactly`.
+    #[test]
+    fn test_p_drop_weapon_renders_exactly() {
+        let field_types = field_types(&[("readyweapon", "i32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_DropWeapon",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_DropWeapon(player: &mut Player, world: &mut World) {
+    P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate);
+}";
+        assert_eq!(rendered, expected);
+    }
 }
