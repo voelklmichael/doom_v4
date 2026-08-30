@@ -2113,15 +2113,20 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // at all -- an assignment is only ever a *statement* here, never
         // a value this renderer produces -- so the naive single-
         // statement translation fails outright rather than mistranslating
-        // (confirmed directly, not guessed at). Split into the two
+        // (confirmed directly, not guessed at). Flattened to however many
         // ordinary assignments C's own chain performs in sequence
-        // (innermost first, matching real evaluation order: `momy` is
-        // assigned before `momx` reads it back), each rendered through
-        // the ordinary single-assignment path below so every existing
-        // write-side special case (target/tracer writes, same-handle
-        // writes, ...) still applies to each piece independently --
-        // scoped to a plain `=` chain only, the one real corpus shape,
-        // not every possible mix of compound ops.
+        // (innermost first, matching real evaluation order: `momz` is
+        // assigned before `momy`/`momx` read it back), each rendered
+        // through the ordinary single-assignment path below so every
+        // existing write-side special case (target/tracer writes, same-
+        // handle writes, ...) still applies to each piece independently.
+        // Generalized from a fixed two-target split to any chain length
+        // (`mo->momx = mo->momy = mo->momz = 0;`, `P_ExplodeMissile`, a
+        // three-target chain the original two-target-only version
+        // couldn't recurse into -- its "first" half was still itself a
+        // chain, handed to `render_expr_stmt` rather than back through
+        // this same flattening) -- scoped to a plain `=` chain only, the
+        // one real corpus shape, not every possible mix of compound ops.
         Stmt::Expr(Some(Expr::Assign {
             op: AssignOp::Assign,
             lhs,
@@ -2134,28 +2139,37 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             }
         ) =>
         {
-            let Expr::Assign {
-                lhs: inner_lhs,
-                rhs: inner_rhs,
-                ..
-            } = rhs.as_ref()
-            else {
-                unreachable!("guarded above")
+            let mut targets = vec![lhs.as_ref().clone()];
+            let mut cur = rhs.as_ref();
+            let value = loop {
+                match cur {
+                    Expr::Assign {
+                        op: AssignOp::Assign,
+                        lhs: l2,
+                        rhs: r2,
+                    } => {
+                        targets.push(l2.as_ref().clone());
+                        cur = r2.as_ref();
+                    }
+                    other => break other.clone(),
+                }
             };
-            let first = Expr::Assign {
-                op: AssignOp::Assign,
-                lhs: inner_lhs.clone(),
-                rhs: inner_rhs.clone(),
-            };
-            let second = Expr::Assign {
-                op: AssignOp::Assign,
-                lhs: lhs.clone(),
-                rhs: inner_lhs.clone(),
-            };
-            Ok(vec![
-                format!("{}{};", indent(depth), render_expr_stmt(&first, ctx)?),
-                format!("{}{};", indent(depth), render_expr_stmt(&second, ctx)?),
-            ])
+            let mut lines = Vec::with_capacity(targets.len());
+            let mut rhs_expr = value;
+            for target in targets.into_iter().rev() {
+                let stmt = Expr::Assign {
+                    op: AssignOp::Assign,
+                    lhs: Box::new(target.clone()),
+                    rhs: Box::new(rhs_expr),
+                };
+                lines.push(format!(
+                    "{}{};",
+                    indent(depth),
+                    render_expr_stmt(&stmt, ctx)?
+                ));
+                rhs_expr = target;
+            }
+            Ok(lines)
         }
         Stmt::Expr(Some(e)) => Ok(vec![format!(
             "{}{};",
@@ -3426,6 +3440,40 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         // guessed at.
         let lhs_is_plain_int_local =
             matches!(lhs.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()));
+        // `mo->momx = mo->momy = mo->momz = 0;` (`P_ExplodeMissile`, once
+        // flattened by `render_stmt`'s own chained-assignment handling
+        // into three separate plain assignments) -- a raw `int` literal
+        // (`0`) written straight into a *plain self-struct* `FixedT`
+        // field, the same "C's `fixed_t` is just `int`, Rust's `FixedT`
+        // needs its own wrapper" gap the target/tracer write arms above
+        // (`is_fixed_t_field`, `PIT_VileCheck`'s `corpsehit->momy = 0;`)
+        // already close for a *target/tracer-typed* base -- this is that
+        // same fix for the far more common case of writing straight to
+        // one of the function's own `self`-struct fields, never needed
+        // before because every earlier `A_*`/tick function's own literal-
+        // into-`FixedT`-field writes happened to go through a target/
+        // tracer or spawned-mobj alias instead. Deliberately scoped to a
+        // genuine `Expr::IntLiteral` RHS only, *not* the broader
+        // `!expr_is_fixed_t_valued` check the target/tracer arms use --
+        // tried that first and it was a real regression, not just overly
+        // cautious: `T_MoveCeiling`'s own `ceiling->speed = CEILSPEED;`
+        // (`CEILSPEED` a `#define`d alias for `FRACUNIT`, `p_spec.h`,
+        // confirmed by direct read) is already correctly `FixedT`-typed
+        // end to end, but this parser never macro-expands `#define`s
+        // (matching `enum_values.rs`'s own documented stance), so
+        // `expr_is_fixed_t_valued` -- which only recognizes the literal
+        // identifier `FRACUNIT`, not every macro that happens to expand
+        // to it -- can't tell it apart from a genuinely-plain-`int`
+        // constant; wrapping it in `FixedT(CEILSPEED)` would have been
+        // a real `rustc` rejection (building a `FixedT` from a `FixedT`
+        // argument). A bare integer literal has no such ambiguity: it is
+        // never itself already `FixedT`-typed, so this narrower check is
+        // both sufficient for `P_ExplodeMissile`'s own need and safe
+        // against every other already-shipped translation.
+        let lhs_is_fixed_t_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT"));
+        let rhs_is_int_literal = matches!(rhs.as_ref(), Expr::IntLiteral(_));
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
@@ -3641,6 +3689,8 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             text
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
+        } else if lhs_is_fixed_t_self_field && *op == AssignOp::Assign && rhs_is_int_literal {
+            format!("FixedT({rhs_text})")
         } else {
             rhs_text
         };
@@ -12313,6 +12363,57 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n    \
              }\n    \
              S_StartSound(None, sfx_bossit);\n\
+             }"
+        );
+    }
+
+    /// `P_ExplodeMissile` (`p_mobj.c`) -- the first real three-target
+    /// chained assignment (`mo->momx = mo->momy = mo->momz = 0;`), the
+    /// case the old two-target-only chain-flattening couldn't reach:
+    /// its "first" half (`momy = momz = 0`) was still itself a chain,
+    /// handed straight to `render_expr_stmt` rather than back through
+    /// the same flattening logic, so it would have failed outright on
+    /// exactly this shape. Generalized `render_stmt`'s chained-assignment
+    /// arm to flatten any chain length instead. Otherwise a clean,
+    /// already-provisioned mix: `mobjinfo[mo->type].deathstate` (the
+    /// already-proven `mobjinfo[]`-by-variable-index rendering, `MOBJINFO
+    /// [mo.r#type as usize]`), `mo->tics -= ..`/clamp, a `flags &=`
+    /// clear, and `mo->info->deathsound` truthiness (`mo.info.deathsound
+    /// != 0`) guarding an `S_StartSound` call -- every one of these
+    /// already proven by earlier `A_*` functions.
+    #[test]
+    fn test_p_explode_missile_renders_exactly() {
+        let field_types = field_types(&[
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("type", "i32"),
+            ("tics", "i32"),
+            ("flags", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_ExplodeMissile",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_ExplodeMissile(mo: &mut Mobj, world: &mut World) {\n    \
+             mo.momz = FixedT(0);\n    \
+             mo.momy = mo.momz;\n    \
+             mo.momx = mo.momy;\n    \
+             P_SetMobjState(mo, MOBJINFO[mo.r#type as usize].deathstate);\n    \
+             mo.tics -= P_Random() & 3;\n    \
+             if mo.tics < 1 {\n        \
+             mo.tics = 1;\n    \
+             }\n    \
+             mo.flags &= !MF_MISSILE;\n    \
+             if mo.info.deathsound != 0 {\n        \
+             S_StartSound(mo, mo.info.deathsound);\n    \
+             }\n\
              }"
         );
     }
