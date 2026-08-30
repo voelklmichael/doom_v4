@@ -3085,6 +3085,23 @@ fn is_fixed_t_local_ident(e: &Expr, ctx: &FnBodyContext) -> bool {
 
 fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
     match e {
+        // `P_AproxDistance`'s own bare `dx`/`dy` -- a plain function
+        // *parameter* genuinely declared `fixed_t` in the real C source,
+        // registered `"FixedT"`-valued in `extra_cross_ref_idents` the
+        // same way `render_pure_fn` registers every one of its own
+        // parameters -- distinct from a self-struct field (resolved via
+        // the `Member` arm below) or a `fixed_t`-declared *local*
+        // (`FnBodyContext::fixed_t_locals`, populated only from a
+        // function's own top-level `Decl`s, which a parameter never is).
+        Expr::Ident(n)
+            if ctx
+                .extra_cross_ref_idents
+                .get(n.as_str())
+                .map(String::as_str)
+                == Some("FixedT") =>
+        {
+            true
+        }
         Expr::Ident(n) => n == "FRACUNIT",
         Expr::Member { base, field, .. } => {
             // `corpsehit->momy` (`PIT_VileCheck`) -- a third real source,
@@ -3547,6 +3564,23 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         // a self-struct field, just for a plain local (`FnBodyContext::
         // fixed_t_locals`) instead.
         let lhs_is_fixed_t_local = is_fixed_t_local_ident(lhs, ctx);
+        // `dx = abs(dx);` (`P_AproxDistance`) -- self-reassignment through
+        // `abs()`, the one real corpus shape needing `abs()`'s existing
+        // raw-magnitude extraction (`(dx).0.abs()`, already correct for
+        // `PIT_VileCheck`'s own "compare against a plain `int`" use)
+        // re-wrapped back into `FixedT` here, since `dx` stays genuinely
+        // `fixed_t`-typed afterward (used in real `FixedT` arithmetic --
+        // `dx>>1`, `dx+dy` -- not compared against a bare `int` the way
+        // `PIT_VileCheck`'s own use is). Scoped to a bare-`Ident` LHS
+        // that's itself known `FixedT`-valued (a self-struct field, a
+        // `fixed_t`-declared local, or -- new here -- one of `render_pure_
+        // fn`'s own `FixedT`-registered parameters, `dx`/`dy` themselves,
+        // via `expr_is_fixed_t_valued`'s new `extra_cross_ref_idents`
+        // arm), not every possible `abs()` reassignment.
+        let lhs_is_fixed_t_typed_ident = matches!(lhs.as_ref(), Expr::Ident(_))
+            && (lhs_is_fixed_t_local || expr_is_fixed_t_valued(lhs, ctx));
+        let rhs_is_abs_call = matches!(rhs.as_ref(), Expr::Call { callee, .. }
+            if matches!(callee.as_ref(), Expr::Ident(n) if n == "abs"));
         let rhs_is_int_literal = matches!(rhs.as_ref(), Expr::IntLiteral(_));
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
@@ -3763,9 +3797,9 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             text
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
-        } else if (lhs_is_fixed_t_self_field || lhs_is_fixed_t_local)
-            && *op == AssignOp::Assign
-            && rhs_is_int_literal
+        } else if *op == AssignOp::Assign
+            && ((lhs_is_fixed_t_self_field || lhs_is_fixed_t_local) && rhs_is_int_literal
+                || lhs_is_fixed_t_typed_ident && rhs_is_abs_call)
         {
             format!("FixedT({rhs_text})")
         } else {
@@ -5651,6 +5685,101 @@ fn body_has_linetarget_ref(items: &[BlockItem]) -> bool {
     body_has_any_ident_ref(items, &["linetarget"])
 }
 
+/// Whether `name` is ever the direct target of an assignment anywhere in
+/// `items` (`dx = abs(dx);`, `P_AproxDistance`'s own idiom, reassigning
+/// one of its own parameters) -- unlike `body_has_any_ident_ref` (which
+/// would also count a plain *read*, e.g. the `dx` inside `abs(dx)`
+/// itself), this only fires for a genuine write, since it's used to
+/// decide whether a rendered Rust parameter needs `mut` -- marking one
+/// `mut` when it's only ever read would be a real `clippy::unused_mut`
+/// warning, not just imprecise. Same shallow, top-level-plus-nested-
+/// control-flow traversal shape as `stmt_has_any_ident_ref`, just checking
+/// each `Expr::Assign`'s own `lhs` specifically rather than every operand.
+fn body_reassigns_ident(items: &[BlockItem], name: &str) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Decl(_) => false,
+        BlockItem::Stmt(s) => stmt_reassigns_ident(s, name),
+    })
+}
+
+fn expr_reassigns_ident(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Assign { lhs, rhs, .. } => {
+            matches!(lhs.as_ref(), Expr::Ident(n) if n == name) || expr_reassigns_ident(rhs, name)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::PreIncDec { expr, .. }
+        | Expr::PostIncDec { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Sizeof(SizeofArg::Expr(expr)) => expr_reassigns_ident(expr, name),
+        Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
+            expr_reassigns_ident(lhs, name) || expr_reassigns_ident(rhs, name)
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_reassigns_ident(cond, name)
+                || expr_reassigns_ident(then_expr, name)
+                || expr_reassigns_ident(else_expr, name)
+        }
+        Expr::Call { callee, args } => {
+            expr_reassigns_ident(callee, name) || args.iter().any(|a| expr_reassigns_ident(a, name))
+        }
+        Expr::Index { base, index } => {
+            expr_reassigns_ident(base, name) || expr_reassigns_ident(index, name)
+        }
+        Expr::Member { base, .. } => expr_reassigns_ident(base, name),
+        _ => false,
+    }
+}
+
+fn stmt_reassigns_ident(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => expr_reassigns_ident(e, name),
+        Stmt::Expr(None) => false,
+        Stmt::Compound(c) => body_reassigns_ident(&c.items, name),
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_reassigns_ident(cond, name)
+                || stmt_reassigns_ident(then_branch, name)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_reassigns_ident(eb, name))
+        }
+        Stmt::Switch { cond, body } => {
+            expr_reassigns_ident(cond, name) || stmt_reassigns_ident(body, name)
+        }
+        Stmt::Case { expr, stmt } => {
+            expr_reassigns_ident(expr, name) || stmt_reassigns_ident(stmt, name)
+        }
+        Stmt::Default(stmt) => stmt_reassigns_ident(stmt, name),
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr_reassigns_ident(cond, name) || stmt_reassigns_ident(body, name)
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::Decl(_) => false,
+                ForInit::Expr(e) => expr_reassigns_ident(e, name),
+            }) || cond.as_ref().is_some_and(|c| expr_reassigns_ident(c, name))
+                || step.as_ref().is_some_and(|s| expr_reassigns_ident(s, name))
+                || stmt_reassigns_ident(body, name)
+        }
+        Stmt::Return(Some(e)) => expr_reassigns_ident(e, name),
+        Stmt::Labeled { stmt, .. } => stmt_reassigns_ident(stmt, name),
+        _ => false,
+    }
+}
+
 /// True for `var = Z_Malloc(...);` -- the allocation call itself, always
 /// discarded (see module docs: `render_spawn_fn` replaces it with
 /// `Arena::insert`).
@@ -6029,7 +6158,24 @@ fn render_params(
         let rust_type = param_types
             .get(&name)
             .ok_or_else(|| format!("{fn_name}: parameter `{name}`'s Rust type isn't known"))?;
-        rendered.push(format!("{}: {rust_type}", rust_field_name(&name)?));
+        // `dx = abs(dx);` (`P_AproxDistance`) -- the first real corpus
+        // function to reassign one of its own parameters (every earlier
+        // `render_trigger_fn` caller only ever reads its params) -- a
+        // genuine `rustc` rejection (`cannot assign to immutable
+        // argument`) without `mut` here, confirmed by compiling the naive
+        // version first, not guessed at. `body_reassigns_ident` (not the
+        // looser `body_has_any_ident_ref`, which would also fire for a
+        // plain read and produce a spurious `unused_mut` on every
+        // never-reassigned param) decides this per parameter.
+        let mut_prefix = if body_reassigns_ident(&f.body.items, &name) {
+            "mut "
+        } else {
+            ""
+        };
+        rendered.push(format!(
+            "{mut_prefix}{}: {rust_type}",
+            rust_field_name(&name)?
+        ));
     }
     Ok(rendered)
 }
@@ -6465,6 +6611,67 @@ pub fn render_trigger_fn(
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
     Ok(format!(
         "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>){return_arrow} {{\n{}\n}}",
+        rendered_params.join(", "),
+        body_lines.join("\n")
+    ))
+}
+
+/// `render_trigger_fn`'s own leaner sibling for a genuinely different
+/// shape: a small, self-contained helper (`P_AproxDistance(fixed_t dx,
+/// fixed_t dy)`, `p_maputl.c`) whose body touches no global state at all
+/// -- no `self`-struct receiver, no `World`, no `Arena<Thinker>`, just its
+/// own parameters in and a plain value out. `render_trigger_fn` always
+/// appends a fixed `, world: &mut World, thinkers: &mut Arena<Thinker>)`
+/// to its signature, which would be actively wrong here (no real corpus
+/// call site anywhere passes those to `P_AproxDistance`, confirmed by
+/// every already-translated caller's own rendered text, e.g. `A_Tracer`'s
+/// `P_AproxDistance(dx, dy)`) -- so this renders a bare signature instead,
+/// with `param_types` doing double duty as `extra_cross_ref_idents`
+/// (letting `expr_is_fixed_t_valued`'s own new `"FixedT"`-registered-
+/// parameter arm recognize a bare `dx`/`dy` reference as genuinely
+/// `FixedT`-valued, the same way a self-struct field or `fixed_t`-declared
+/// local already are) exactly the way `render_trigger_fn` already reuses
+/// its own `param_types` for that map.
+pub fn render_pure_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    param_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+    let rendered_params = render_params(f, fn_name, param_types)?;
+    let plain_int_locals = collect_plain_int_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
+    let ctx = FnBodyContext {
+        self_param: "",
+        self_field_types: &HashMap::new(),
+        extra_cross_ref_idents: param_types,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
+        embedded_ctor: None,
+        mutating_handle: None,
+        same_handle_write: None,
+        same_target_write: None,
+        self_removal_ident: "arena",
+        plain_int_locals: &plain_int_locals,
+        angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &fixed_t_locals,
+        thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
+        active_goto_label: None,
+        active_for_continue_step: None,
+        static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
+    };
+
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    Ok(format!(
+        "pub fn {fn_name}({}){return_arrow} {{\n{}\n}}",
         rendered_params.join(", "),
         body_lines.join("\n")
     ))
@@ -12714,6 +12921,58 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              return false;\n    \
              }\n    \
              return true;\n\
+             }"
+        );
+    }
+
+    /// `P_AproxDistance` (`p_maputl.c`) -- the first function needing
+    /// `render_pure_fn`'s own leaner signature (no `self`, no `World`, no
+    /// `Arena<Thinker>` -- a small self-contained helper touching no
+    /// global state at all). Two new, narrowly-scoped mechanisms: (1)
+    /// `expr_is_fixed_t_valued` gains a `"FixedT"`-registered-parameter
+    /// arm (`dx`/`dy` themselves, plain function parameters genuinely
+    /// declared `fixed_t`, distinct from a self-struct field or a
+    /// `fixed_t`-declared local) so `abs(dx)` renders its already-correct
+    /// raw-magnitude extraction (`(dx).0.abs()`, `PIT_VileCheck`'s own
+    /// precedent); (2) `dx = abs(dx);` reassigns `dx` right back into
+    /// itself, needing the extracted `i32` magnitude re-wrapped in
+    /// `FixedT(..)` since `dx` stays genuinely `fixed_t`-typed afterward
+    /// (`dx>>1`, `dx+dy`) -- unlike `PIT_VileCheck`'s own `abs(..)` use,
+    /// which stays a bare `i32` because it's compared against a plain
+    /// `int` field. **A second, independent gap surfaced by actually
+    /// compiling the naive output with `rustc`**: reassigning a Rust
+    /// function *parameter* needs it declared `mut` in the signature --
+    /// the first real corpus function to reassign one of its own
+    /// parameters (every earlier `render_trigger_fn` caller only ever
+    /// reads its params) -- `render_params` now checks each parameter
+    /// with the new `body_reassigns_ident` (a precise write-only scan,
+    /// not the looser `body_has_any_ident_ref`, which would also fire on
+    /// a plain read and produce a spurious `clippy::unused_mut` on every
+    /// never-reassigned parameter). Compile-verified for real with a
+    /// hand-written `FixedT` stand-in (`rustc --edition 2021`, both
+    /// `--crate-type lib` and a `--crate-type bin` smoke run actually
+    /// executing it against `P_AproxDistance(3, -4) == 6`) -- zero
+    /// errors. `test_p_aprox_distance_renders_exactly`.
+    #[test]
+    fn test_p_aprox_distance_renders_exactly() {
+        let param_types = field_types(&[("dx", "FixedT"), ("dy", "FixedT")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_maputl.c",
+            "P_AproxDistance",
+            &param_types,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_AproxDistance(mut dx: FixedT, mut dy: FixedT) -> FixedT {\n    \
+             dx = FixedT((dx).0.abs());\n    \
+             dy = FixedT((dy).0.abs());\n    \
+             if dx < dy {\n        \
+             return dx + dy - (dx >> 1);\n    \
+             }\n    \
+             return dx + dy - (dy >> 1);\n\
              }"
         );
     }
