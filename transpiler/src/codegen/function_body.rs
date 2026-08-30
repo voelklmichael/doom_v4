@@ -370,6 +370,25 @@ struct FnBodyContext<'a> {
     /// everywhere else, including every isolated-fragment test below that
     /// doesn't exercise a `for` loop at all.
     active_for_continue_step: Option<&'a str>,
+    /// This function's own declared Rust return type (`render_pure_fn`/
+    /// `render_world_fn`'s own `return_type` parameter, threaded through
+    /// verbatim), needed for exactly one purpose so far: `Stmt::Return`
+    /// wrapping a bare cross-reference value (`return line->frontsector;`,
+    /// `getNextSector`'s own idiom, `p_spec.c`) in `Some(..)` when the
+    /// function's own return type is `Option<..>` but the expression
+    /// itself renders as a bare, non-`Option` index type (`render_expr`'s
+    /// own `is_crossref` flag already means exactly that -- a bare cross-
+    /// reference value, never `Option`-wrapped, per every other cross-ref
+    /// arm in this module). A sibling return in the very same function
+    /// (`return line->backsector;`) needs no such wrap, since `backsector`
+    /// is already `Option<SectorId>` -- correctly told apart because *its*
+    /// own render never sets `is_crossref` (nothing chains a further
+    /// `.field` off it here), not by any per-field name list. `None` for
+    /// every context that isn't `render_pure_fn`/`render_world_fn` (a
+    /// `self`-struct tick/action function's own `Stmt::Return` is always
+    /// either bare `void` or a plain `bool`/`i32`, never `Option<..>`, so
+    /// this never applies there).
+    return_type: Option<&'a str>,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -716,6 +735,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             }
             if name == "vileobj" {
                 return Ok(("world.vileobj".to_string(), false));
+            }
+            // `numsectors` (`p_setup.c`'s own file-scope `int
+            // numsectors;`, `P_FindSectorFromLineTag`'s own `for
+            // (i=start+1;i<numsectors;i++)`) -- unlike `linetarget`/
+            // `braintargets` (genuine mutable game state with no single
+            // source of truth elsewhere), this is a read-only derived
+            // quantity that's always exactly `world.sectors.len()` (the
+            // real engine sets both together at level load, from the very
+            // same array); rendering it as a fresh `World` field would
+            // just be a second, redundant place for the same number to
+            // silently drift out of sync, the same "keep the shape but
+            // don't duplicate the source of truth" reasoning already
+            // applied to `mobj_t.info`/`sector_t.linecount` at the struct
+            // level -- just resolved here at the expression-rendering
+            // level, since no struct field actually holds `numsectors`.
+            if name == "numsectors" {
+                return Ok(("world.sectors.len() as i32".to_string(), false));
             }
             if name == "viletryx" {
                 return Ok(("world.viletryx".to_string(), false));
@@ -1372,6 +1408,17 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides") => {
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SideId({index_text} as u32)"), true))
+        }
+        // `sectors[i]` (bare, no `&` -- `P_FindSectorFromLineTag`'s own
+        // `sectors[i].tag`, `p_spec.c`). The exact same idiom as bare
+        // `sides[i]` just above, generalized to its sibling global array
+        // now that a second real caller needs it: `sector_t*` already
+        // maps to `SectorId`, so this needs no real indexing operation
+        // either, just wrapping the index -- `is_crossref: true` so the
+        // chained `.tag` resolves through `world[...]` the same way.
+        Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "sectors") => {
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("SectorId({index_text} as u32)"), true))
         }
         // A plain fixed-size array *field* (`line->sidenum[0]`, `sidenum:
         // [i16; 2]` -- struct_fields.rs's own single-dimension array
@@ -2362,11 +2409,30 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             render_expr_stmt(e, ctx)?
         )]),
         Stmt::Return(None) => Ok(vec![format!("{}return;", indent(depth))]),
-        Stmt::Return(Some(e)) => Ok(vec![format!(
-            "{}return {};",
-            indent(depth),
-            render_expr(e, ctx)?.0
-        )]),
+        Stmt::Return(Some(e)) => {
+            let (text, _) = render_expr(e, ctx)?;
+            // `return line->frontsector;` (`getNextSector`, `p_spec.c`) --
+            // this function's own return type is `Option<SectorId>`
+            // (matching its sibling return, `return line->backsector;`,
+            // already `Option`-typed with no wrap needed), but
+            // `frontsector` itself is a bare, non-`Option` `SectorId`
+            // field (`struct_fields.rs`'s own corpus-verified asymmetry:
+            // only `backsector` is genuinely nullable). Hand-matched by
+            // field name, the same "no general struct-field-type registry
+            // yet, name it explicitly" style as `sides[i].sector`/
+            // `specialdata` elsewhere in this module, rather than a
+            // general "is this bare `Member` cross-reference-typed" check
+            // for a plain (non-`self`, non-`ctor`) parameter's own field --
+            // unproven beyond this one real corpus case so far.
+            let text = if matches!(ctx.return_type, Some(rt) if rt.starts_with("Option<"))
+                && matches!(e, Expr::Member { field, .. } if field == "frontsector")
+            {
+                format!("Some({text})")
+            } else {
+                text
+            };
+            Ok(vec![format!("{}return {};", indent(depth), text)])
+        }
         Stmt::If {
             cond,
             then_branch,
@@ -4749,6 +4815,7 @@ fn render_fn_impl(
         thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let handle_part = if needs_self_removal && !composed_self_removal {
@@ -4856,6 +4923,7 @@ pub fn render_weapon_fn(
         thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -6507,6 +6575,7 @@ pub fn render_spawn_fn(
         thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -6870,6 +6939,7 @@ pub fn render_trigger_fn(
         thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -6931,6 +7001,7 @@ pub fn render_pure_fn(
         thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -7000,6 +7071,7 @@ pub fn render_world_fn(
         thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -7724,6 +7796,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -7820,6 +7893,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -7876,6 +7950,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -7953,6 +8028,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -8117,6 +8193,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -9276,6 +9353,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -9348,6 +9426,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -9446,6 +9525,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -9524,6 +9604,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -9603,6 +9684,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -9687,6 +9769,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -11149,6 +11232,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -11907,6 +11991,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -13759,6 +13844,113 @@ pub fn PIT_RadiusAttack(thing: &mut Mobj, world: &mut World, thinkers: &Arena<Th
         P_DamageMobj(thing, bombspot, bombsource, bombdamage - dist.0);
     }
     return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FindSectorFromLineTag` (`p_spec.c`) -- opens a fresh batch of
+    /// non-`A_*`/non-mover functions, called (as a forward-referenced
+    /// stub) by every already-translated tagged-sector trigger
+    /// (`EV_DoCeiling`/`EV_DoDoor`/`EV_DoPlat`/`EV_StartLightStrobing`'s
+    /// own `while ((secnum = P_FindSectorFromLineTag(line,secnum)) >=
+    /// 0)`), but never itself translated until now. `render_world_fn`'s
+    /// existing shape fits directly (a plain `line: &Line`/`start: i32`
+    /// parameter pair, `-> i32`, real `World` access, no `self`-struct,
+    /// no `Arena<Thinker>`) -- the only two genuinely new pieces are both
+    /// by-name global registrations, the same style `braintargets`/
+    /// `activeplats` already established: `numsectors` (`p_setup.c`'s own
+    /// file-scope `int numsectors;`) renders as `world.sectors.len() as
+    /// i32` rather than a fresh `World` field, since it's a read-only
+    /// derived quantity always exactly equal to the sector array's own
+    /// length (both set together at level load in the real engine) --
+    /// giving it a second, independent field would just be a redundant
+    /// place for the same number to drift out of sync, matching the
+    /// "don't duplicate the source of truth" reasoning `mobj_t.info`/
+    /// `sector_t.linecount` already established at the struct-field
+    /// level. Bare (non-`&`) `sectors[i]` (`sectors[i].tag`) generalizes
+    /// the existing bare `sides[i]` special case to its sibling global
+    /// array: `sector_t*` already maps to `SectorId`, so this needs no
+    /// real indexing either, just wrapping the index with `is_crossref:
+    /// true` so the chained `.tag` resolves through `world[...]` the same
+    /// way. `line->tag` needs nothing new at all: `tag` is a plain `i16`
+    /// field on both `Sector`/`Line` (confirmed by direct read of
+    /// `r_defs.h`, not assumed), so the comparison is ordinary `i16 ==
+    /// i16`. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Line`/`Sector`/`World`
+    /// stand-in -- zero errors. `test_p_find_sector_from_line_tag_renders_exactly`.
+    #[test]
+    fn test_p_find_sector_from_line_tag_renders_exactly() {
+        let params = field_types(&[("line", "&Line"), ("start", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindSectorFromLineTag",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindSectorFromLineTag(line: &Line, start: i32, world: &mut World) -> i32 {
+    let mut i;
+    i = start + 1;
+    while i < world.sectors.len() as i32 {
+        if world[SectorId(i as u32)].tag == line.tag {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `getNextSector` (`p_spec.c`) -- a small pure helper (no `self`-
+    /// struct, no `World`/`Arena` access at all: both `line`/`sec` are
+    /// plain parameters, so `render_pure_fn` fits directly), the first
+    /// real corpus function needing `Stmt::Return`'s new `Option<..>`-
+    /// wrap: its own return type is `Option<SectorId>` (a genuinely
+    /// nullable `sector_t*`, `!(one-sided) -> NULL`), and while `return
+    /// line->backsector;` needs no wrap (`backsector` is already `Option
+    /// <SectorId>`, the corpus-verified nullable one of the pair), its
+    /// sibling `return line->frontsector;` returns the bare, non-nullable
+    /// twin -- needing `Some(..)`, hand-matched by field name (`"no
+    /// general struct-field-type registry yet"`, the same style
+    /// `sides[i].sector`/`specialdata` already established) rather than a
+    /// general is-this-bare-Member-cross-reference-typed check unproven
+    /// beyond this one real case. `return NULL;` needs nothing new either
+    /// -- `Expr::Ident("NULL")` already renders as `None` unconditionally
+    /// via the existing generic arm. `!(line->flags & ML_TWOSIDED)`
+    /// reuses the already-proven negated-non-comparison-`Binary`
+    /// truthiness arm (`A_Chase`'s own `!(actor->target->flags&
+    /// MF_SHOOTABLE)`) with zero changes -- `ML_TWOSIDED` itself is a
+    /// plain `#define`d macro (`doomdata.h`, confirmed by direct read,
+    /// not an enum constant), rendered as opaque pass-through text, the
+    /// same `MISSILERANGE`/`SKULLSPEED` precedent. `line->frontsector ==
+    /// sec` needs nothing new either: `SectorId` already derives
+    /// `PartialEq`/`Eq`. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against a hand-written `Line`/`SectorId`
+    /// stand-in (`ML_TWOSIDED: i16 = 4`, matching the real macro's own
+    /// value) -- zero errors. `test_get_next_sector_renders_exactly`.
+    #[test]
+    fn test_get_next_sector_renders_exactly() {
+        let params = field_types(&[("line", "&Line"), ("sec", "SectorId")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "getNextSector",
+            &params,
+            Some("Option<SectorId>"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn getNextSector(line: &Line, sec: SectorId) -> Option<SectorId> {
+    if line.flags & ML_TWOSIDED == 0 {
+        return None;
+    }
+    if line.frontsector == sec {
+        return line.backsector;
+    }
+    return Some(line.frontsector);
 }";
         assert_eq!(rendered, expected);
     }
