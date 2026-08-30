@@ -22,6 +22,56 @@
 //! `[Player; MAXPLAYERS]`, not `Vec`, matching `runtime/player.rs`'s own
 //! already-documented design (a plain, fixed-size, never-resized array,
 //! unlike `sectors`/`sides`' genuinely per-level-sized tables).
+//! `linetarget` joined once `A_Punch`/`A_Saw` (`p_pspr.c`) needed
+//! somewhere to hold `p_local.h`'s own `extern mobj_t* linetarget;` --
+//! genuine file-scope mutable game state (the last thing
+//! `P_AimLineAttack` hit, corpus-wide, not a per-level table like
+//! `sectors`/`sides` or a program-lifetime fixed array like `players`),
+//! but still just one more piece of state a tick/action function's own
+//! body needs to resolve through, so it lives here rather than as some
+//! new kind of parameter -- a plain `Option<Handle<Thinker>>` field,
+//! the same type `Mobj.target`/`.tracer` already use for "no target"
+//! vs. a real live thinker.
+//! `subsectors` joined once `A_Look`'s own `actor->subsector->sector->
+//! soundtarget` needed somewhere to resolve `Mobj.subsector`
+//! (`SubsectorId`) into, the same per-level `Vec`-backed shape as
+//! `sectors`/`sides` (`r_defs.h`'s `subsector_t` is bulk-allocated once
+//! per level, same as every other geometry struct).
+//! `braintargets`/`numbraintargets`/`braintargeton` joined once
+//! `A_BrainSpit` (`p_enemy.c`) needed somewhere to hold its own file-
+//! scope `mobj_t* braintargets[32]; int numbraintargets; int
+//! braintargeton;` -- the same "genuine mutable game state, not a per-
+//! level table or a fixed-size player array" category `linetarget`
+//! already established, just a fixed-size array of targets (`A_BrainAwake`
+//! populates it; `A_BrainSpit` only ever reads/advances it) instead of a
+//! single value.
+//! `a_brain_spit_easy` joined once `A_BrainSpit`'s own `static int easy =
+//! 0;` needed somewhere to live: a C function-local `static` persists
+//! across every call, unlike an ordinary local (which a Rust `let`
+//! re-initializes fresh each time this function's own body runs) --
+//! genuinely the same *kind* of state `linetarget`/`braintargeton` are
+//! (mutable, outliving any one call), just scoped to one function's own
+//! textual visibility in the original C rather than visible file-wide, so
+//! it gets the same treatment (a `World` field) with the function's own
+//! name folded into the field name to keep it from colliding with some
+//! future unrelated function's own same-named `static` local (`docs/
+//! 03_TRANSPILER.md`'s `render_fn`/`FnBodyContext::static_locals`, in
+//! `function_body.rs`, computes this exact name and skips ever rendering
+//! the original declaration's own `let`). Its `= 0` initializer isn't
+//! wired up here -- nothing in this codebase constructs a real `World`
+//! value yet (disk emission/level loading don't exist), so there's
+//! nothing to initialize *to* yet; whichever future piece builds that
+//! constructor is responsible for seeding this at `0`, matching the C
+//! initializer's own "runs once, at program start" semantics.
+//! `corpsehit`/`vileobj`/`viletryx`/`viletryy` joined once `PIT_VileCheck`/
+//! `A_VileChase` (`p_enemy.c`) needed somewhere to hold their own shared
+//! file-scope `mobj_t* corpsehit; mobj_t* vileobj; fixed_t viletryx;
+//! fixed_t viletryy;` -- the same "genuine mutable game state a callback
+//! and its caller communicate through" category `linetarget`/
+//! `braintargets` already established, just a pair of single values
+//! (`corpsehit`/`vileobj`, `Option<Handle<Thinker>>`) and a pair of
+//! coordinates (`viletryx`/`viletryy`, `FixedT`) instead of one value or
+//! an array.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -37,7 +87,17 @@ pub fn render_world_struct() -> String {
 pub struct World {
     pub sectors: Vec<Sector>,
     pub sides: Vec<Side>,
+    pub subsectors: Vec<Subsector>,
     pub players: [Player; MAXPLAYERS],
+    pub linetarget: Option<Handle<Thinker>>,
+    pub braintargets: [Option<Handle<Thinker>>; 32],
+    pub numbraintargets: i32,
+    pub braintargeton: i32,
+    pub a_brain_spit_easy: i32,
+    pub corpsehit: Option<Handle<Thinker>>,
+    pub vileobj: Option<Handle<Thinker>>,
+    pub viletryx: FixedT,
+    pub viletryy: FixedT,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -66,6 +126,19 @@ impl std::ops::IndexMut<SideId> for World {
     }
 }
 
+impl std::ops::Index<SubsectorId> for World {
+    type Output = Subsector;
+    fn index(&self, id: SubsectorId) -> &Subsector {
+        &self.subsectors[id.0 as usize]
+    }
+}
+
+impl std::ops::IndexMut<SubsectorId> for World {
+    fn index_mut(&mut self, id: SubsectorId) -> &mut Subsector {
+        &mut self.subsectors[id.0 as usize]
+    }
+}
+
 impl std::ops::Index<PlayerId> for World {
     type Output = Player;
     fn index(&self, id: PlayerId) -> &Player {
@@ -91,11 +164,23 @@ mod tests {
         assert!(rendered.starts_with("pub struct World {"));
         assert!(rendered.contains("pub sectors: Vec<Sector>,"));
         assert!(rendered.contains("pub sides: Vec<Side>,"));
+        assert!(rendered.contains("pub subsectors: Vec<Subsector>,"));
         assert!(rendered.contains("pub players: [Player; MAXPLAYERS],"));
+        assert!(rendered.contains("pub linetarget: Option<Handle<Thinker>>,"));
+        assert!(rendered.contains("pub braintargets: [Option<Handle<Thinker>>; 32],"));
+        assert!(rendered.contains("pub numbraintargets: i32,"));
+        assert!(rendered.contains("pub braintargeton: i32,"));
+        assert!(rendered.contains("pub a_brain_spit_easy: i32,"));
+        assert!(rendered.contains("pub corpsehit: Option<Handle<Thinker>>,"));
+        assert!(rendered.contains("pub vileobj: Option<Handle<Thinker>>,"));
+        assert!(rendered.contains("pub viletryx: FixedT,"));
+        assert!(rendered.contains("pub viletryy: FixedT,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SideId> for World"));
+        assert!(rendered.contains("impl std::ops::Index<SubsectorId> for World"));
+        assert!(rendered.contains("impl std::ops::IndexMut<SubsectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<PlayerId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<PlayerId> for World"));
     }
