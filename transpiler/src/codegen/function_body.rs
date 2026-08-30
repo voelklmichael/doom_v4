@@ -12417,4 +12417,51 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }"
         );
     }
+
+    /// `P_CheckMissileSpawn` (`p_mobj.c`) -- a clean, already-fully-
+    /// provisioned function needing no new mechanism at all: `tics -=`/
+    /// clamp (`P_ExplodeMissile`'s own idiom just above), `th->x +=
+    /// (th->momx>>1);` reusing `FixedT`'s existing `Shr<i32>`/`AddAssign`
+    /// (first proven for `A_SkullAttack`'s own `dist` gap), and a
+    /// `P_TryMove` call through the already-registered bool-returning-
+    /// helper machinery (`is_bool_returning_call`) for the closing
+    /// `if (!P_TryMove(..)) P_ExplodeMissile(th);` -- a forward reference
+    /// to the just-translated sibling above, the same "call an already-
+    /// translated function by name" convention every other cross-function
+    /// call in this corpus already relies on.
+    #[test]
+    fn test_p_check_missile_spawn_renders_exactly() {
+        let field_types = field_types(&[
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("tics", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_CheckMissileSpawn",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_CheckMissileSpawn(th: &mut Mobj, world: &mut World) {\n    \
+             th.tics -= P_Random() & 3;\n    \
+             if th.tics < 1 {\n        \
+             th.tics = 1;\n    \
+             }\n    \
+             th.x += th.momx >> 1;\n    \
+             th.y += th.momy >> 1;\n    \
+             th.z += th.momz >> 1;\n    \
+             if !P_TryMove(th, th.x, th.y) {\n        \
+             P_ExplodeMissile(th);\n    \
+             }\n\
+             }"
+        );
+    }
 }
