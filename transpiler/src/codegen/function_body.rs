@@ -346,6 +346,19 @@ struct FnBodyContext<'a> {
     /// everywhere else, including inside `render_thinker_list_scan`'s own
     /// (separate, `Arena::iter()`-based) while-loop-shaped scan.
     thinker_scan_handle_alias: Option<(&'a str, &'a str)>,
+    /// Set only while rendering the body of a `sector = sectors; for
+    /// (i=0;i<numsectors;i++,sector++) { .. }`-shaped loop
+    /// (`is_sector_walk_for`'s own doc comment, `EV_LightTurnOn`/
+    /// `EV_TurnTagLightsOff`, `p_lights.c`) -- Doom's own "walk the whole
+    /// `sectors[]` array in lockstep with an index" idiom. Maps the
+    /// pointer-local's own name (`sector`) to the loop counter's name
+    /// (`i`): a bare reference to the pointer-local resolves to
+    /// `SectorId({counter} as u32)` directly (`render_expr`'s own
+    /// `Expr::Ident` arm), the same "the pointer already *is* the index"
+    /// reasoning `sec-sectors`'s own pointer-arithmetic special case
+    /// already established, just resolved once per reference instead of
+    /// via arithmetic. `None` everywhere else.
+    sector_walk_alias: Option<(&'a str, &'a str)>,
     /// Set only while rendering the statements a forward `goto` jumps
     /// *over* (the block `render_compound_items`'s own goto-to-common-
     /// label transform wraps in a Rust labeled block) -- the label name
@@ -841,6 +854,19 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // rather than a fixed name.
             if let Some(field) = ctx.static_locals.get(name.as_str()) {
                 return Ok((format!("world.{field}"), false));
+            }
+            // `sector` (`EV_LightTurnOn`'s own `sector = sectors; for
+            // (i=0;i<numsectors;i++,sector++) { .. sector->tag .. }`) --
+            // once inside the loop this idiom's own lookahead recognized
+            // (`FnBodyContext::sector_walk_alias`'s own doc comment), a
+            // bare reference to the pointer-local resolves directly to
+            // `SectorId({counter} as u32)`, the same "the pointer already
+            // *is* the index" reasoning `sec-sectors` already established,
+            // just resolved per-reference instead of via arithmetic.
+            if let Some((var, counter)) = ctx.sector_walk_alias
+                && name == var
+            {
+                return Ok((format!("SectorId({counter} as u32)"), true));
             }
             let is_crossref = ctx
                 .extra_cross_ref_idents
@@ -1995,15 +2021,17 @@ fn is_bool_returning_call(expr: &Expr) -> bool {
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
     match expr {
-        // Covers both a trigger function's own `Option<PlayerId>` local
-        // (`p`) and a `Mobj`-shaped action function's own local alias of
-        // `target`/`tracer` (`dest`, `A_SkullAttack`'s idiom) -- both
-        // tracked the same way, via `ctx.extra_cross_ref_idents`.
+        // Covers a trigger function's own `Option<PlayerId>` local (`p`),
+        // a `Mobj`-shaped action function's own local alias of `target`/
+        // `tracer` (`dest`, `A_SkullAttack`'s idiom), and a local assigned
+        // from `getNextSector(..)`'s own real `Option<SectorId>` return
+        // (`tsec`, `EV_LightTurnOn`'s idiom) -- all tracked the same way,
+        // via `ctx.extra_cross_ref_idents`.
         Expr::Ident(n) => matches!(
             ctx.extra_cross_ref_idents
                 .get(n.as_str())
                 .map(String::as_str),
-            Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>")
+            Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>") | Some("Option<SectorId>")
         ),
         Expr::Member { field, .. } if field == "player" => true,
         // `!actor->target` (`A_PosAttack` and friends) -- `target`'s
@@ -3057,6 +3085,133 @@ fn is_thinker_list_scan_for(stmt: &Stmt) -> Option<(&str, &Stmt)> {
         return None;
     }
     Some((var, body))
+}
+
+/// `sector = sectors;` -- the priming statement immediately before
+/// `is_sector_walk_for`'s own loop header (`EV_LightTurnOn`/
+/// `EV_TurnTagLightsOff`, `p_lights.c`), Doom's own "walk the whole
+/// `sectors[]` array in lockstep with an index" idiom: a `sector_t*`
+/// local assigned the bare array name itself (its first element,
+/// address-of elided the same way C's own array-to-pointer decay
+/// already does), then advanced one element per loop iteration via its
+/// own `sector++` step rather than a real index. Mirrors
+/// `is_thinker_list_scan_init`'s own shape exactly, just keyed off
+/// `sectors` instead of `thinkercap.next`.
+fn is_sector_walk_priming(stmt: &Stmt) -> Option<&str> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = stmt
+    else {
+        return None;
+    };
+    let Expr::Ident(var) = lhs.as_ref() else {
+        return None;
+    };
+    matches!(rhs.as_ref(), Expr::Ident(n) if n == "sectors").then_some(var.as_str())
+}
+
+/// `for (i=0;i<numsectors;i++,sector++) { .. }` -- the loop header
+/// pairing with `is_sector_walk_priming`'s own initializer, confirmed to
+/// advance the *same* pointer-local named there (not just assumed from
+/// adjacency), the same "confirm every real piece" discipline
+/// `is_thinker_list_scan_for` already established. Its own step is a
+/// genuine two-part comma expression (`i++, sector++`) -- a shape no
+/// earlier `for` loop in this corpus has needed -- returning just the
+/// counter's own name and the loop body; the pointer-local's own
+/// `sector++` half is dropped entirely from the rendered output, since
+/// `sector_walk_alias` already resolves every reference to it as
+/// `SectorId({counter} as u32)`, which needs no separate advancement of
+/// its own.
+fn is_sector_walk_for<'a>(stmt: &'a Stmt, var: &str) -> Option<(&'a str, &'a Stmt)> {
+    let Stmt::For {
+        init: Some(ForInit::Expr(init_expr)),
+        cond: Some(cond),
+        step: Some(step),
+        body,
+    } = stmt
+    else {
+        return None;
+    };
+    let Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: init_lhs,
+        rhs: init_rhs,
+    } = init_expr
+    else {
+        return None;
+    };
+    let Expr::Ident(counter) = init_lhs.as_ref() else {
+        return None;
+    };
+    if !matches!(init_rhs.as_ref(), Expr::IntLiteral(s) if s == "0") {
+        return None;
+    }
+    let Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: cond_lhs,
+        rhs: cond_rhs,
+    } = cond
+    else {
+        return None;
+    };
+    if !matches!(cond_lhs.as_ref(), Expr::Ident(n) if n == counter) {
+        return None;
+    }
+    if !matches!(cond_rhs.as_ref(), Expr::Ident(n) if n == "numsectors") {
+        return None;
+    }
+    let Expr::Comma(step1, step2) = step else {
+        return None;
+    };
+    let step1_ok = matches!(step1.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == counter));
+    if !step1_ok {
+        return None;
+    }
+    let step2_ok = matches!(step2.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == var));
+    if !step2_ok {
+        return None;
+    }
+    Some((counter, body))
+}
+
+/// Renders the whole `sector = sectors; for (i=0;i<numsectors;i++,
+/// sector++) { .. }` pair as one ordinary Rust counted loop over
+/// `world.sectors.len()`, reusing `render_for`'s own existing machinery
+/// (the `continue`-hoists-the-step handling included) by constructing a
+/// synthetic single-part step (`i++` alone, the pointer-local's own
+/// `sector++` half already made redundant by `sector_walk_alias`) rather
+/// than teaching `render_for` itself about a comma-step shape only this
+/// one idiom needs.
+fn render_sector_walk_for(
+    var: &str,
+    counter: &str,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let inner_ctx = FnBodyContext {
+        sector_walk_alias: Some((var, counter)),
+        ..*ctx
+    };
+    let init = Some(ForInit::Expr(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::IntLiteral("0".to_string())),
+    }));
+    let cond = Some(Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::Ident("numsectors".to_string())),
+    });
+    let step = Some(Expr::PostIncDec {
+        expr: Box::new(Expr::Ident(counter.to_string())),
+        op: IncDecOp::Inc,
+    });
+    render_for(&init, &cond, &step, body, &inner_ctx, depth)
 }
 
 /// `curvar->function.acp1 == (actionf_p1)P_MobjThinker` -- the tag check
@@ -4414,6 +4569,20 @@ fn render_compound_items(
             i += 1;
             continue;
         }
+        // `sector = sectors; for (i=0;i<numsectors;i++,sector++) { .. }`
+        // (`is_sector_walk_priming`/`is_sector_walk_for`'s own doc
+        // comments, `EV_LightTurnOn`/`EV_TurnTagLightsOff`) -- another
+        // two-statement idiom, the same "needs its own lookahead" reason
+        // as the thinker-list scan just above.
+        if let BlockItem::Stmt(priming_stmt) = &items[i]
+            && let Some(var) = is_sector_walk_priming(priming_stmt)
+            && let Some(BlockItem::Stmt(for_stmt)) = items.get(i + 1)
+            && let Some((counter, body)) = is_sector_walk_for(for_stmt, var)
+        {
+            out.extend(render_sector_walk_for(var, counter, body, ctx, depth)?);
+            i += 2;
+            continue;
+        }
         if let BlockItem::Decl(d) = &items[i]
             && d.declarators.len() == 1
             && declarator_name(&d.declarators[0].declarator).is_some_and(|n| scan_vars.contains(&n))
@@ -4441,6 +4610,19 @@ fn thinker_scan_var_names(items: &[BlockItem]) -> HashSet<String> {
             && let Some(var) = is_thinker_list_scan_init(init_stmt)
             && let BlockItem::Stmt(while_stmt) = &pair[1]
             && is_thinker_list_scan_while(while_stmt, var).is_some()
+        {
+            names.insert(var.to_string());
+        }
+        // `sector = sectors;`'s own declaration (`sector_t* sector;`,
+        // declared once earlier in the function) becomes dead the same
+        // way `currentthinker`'s own does: `sector_walk_alias` resolves
+        // every reference to it without ever really binding it in Rust,
+        // so leaving its own `let mut sector;` in would be genuinely
+        // uninferable, unassigned dead code.
+        if let BlockItem::Stmt(priming_stmt) = &pair[0]
+            && let Some(var) = is_sector_walk_priming(priming_stmt)
+            && let BlockItem::Stmt(for_stmt) = &pair[1]
+            && is_sector_walk_for(for_stmt, var).is_some()
         {
             names.insert(var.to_string());
         }
@@ -5076,6 +5258,7 @@ fn render_fn_impl(
         self_removal_ident,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -5184,6 +5367,7 @@ pub fn render_weapon_fn(
         fixed_t_locals: &fixed_t_locals,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -5679,6 +5863,15 @@ fn line_sector_field_alias_type(e: &Expr) -> Option<&'static str> {
                 && matches!(base.as_ref(), Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides")) =>
         {
             Some("SectorId")
+        }
+        // `tsec = getNextSector(templine, sector);` (`EV_LightTurnOn`/
+        // `EV_TurnTagLightsOff`) -- `getNextSector`'s own real, already-
+        // translated return type is `Option<SectorId>` (confirmed by
+        // direct read, `p_spec.c`), the same "hand-match the one real
+        // callee" style `collect_spawn_mobj_locals` already uses for
+        // `P_SpawnMobj`/`P_SpawnMissile`.
+        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "getNextSector") => {
+            Some("Option<SectorId>")
         }
         _ => None,
     }
@@ -6934,6 +7127,7 @@ pub fn render_spawn_fn(
         fixed_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -7298,6 +7492,7 @@ pub fn render_trigger_fn(
         fixed_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -7360,6 +7555,7 @@ pub fn render_pure_fn(
         fixed_t_locals: &fixed_t_locals,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type,
@@ -7462,6 +7658,7 @@ pub fn render_world_fn(
         fixed_t_locals: &fixed_t_locals,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type,
@@ -8192,6 +8389,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -8289,6 +8487,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -8346,6 +8545,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -8424,6 +8624,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -8589,6 +8790,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -9749,6 +9951,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -9822,6 +10025,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -9921,6 +10125,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -10000,6 +10205,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -10080,6 +10286,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -10165,6 +10372,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -11628,6 +11836,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -12387,6 +12596,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             self_removal_ident: "arena",
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -14837,6 +15047,86 @@ pub fn P_NoiseAlert(target: Handle<Thinker>, emmiter: Handle<Thinker>, world: &m
     world.soundtarget = Some(target);
     world.validcount += 1;
     P_RecursiveSound(world[match thinkers.get(emmiter) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector, 0);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_TurnTagLightsOff` (`p_lights.c`) -- the function whose own
+    /// `sector = sectors; for (j=0;j<numsectors;j++,sector++)` idiom this
+    /// round's earlier `World.lines`/`.vertices` entry left as an
+    /// explicitly investigated, deliberately not-yet-designed blocker.
+    /// `is_sector_walk_priming`/`is_sector_walk_for` (mirroring
+    /// `is_thinker_list_scan_init`/`_for`'s own two-statement-lookahead
+    /// shape) recognize the whole pair and render it as one ordinary
+    /// counted loop over `world.sectors.len()`, with `FnBodyContext::
+    /// sector_walk_alias` resolving every bare reference to the pointer-
+    /// local as `SectorId({counter} as u32)` directly -- the same "the
+    /// pointer already *is* the index" reasoning `sec-sectors`'s own
+    /// pointer-arithmetic special case established, just resolved per-
+    /// reference instead of via arithmetic, and needing no real advance
+    /// of its own (`sector++`'s own comma-step half is simply dropped,
+    /// `render_sector_walk_for` constructs a synthetic single-part step
+    /// for `render_for` to reuse unchanged). Its own declaration (`sector_
+    /// t* sector;`) is dropped the same way `currentthinker`'s already
+    /// is. `sector->lines[i]` and `getNextSector(templine,sector)` reuse
+    /// the alias-collector extensions `P_RecursiveSound`'s own entry
+    /// above just added (`templine` registers `"LineId"`), but `tsec =
+    /// getNextSector(..)` needed one more: a new by-callee-name rule
+    /// registering a local assigned from `getNextSector`'s own real
+    /// `Option<SectorId>` return, plus `is_option_valued`'s own `Ident`
+    /// arm widened to recognize `"Option<SectorId>"` alongside its
+    /// existing `Option<PlayerId>`/`Option<Handle<Thinker>>` pair --
+    /// `if (!tsec) continue;` needed exactly this to render `tsec.is_
+    /// none()` rather than failing outright. `min`'s own plain-`int`
+    /// declaration needs no cast at all despite `Sector.lightlevel`
+    /// being `i16`, not `i32`: Rust's ordinary deferred-`let` inference
+    /// settles it as `i16` from its own consistent uses (assigned from
+    /// and compared against `lightlevel` throughout, never mixed with a
+    /// real `i32`), the same "resolves for free" precedent `prestep`/
+    /// `x`/`y`/`z` already established elsewhere. Verified compiling for
+    /// real (`rustc --edition 2021 --crate-type lib`) against a hand-
+    /// written `Sector`/`Line`/`World`/stub-`getNextSector` stand-in --
+    /// zero errors. `test_ev_turn_tag_lights_off_renders_exactly`.
+    /// 423/423 tests passing.
+    #[test]
+    fn test_ev_turn_tag_lights_off_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "EV_TurnTagLightsOff",
+            &params,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_TurnTagLightsOff(line: &Line, world: &mut World) {
+    let mut i;
+    let mut j;
+    let mut min;
+    let mut tsec;
+    let mut templine;
+    j = 0;
+    while j < world.sectors.len() as i32 {
+        if world[SectorId(j as u32)].tag == line.tag {
+            min = world[SectorId(j as u32)].lightlevel;
+            i = 0;
+            while i < world[SectorId(j as u32)].linecount {
+                templine = world[SectorId(j as u32)].lines[i as usize];
+                tsec = getNextSector(templine, SectorId(j as u32));
+                if tsec.is_none() {
+                    i += 1;
+                    continue;
+                }
+                if world[tsec.unwrap()].lightlevel < min {
+                    min = world[tsec.unwrap()].lightlevel;
+                }
+                i += 1;
+            }
+            world[SectorId(j as u32)].lightlevel = min;
+        }
+        j += 1;
+    }
 }";
         assert_eq!(rendered, expected);
     }
