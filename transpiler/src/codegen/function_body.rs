@@ -852,6 +852,19 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "attackrange" {
                 return Ok(("world.attackrange".to_string(), false));
             }
+            // `swingx`/`swingy` (`p_pspr.c`'s own file-scope `fixed_t
+            // swingx; fixed_t swingy;`, `P_CalcSwing`'s idiom) -- the same
+            // category `viletryx`/`attackrange` already established; a
+            // bare write (`swingx = ..;`) resolves through this same arm
+            // too, since `render_expr_stmt`'s generic assignment fallback
+            // renders its own LHS through `render_expr` with no separate
+            // write-side special case needed.
+            if name == "swingx" {
+                return Ok(("world.swingx".to_string(), false));
+            }
+            if name == "swingy" {
+                return Ok(("world.swingy".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -16085,6 +16098,51 @@ pub fn P_SpawnBlood(x: FixedT, y: FixedT, mut z: FixedT, damage: i32, world: &mu
             P_SetMobjState(th, S_BLOOD3);
         }
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_CalcSwing` (`p_pspr.c`) -- an ordinary `Player`-shaped self-
+    /// struct function (`render_fn`), needing only one small new piece:
+    /// `swingx`/`swingy` (`p_pspr.c`'s own file-scope `fixed_t swingx;
+    /// fixed_t swingy;`) join the by-name `World` global list
+    /// (`viletryx`/`attackrange`'s own category) -- a bare *write*
+    /// (`swingx = ..;`) needed no separate mechanism at all, since
+    /// `render_expr_stmt`'s generic assignment path already renders its
+    /// own LHS through the same `render_expr` `Expr::Ident` arm a read
+    /// would use. `swing` (a genuinely `fixed_t`-declared local) and
+    /// `angle` (a plain `int` local, reused across two separate `finesine[
+    /// angle]` index shapes) are both automatically handled by already-
+    /// existing machinery (`collect_fixed_t_locals`, `finesine`'s own
+    /// blanket by-name `as usize` index cast). Both `(FINEANGLES/70*
+    /// leveltime)&FINEMASK`-shaped expressions needed no parens at all in
+    /// either language (`&`'s C/Rust precedence is lower than `*`/`/`/
+    /// `+`), confirming the precedence-aware renderer drops them
+    /// correctly, the same "redundant original parens, dropped
+    /// correctly" pattern `P_SpawnPuff`'s own entry just proved. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Player`/`World`/`FixedT` stand-in and stub
+    /// `FixedMul` -- zero errors. `test_p_calc_swing_renders_exactly`.
+    #[test]
+    fn test_p_calc_swing_renders_exactly() {
+        let field_types = field_types(&[("bob", "FixedT")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_CalcSwing",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_CalcSwing(player: &mut Player, world: &mut World) {
+    let mut swing;
+    let mut angle;
+    swing = player.bob;
+    angle = FINEANGLES / 70 * leveltime & FINEMASK;
+    world.swingx = FixedMul(swing, finesine[angle as usize]);
+    angle = FINEANGLES / 70 * leveltime + FINEANGLES / 2 & FINEMASK;
+    world.swingy = -FixedMul(world.swingx, finesine[angle as usize]);
 }";
         assert_eq!(rendered, expected);
     }
