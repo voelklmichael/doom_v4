@@ -259,6 +259,19 @@ struct FnBodyContext<'a> {
     /// so the alias is a plain rename, not a dereference. `None`
     /// everywhere else.
     thinker_scan_alias: Option<(&'a str, &'a str)>,
+    /// Set only while rendering the statements a forward `goto` jumps
+    /// *over* (the block `render_compound_items`'s own goto-to-common-
+    /// label transform wraps in a Rust labeled block) -- the label name
+    /// a bare `goto name;` reachable in that scope is expected to target
+    /// (`A_Look`'s own `seeyou`). `Stmt::Goto`'s own `render_stmt` arm
+    /// renders `break '{name};` only when this matches; any other goto
+    /// shape (a backward jump, a label this transform didn't recognize,
+    /// ...) is rejected rather than guessed at, matching this module's
+    /// usual "fail loudly on anything not yet seen" discipline. `None`
+    /// everywhere else, including after the labeled block closes (the
+    /// label's own statement and everything following it render with an
+    /// ordinary context, same as before the goto ever existed).
+    active_goto_label: Option<&'a str>,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -394,6 +407,31 @@ fn is_target_tracer_typed(
             (field == "target" || field == "tracer")
                 && self_field_types.get(field.as_str()).map(String::as_str)
                     == Some("Option<Handle<Thinker>>")
+        }
+        // `actor->subsector->sector->soundtarget` (`A_Look`) -- a third
+        // real corpus source of an `Option<Handle<Thinker>>` value,
+        // besides `self.target`/`.tracer` directly: `sector_t.
+        // soundtarget` (`struct_fields.rs`'s own mapping) is the same
+        // "always `Mobj`-shaped when present, corpus-checked" kind of
+        // value, just reached through two levels of cross-reference
+        // chaining first rather than a direct self field. Hand-matched
+        // by its own exact shape (the same "no general struct-field-type
+        // registry for anything but self/ctor" reasoning `line->
+        // frontsector` already established) rather than folded into the
+        // `target`/`tracer` arm above, since that one only ever looks
+        // one `Member` level deep.
+        Expr::Member {
+            base: sector_expr,
+            field,
+            ..
+        } if field == "soundtarget"
+            && matches!(sector_expr.as_ref(), Expr::Member { base: subsector_expr, field: sector_field, .. }
+                if sector_field == "sector"
+                    && matches!(subsector_expr.as_ref(), Expr::Member { base: actor_expr, field: subsector_field, .. }
+                        if subsector_field == "subsector"
+                            && matches!(actor_expr.as_ref(), Expr::Ident(n) if n == self_param))) =>
+        {
+            true
         }
         Expr::Ident(name) => {
             aliases.get(name.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>")
@@ -645,6 +683,25 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].frontsector"), true))
+        }
+        // `actor->subsector->sector` (`A_Look`'s own `actor->subsector->
+        // sector->soundtarget`) -- a second level of self-struct
+        // chaining the generic fallback below can't resolve on its own:
+        // it only ever decides a `Member`'s own `is_crossref` by checking
+        // whether *its* base is `self_param` directly, so a self field
+        // (`subsector: SubsectorId`) whose *own* field (`sector:
+        // SectorId`, `subsector_t`'s own definition) is itself cross-
+        // reference-typed needs its own narrow arm -- the same "no
+        // general struct-field-type registry for anything but self/ctor"
+        // reasoning `line->frontsector` already established just above,
+        // just one level further removed from `self_param`.
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                    if bf == "subsector" && matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].sector"), true))
         }
         // `actor->target->info` read inside the RHS of a write to a
         // *different* field of that same `actor->target` (`A_VileAttack`'s
@@ -1090,9 +1147,22 @@ fn render_binary_operand(
     // tracks a field's real C type well enough to tell a genuinely-`int`
     // negation from a genuinely-`bool` one inside a chain, so this
     // leaves `Unary::Not` exactly as before rather than guessing.
+    // `targ && (targ->flags & MF_SHOOTABLE)` (`A_Look`) -- a bare, non-
+    // negated `Option<Handle<Thinker>>`-typed *local* (`targ`, aliased
+    // from `actor->subsector->sector->soundtarget`) used as one operand
+    // of a `&&` chain, alongside the `Member`/non-comparison-`Binary`
+    // shapes just above -- also real C truthiness (a null-pointer check
+    // in the original), just on a bare identifier rather than a field
+    // read, so it needs the same `render_bool_expr` routing (which
+    // already has its own bare-`Ident`-Option-valued arm, `.is_some()`,
+    // built for `linetarget`'s own un-negated truthiness) rather than
+    // falling through to the plain identifier text below -- an `Option`
+    // isn't itself a valid `&&` operand in Rust, a real type error, not
+    // just a wrong-but-compiling translation.
     if matches!(parent_op, BinaryOp::LogAnd | BinaryOp::LogOr)
         && (matches!(operand, Expr::Member { .. })
-            || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op)))
+            || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op))
+            || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx)))
     {
         return render_bool_expr(operand, ctx);
     }
@@ -1616,6 +1686,20 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // itself while splitting arms apart (that one is peeled off
         // before individual statements ever reach `render_stmt` at all).
         Stmt::Break => Ok(vec![format!("{}break;", indent(depth))]),
+        // A forward `goto` reaching a common tail (`A_Look`'s own `goto
+        // seeyou;`) -- only ever rendered inside the labeled block
+        // `render_compound_items`'s own goto-to-common-label transform
+        // wraps the jumped-over statements in (see `active_goto_label`'s
+        // own doc comment). Any other goto shape -- a backward jump, or
+        // one whose target the transform didn't recognize -- has no
+        // representation here and is rejected rather than guessed at.
+        Stmt::Goto(label) if ctx.active_goto_label == Some(label.as_str()) => {
+            Ok(vec![format!("{}break '{};", indent(depth), label)])
+        }
+        Stmt::Goto(label) => Err(format!(
+            "render_stmt: unsupported goto shape (target {label:?} not a recognized \
+             forward-jump-to-common-tail)"
+        )),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
 }
@@ -2037,6 +2121,7 @@ fn render_thinker_list_scan(
     }
     let inner_ctx = FnBodyContext {
         thinker_scan_alias: Some((var, "m")),
+        active_goto_label: None,
         ..*ctx
     };
     let (cond_text, _) = render_expr(real_cond, &inner_ctx)?;
@@ -2672,6 +2757,52 @@ fn render_compound_items(
     ctx: &FnBodyContext,
     depth: usize,
 ) -> Result<Vec<String>, String> {
+    // A forward `goto` reaching a common tail (`A_Look`'s own `goto
+    // seeyou;`, from two different places, both skipping over an
+    // intervening `if (!P_LookForPlayers(..)) return;` to land on shared
+    // code) -- Rust has no `goto` at all, but this exact shape (every
+    // `goto` in the label's own prefix targets that same label) is
+    // representable with a labeled block: wrap everything before the
+    // label in `'label: { .. }`, rendering each such `goto` as `break
+    // 'label;` (`Stmt::Goto`'s own `render_stmt` arm, gated on
+    // `active_goto_label`), then continue rendering the label's own
+    // statement and everything after it normally, outside the block --
+    // the label itself needs no marker of its own in the output, since
+    // "falling out of the labeled block" already reaches the same place
+    // "falling through to the label" did in the original C. Only
+    // attempted when *every* goto reachable in that prefix targets this
+    // one label (`collect_goto_targets`) -- a stray goto to some other
+    // target would mean this isn't the simple common-tail shape this
+    // transform was built for, so it's left alone (falls through to the
+    // ordinary per-item loop below, where a real `Stmt::Goto` reaching
+    // `render_stmt` with no matching `active_goto_label` fails loudly
+    // rather than being silently mishandled).
+    if ctx.active_goto_label.is_none()
+        && let Some((label_idx, label)) = find_forward_goto_label(items)
+        && label_idx > 0
+    {
+        let mut targets = HashSet::new();
+        collect_goto_targets(&items[..label_idx], &mut targets);
+        if !targets.is_empty() && targets.iter().all(|t| t == label) {
+            let mut out = Vec::new();
+            out.push(format!("{}'{label}: {{", indent(depth)));
+            let inner_ctx = FnBodyContext {
+                active_goto_label: Some(label),
+                ..*ctx
+            };
+            out.extend(render_compound_items(
+                &items[..label_idx],
+                &inner_ctx,
+                depth + 1,
+            )?);
+            out.push(format!("{}}}", indent(depth)));
+            if let BlockItem::Stmt(Stmt::Labeled { stmt, .. }) = &items[label_idx] {
+                out.extend(render_stmt(stmt, ctx, depth)?);
+            }
+            out.extend(render_compound_items(&items[label_idx + 1..], ctx, depth)?);
+            return Ok(out);
+        }
+    }
     // A trigger with an inline constructor (`render_trigger_fn`'s own
     // `embedded_ctor`, e.g. `EV_DoCeiling`) watches every block it
     // renders for the `Z_Malloc` call that starts its known constructor
@@ -2725,6 +2856,64 @@ fn render_compound_items(
         i += 1;
     }
     Ok(out)
+}
+
+/// The first top-level `label:` found in `items`, if any (`A_Look`'s own
+/// `seeyou:`) -- `render_compound_items`'s own goto-to-common-label
+/// transform only recognizes a label sitting directly in the same block
+/// as the gotos that reach it, matching the one real corpus shape this
+/// was built against.
+fn find_forward_goto_label(items: &[BlockItem]) -> Option<(usize, &str)> {
+    items.iter().enumerate().find_map(|(i, item)| {
+        if let BlockItem::Stmt(Stmt::Labeled { label, .. }) = item {
+            Some((i, label.as_str()))
+        } else {
+            None
+        }
+    })
+}
+
+/// Every `goto` target reachable anywhere in `items` (recursing into
+/// `if`/`switch`/`case`/`default`/`while`/`do`-`while`/`for`/nested `{ }`
+/// blocks) -- used by `render_compound_items`'s own goto-to-common-label
+/// transform to confirm every `goto` in the prefix it's about to wrap in
+/// a labeled block really does target the one label it found, rather
+/// than assuming it; a stray goto to some other target means this isn't
+/// the simple shape the transform handles, so it's left alone instead of
+/// guessed at.
+fn collect_goto_targets(items: &[BlockItem], out: &mut HashSet<String>) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_goto_targets_stmt(s, out);
+        }
+    }
+}
+
+fn collect_goto_targets_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Goto(label) => {
+            out.insert(label.clone());
+        }
+        Stmt::Compound(c) => collect_goto_targets(&c.items, out),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_goto_targets_stmt(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_goto_targets_stmt(eb, out);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_goto_targets_stmt(body, out),
+        Stmt::Case { stmt, .. } => collect_goto_targets_stmt(stmt, out),
+        Stmt::Default(stmt) => collect_goto_targets_stmt(stmt, out),
+        Stmt::While { body, .. } => collect_goto_targets_stmt(body, out),
+        Stmt::DoWhile { body, .. } => collect_goto_targets_stmt(body, out),
+        Stmt::For { body, .. } => collect_goto_targets_stmt(body, out),
+        Stmt::Labeled { stmt, .. } => collect_goto_targets_stmt(stmt, out),
+        _ => {}
+    }
 }
 
 fn find_function_def<'a>(unit_items: &'a [ExternalDecl], fn_name: &str) -> Option<&'a FunctionDef> {
@@ -2977,6 +3166,7 @@ fn render_fn_impl(
         angle_t_locals: &angle_t_locals,
         self_removal_ident,
         thinker_scan_alias: None,
+        active_goto_label: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let handle_part = if needs_self_removal && !composed_self_removal {
@@ -3072,6 +3262,7 @@ pub fn render_weapon_fn(
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &angle_t_locals,
         thinker_scan_alias: None,
+        active_goto_label: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let needs_self_handle_deref =
@@ -4396,6 +4587,7 @@ pub fn render_spawn_fn(
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
+        active_goto_label: None,
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -4753,6 +4945,7 @@ pub fn render_trigger_fn(
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
+        active_goto_label: None,
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -5471,6 +5664,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -5561,6 +5755,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -5611,6 +5806,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -5682,6 +5878,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -5840,6 +6037,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -6993,6 +7191,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -7059,6 +7258,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7151,6 +7351,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7223,6 +7424,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7296,6 +7498,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
         rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
@@ -7374,6 +7577,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -8827,6 +9031,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
@@ -9579,6 +9784,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             angle_t_locals: &HashSet::new(),
             self_removal_ident: "arena",
             thinker_scan_alias: None,
+            active_goto_label: None,
         };
         let rendered = render_compound_items(&f.body.items[9..11], &ctx, 1)
             .expect("should render cleanly")
@@ -9659,6 +9865,101 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              S_StartSound(player.mo, sfx_punch);\n        \
              let __rhs = R_PointToAngle2(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }); if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle = __rhs; };\n    \
              }\n\
+             }"
+        );
+    }
+
+    /// `A_Look` (`p_enemy.c`) -- closes the last remaining gap this
+    /// module's own docs had flagged since the `states[]` entry: `goto`/
+    /// label support, plus a new cross-reference chain (`Mobj.subsector`
+    /// -> `Subsector.sector` -> `Sector.soundtarget`). Two real gotos
+    /// (`if (ambush) { if (P_CheckSight(..)) goto seeyou; } else goto
+    /// seeyou;`) both jump *forward*, skipping an intervening `if
+    /// (!P_LookForPlayers(..)) return;`, to reach one shared tail --
+    /// Rust has no `goto` at all, but this exact "every goto in the
+    /// label's own prefix targets the one label" shape is representable
+    /// with a labeled block (`render_compound_items`'s new transform):
+    /// wrap the prefix in `'seeyou: { .. }`, render each `goto seeyou;`
+    /// as `break 'seeyou;`, then continue past the closing brace exactly
+    /// where the label sat -- "falling out of the block" already reaches
+    /// the same place "falling through to the label" did in the
+    /// original. `targ = actor->subsector->sector->soundtarget;` needed
+    /// two new pieces: `World::subsectors` (a `SubsectorId`-indexed
+    /// table, the same per-level `Vec` shape as `sectors`/`sides`), and
+    /// a narrow `Member` arm resolving `X->subsector->sector` (a self
+    /// field whose *own* field is itself cross-reference-typed, the
+    /// generic fallback only ever checks one level) into `world[..]`
+    /// correctly. `sector_t.soundtarget` (`mobj_t*`) is exactly the same
+    /// "always `Mobj`-shaped when present" kind of value `self.target`/
+    /// `.tracer` already are, just reached through that chain instead of
+    /// directly off `self` -- `is_target_tracer_typed` recognizes the
+    /// whole chain by shape, so `targ` gets registered as an ordinary
+    /// target/tracer-style local alias (`collect_target_tracer_aliases`
+    /// needed no changes at all) and `targ->flags` dereferences through
+    /// the already-existing `Arena` lookup machinery unchanged. The one
+    /// remaining new piece: `targ && (targ->flags & MF_SHOOTABLE)` uses
+    /// the bare, non-negated local directly as a `&&` operand --
+    /// `render_binary_operand` only special-cased a `Member`/non-
+    /// comparison-`Binary` operand for this before, not a bare `Option`-
+    /// valued `Ident`, so `targ` alone would have rendered as plain
+    /// (invalid) `&&` operand text; fixed by routing it through
+    /// `render_bool_expr` too (which already had the `.is_some()` arm
+    /// `linetarget` needed). The switch/`S_StartSound` tail is
+    /// structurally identical to the already-translated `A_Scream`
+    /// (same three-case sound-selection `switch`, same `MT_SPIDER`/
+    /// `MT_CYBORG` full-volume check), reusing that machinery verbatim.
+    #[test]
+    fn test_a_look_renders_exactly() {
+        let field_types = field_types(&[
+            ("threshold", "i32"),
+            ("subsector", "SubsectorId"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("flags", "i32"),
+            ("info", "&'static MobjInfo"),
+        ]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Look", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Look(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             'seeyou: {\n        \
+             let mut targ;\n        \
+             actor.threshold = 0;\n        \
+             targ = world[world[actor.subsector].sector].soundtarget;\n        \
+             if targ.is_some() && (match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_SHOOTABLE) != 0 {\n            \
+             actor.target = targ;\n            \
+             if (actor.flags & MF_AMBUSH) != 0 {\n                \
+             if P_CheckSight(actor, actor.target) {\n                    \
+             break 'seeyou;\n                \
+             }\n            \
+             } else {\n                \
+             break 'seeyou;\n            \
+             }\n        \
+             }\n        \
+             if !P_LookForPlayers(actor, false) {\n            \
+             return;\n        \
+             }\n    \
+             }\n    \
+             if actor.info.seesound != 0 {\n        \
+             let mut sound;\n        \
+             match actor.info.seesound {\n            \
+             sfx_posit1 | sfx_posit2 | sfx_posit3 => {\n                \
+             sound = sfx_posit1 + P_Random() % 3;\n            \
+             }\n            \
+             sfx_bgsit1 | sfx_bgsit2 => {\n                \
+             sound = sfx_bgsit1 + P_Random() % 2;\n            \
+             }\n            \
+             _ => {\n                \
+             sound = actor.info.seesound;\n            \
+             }\n        \
+             }\n        \
+             if actor.r#type == MT_SPIDER || actor.r#type == MT_CYBORG {\n            \
+             S_StartSound(None, sound);\n        \
+             } else {\n            \
+             S_StartSound(actor, sound);\n        \
+             }\n    \
+             }\n    \
+             P_SetMobjState(actor, actor.info.seestate);\n\
              }"
         );
     }

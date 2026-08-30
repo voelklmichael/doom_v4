@@ -32,6 +32,11 @@
 //! new kind of parameter -- a plain `Option<Handle<Thinker>>` field,
 //! the same type `Mobj.target`/`.tracer` already use for "no target"
 //! vs. a real live thinker.
+//! `subsectors` joined once `A_Look`'s own `actor->subsector->sector->
+//! soundtarget` needed somewhere to resolve `Mobj.subsector`
+//! (`SubsectorId`) into, the same per-level `Vec`-backed shape as
+//! `sectors`/`sides` (`r_defs.h`'s `subsector_t` is bulk-allocated once
+//! per level, same as every other geometry struct).
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -47,6 +52,7 @@ pub fn render_world_struct() -> String {
 pub struct World {
     pub sectors: Vec<Sector>,
     pub sides: Vec<Side>,
+    pub subsectors: Vec<Subsector>,
     pub players: [Player; MAXPLAYERS],
     pub linetarget: Option<Handle<Thinker>>,
 }
@@ -77,6 +83,19 @@ impl std::ops::IndexMut<SideId> for World {
     }
 }
 
+impl std::ops::Index<SubsectorId> for World {
+    type Output = Subsector;
+    fn index(&self, id: SubsectorId) -> &Subsector {
+        &self.subsectors[id.0 as usize]
+    }
+}
+
+impl std::ops::IndexMut<SubsectorId> for World {
+    fn index_mut(&mut self, id: SubsectorId) -> &mut Subsector {
+        &mut self.subsectors[id.0 as usize]
+    }
+}
+
 impl std::ops::Index<PlayerId> for World {
     type Output = Player;
     fn index(&self, id: PlayerId) -> &Player {
@@ -102,12 +121,15 @@ mod tests {
         assert!(rendered.starts_with("pub struct World {"));
         assert!(rendered.contains("pub sectors: Vec<Sector>,"));
         assert!(rendered.contains("pub sides: Vec<Side>,"));
+        assert!(rendered.contains("pub subsectors: Vec<Subsector>,"));
         assert!(rendered.contains("pub players: [Player; MAXPLAYERS],"));
         assert!(rendered.contains("pub linetarget: Option<Handle<Thinker>>,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SideId> for World"));
+        assert!(rendered.contains("impl std::ops::Index<SubsectorId> for World"));
+        assert!(rendered.contains("impl std::ops::IndexMut<SubsectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<PlayerId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<PlayerId> for World"));
     }
