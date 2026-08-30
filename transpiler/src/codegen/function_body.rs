@@ -5154,6 +5154,30 @@ pub fn render_fn_with_scalar_param(
     )
 }
 
+/// `render_fn_with_scalar_param`'s own twin for `P_Thrust`'s third real
+/// parameter (`move: fixed_t`) -- see `render_fn_impl_with_two_scalar_
+/// params`'s own doc comment.
+pub fn render_fn_with_two_scalar_params(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    scalar_param_type: &str,
+    scalar_param2_type: &str,
+) -> Result<String, String> {
+    render_fn_impl_with_two_scalar_params(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        None,
+        Some(scalar_param_type),
+        Some(scalar_param2_type),
+    )
+}
+
 /// `render_fn`'s own `boolean`-returning twin -- `P_CheckMeleeRange`/
 /// `P_CheckMissileRange` (`p_enemy.c`) are `boolean P_Check...(mobj_t*
 /// actor)`, the same single-self-struct-parameter shape `render_fn`
@@ -5217,6 +5241,36 @@ fn render_fn_impl(
     return_type: Option<&str>,
     scalar_param_type: Option<&str>,
 ) -> Result<String, String> {
+    render_fn_impl_with_two_scalar_params(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        return_type,
+        scalar_param_type,
+        None,
+    )
+}
+
+/// `render_fn_impl`'s own twin for `P_Thrust (player_t* player, angle_t
+/// angle, fixed_t move)` (`p_user.c`) -- a *third* real parameter, one
+/// more plain scalar beyond what `scalar_param_type` alone (`A_PainShootSkull`'s
+/// own single extra parameter) supports. Every earlier `render_fn_impl`
+/// caller still goes through the original three-argument-shaped
+/// `render_fn_impl` above, now a thin wrapper passing `None` for the new
+/// third slot -- no existing call site's behavior changes.
+#[allow(clippy::too_many_arguments)]
+fn render_fn_impl_with_two_scalar_params(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+    scalar_param_type: Option<&str>,
+    scalar_param2_type: Option<&str>,
+) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
     let f = find_function_def(&unit.items, fn_name)
         .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
@@ -5233,6 +5287,17 @@ fn render_fn_impl(
         .map(|ty| {
             let name = nth_param_name(f, 1)
                 .ok_or_else(|| format!("{fn_name}: second parameter has no plain name"))?;
+            Ok::<_, String>((name, ty))
+        })
+        .transpose()?;
+    // `P_Thrust`'s own third parameter (`move: fixed_t`) -- the identical
+    // "caller supplies the type, the name comes from the real C source"
+    // pattern as `scalar_param` just above, one slot further out
+    // (`nth_param_name(f, 2)`).
+    let scalar_param2 = scalar_param2_type
+        .map(|ty| {
+            let name = nth_param_name(f, 2)
+                .ok_or_else(|| format!("{fn_name}: third parameter has no plain name"))?;
             Ok::<_, String>((name, ty))
         })
         .transpose()?;
@@ -5489,11 +5554,48 @@ fn render_fn_impl(
     };
     let extra_params = format!("{thinkers_part}{handle_part}");
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    // `P_Thrust`'s own second scalar parameter is literally named `move`
+    // -- a real Rust keyword (used for closures), needing the same raw-
+    // identifier escape `render_params` already applies to every
+    // `render_trigger_fn`/`render_world_fn`/`render_pure_fn` parameter
+    // (`rust_field_name`) -- this signature-building path had never
+    // needed it before (every earlier scalar parameter, `angle`/`num`/
+    // `armortype`/`power`/`card`, happens not to collide). A bare
+    // reference to it inside the body already escapes correctly on its
+    // own, through `render_expr`'s own generic `Expr::Ident` fallback
+    // (`rust_ident_name`, unrelated to this variable) -- only the
+    // signature text built here was missing the same treatment.
+    //
+    // `P_Thrust`'s own `angle >>= ANGLETOFINESHIFT;` reassigns its second
+    // scalar parameter in place -- the same "a reassigned parameter needs
+    // `mut`" gap `render_params`'s own `body_reassigns_ident` check
+    // already covers for `render_trigger_fn`/etc. (`P_AproxDistance`'s
+    // own `dx = abs(dx);`), never needed here before since no earlier
+    // `scalar_param` was ever reassigned.
     let scalar_part = scalar_param
-        .map(|(name, ty)| format!(", {name}: {ty}"))
+        .map(|(name, ty)| {
+            let mut_prefix = if body_reassigns_ident(&f.body.items, &name) {
+                "mut "
+            } else {
+                ""
+            };
+            Ok::<_, String>(format!(", {mut_prefix}{}: {ty}", rust_field_name(&name)?))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let scalar_part2 = scalar_param2
+        .map(|(name, ty)| {
+            let mut_prefix = if body_reassigns_ident(&f.body.items, &name) {
+                "mut "
+            } else {
+                ""
+            };
+            Ok::<_, String>(format!(", {mut_prefix}{}: {ty}", rust_field_name(&name)?))
+        })
+        .transpose()?
         .unwrap_or_default();
     Ok(format!(
-        "pub fn {fn_name}({param_name}: &mut {self_rust_type}{scalar_part}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
+        "pub fn {fn_name}({param_name}: &mut {self_rust_type}{scalar_part}{scalar_part2}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -15802,6 +15904,59 @@ pub fn P_GivePower(player: &mut Player, power: i32, world: &mut World, thinkers:
     }
     player.powers[power as usize] = 1;
     return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_Thrust` (`p_user.c`) -- a genuinely *third* real parameter
+    /// (`fixed_t move`, alongside `player`/`angle_t angle`), one more than
+    /// `scalar_param_type` alone (`A_PainShootSkull`'s own single extra
+    /// parameter) supports -- a new `render_fn_impl_with_two_scalar_
+    /// params`/`render_fn_with_two_scalar_params` pair (a thin wrapper,
+    /// every earlier `render_fn_impl` caller unaffected, now itself a
+    /// thin wrapper passing `None` for the new third slot). Two more
+    /// small, real gaps surfaced fixing this up for real: (1) `move` is a
+    /// genuine Rust keyword -- every earlier scalar parameter (`angle`/
+    /// `num`/`armortype`/`power`/`card`) happened not to collide, so
+    /// `render_fn_impl`'s own signature-building path had never needed
+    /// `rust_field_name`'s escape at all (unlike `render_params`, which
+    /// already applied it to every `render_trigger_fn`/etc. parameter);
+    /// a bare body reference to `move` already escaped correctly on its
+    /// own, through `render_expr`'s unrelated generic `Expr::Ident`
+    /// fallback. (2) `angle >>= ANGLETOFINESHIFT;` reassigns its own
+    /// scalar parameter -- the identical "needs `mut`" gap `render_params`'s
+    /// own `body_reassigns_ident` check already covers elsewhere
+    /// (`P_AproxDistance`'s `dx = abs(dx);`), never needed by a `render_
+    /// fn_impl`-family scalar parameter before (confirmed safe to add
+    /// generally, not just for this one function, by re-running the full
+    /// suite -- no earlier scalar parameter is ever reassigned). `player->
+    /// mo->momx += FixedMul(move,finecosine[angle]);` needed nothing new
+    /// beyond what's already proven: `is_self_bare_handle_field`'s write
+    /// arm (`P_GiveBody`'s own `player.mo` precedent) composes with
+    /// `FixedMul`'s own already-`FixedT`-valued bare-call recognition
+    /// (`A_Tracer`'s precedent) and `finecosine`/`finesine`'s own by-name
+    /// `as usize` index cast. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written `Player`/
+    /// `Mobj`/`World`/`Handle`/`Arena`/`Thinker`/`FixedT` stand-in -- zero
+    /// errors. `test_p_thrust_renders_exactly`.
+    #[test]
+    fn test_p_thrust_renders_exactly() {
+        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let rendered = render_fn_with_two_scalar_params(
+            &corpus_dir(),
+            "p_user.c",
+            "P_Thrust",
+            "Player",
+            &field_types,
+            "u32",
+            "FixedT",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_Thrust(player: &mut Player, mut angle: u32, r#move: FixedT, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    angle >>= ANGLETOFINESHIFT;
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momx += FixedMul(r#move, finecosine[angle as usize]); };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momy += FixedMul(r#move, finesine[angle as usize]); };
 }";
         assert_eq!(rendered, expected);
     }
