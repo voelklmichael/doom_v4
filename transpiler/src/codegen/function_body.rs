@@ -291,6 +291,32 @@ struct FnBodyContext<'a> {
     /// so the alias is a plain rename, not a dereference. `None`
     /// everywhere else.
     thinker_scan_alias: Option<(&'a str, &'a str)>,
+    /// Set only while rendering the real body inside a *for-loop-shaped*
+    /// thinker scan (`A_BrainAwake`'s own `for (thinker = thinkercap.next;
+    /// ..) { if (!tagcheck) continue; m = (mobj_t*)thinker; <rest> }`,
+    /// `render_thinker_list_scan_for`'s own doc comment) -- `(bind_var,
+    /// handle_var)`, e.g. `("m", "handle")`. Unlike `thinker_scan_alias`
+    /// (a bare rename to the loop's own `&Mobj` match binding, for
+    /// ordinary field access), this is checked only at the one write
+    /// shape that actually needs the scanned thinker's own `Handle`
+    /// *value*, not a dereference through it: `braintargets[numbraintargets]
+    /// = m;` needs `Handle<Thinker>` (captured by `thinkers.iter_with_
+    /// handle()`, `Arena::iter()`'s own plain-`&T` yield has none to give)
+    /// to store into `World::braintargets`, an `[Option<Handle<Thinker>>;
+    /// 32]`. Checked in `render_expr_stmt`'s own general assignment
+    /// fallback (a bare RHS matching `bind_var` renders `Some(handle_var)`
+    /// instead of the ordinary `thinker_scan_alias` rename), not in
+    /// `render_expr`'s `Expr::Ident` arm alongside `thinker_scan_alias`
+    /// itself -- the same bare identifier means two different things
+    /// depending on whether it's a `Member` base (`m->type`, wants the
+    /// plain `&Mobj`) or a bare RHS value (`= m`, wants the handle), a
+    /// distinction `Expr::Ident`'s own rendering has no way to make since
+    /// both reach it through the identical call shape; checking the
+    /// specific write-statement shape first sidesteps the ambiguity
+    /// instead of trying to resolve it at the identifier level. `None`
+    /// everywhere else, including inside `render_thinker_list_scan`'s own
+    /// (separate, `Arena::iter()`-based) while-loop-shaped scan.
+    thinker_scan_handle_alias: Option<(&'a str, &'a str)>,
     /// Set only while rendering the statements a forward `goto` jumps
     /// *over* (the block `render_compound_items`'s own goto-to-common-
     /// label transform wraps in a Rust labeled block) -- the label name
@@ -2519,6 +2545,78 @@ fn is_thinker_list_scan_while<'a>(stmt: &'a Stmt, var: &str) -> Option<&'a Stmt>
     matches_thinkercap.then_some(body.as_ref())
 }
 
+/// `for (var = thinkercap.next; var != &thinkercap; var = var->next) {
+/// body }` -- `A_BrainAwake`/`A_KeenDie`'s own for-loop-shaped intrusive-
+/// list scan, a second real AST shape alongside `is_thinker_list_scan_
+/// init`/`_while`'s separate-statement form (`A_PainShootSkull`'s own
+/// `curvar = thinkercap.next; while (curvar != &thinkercap) { .. }`) --
+/// C89 allows either, and the corpus genuinely uses both. Checks all
+/// three of the `for`'s own clauses match this exact idiom (init assigns
+/// `thinkercap.next`, cond compares against `&thinkercap`, step advances
+/// `var->next`) before returning the loop variable's own name and body,
+/// the same "confirm every real piece, not just the recognizable shell"
+/// discipline `is_thinker_list_scan_init`/`_while` already established.
+fn is_thinker_list_scan_for(stmt: &Stmt) -> Option<(&str, &Stmt)> {
+    let Stmt::For {
+        init: Some(ForInit::Expr(init_expr)),
+        cond: Some(cond),
+        step: Some(step),
+        body,
+    } = stmt
+    else {
+        return None;
+    };
+    let Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: init_lhs,
+        rhs: init_rhs,
+    } = init_expr
+    else {
+        return None;
+    };
+    let Expr::Ident(var) = init_lhs.as_ref() else {
+        return None;
+    };
+    let init_ok = matches!(init_rhs.as_ref(), Expr::Member { base, field, arrow: false }
+        if field == "next" && matches!(base.as_ref(), Expr::Ident(n) if n == "thinkercap"));
+    if !init_ok {
+        return None;
+    }
+    let Expr::Binary {
+        op: BinaryOp::Ne,
+        lhs: cond_lhs,
+        rhs: cond_rhs,
+    } = cond
+    else {
+        return None;
+    };
+    if !matches!(cond_lhs.as_ref(), Expr::Ident(n) if n == var) {
+        return None;
+    }
+    let cond_ok = matches!(cond_rhs.as_ref(), Expr::Unary { op: UnaryOp::AddrOf, expr }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == "thinkercap"));
+    if !cond_ok {
+        return None;
+    }
+    let Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: step_lhs,
+        rhs: step_rhs,
+    } = step
+    else {
+        return None;
+    };
+    if !matches!(step_lhs.as_ref(), Expr::Ident(n) if n == var) {
+        return None;
+    }
+    let step_ok = matches!(step_rhs.as_ref(), Expr::Member { base, field, arrow: true }
+        if field == "next" && matches!(base.as_ref(), Expr::Ident(n) if n == var));
+    if !step_ok {
+        return None;
+    }
+    Some((var, body))
+}
+
 /// `curvar->function.acp1 == (actionf_p1)P_MobjThinker` -- the tag check
 /// every real corpus scan uses to confirm a raw `thinker_t*` is actually
 /// a live `mobj_t` before casting to it. Stripped rather than rendered:
@@ -2527,14 +2625,28 @@ fn is_thinker_list_scan_while<'a>(stmt: &'a Stmt, var: &str) -> Option<&'a Stmt>
 /// 03_TRANSPILER.md`'s Doom Action Pointers/Thinker entries) -- there's
 /// no C vtable left to compare a function pointer against.
 fn is_mobj_thinker_tag_check(expr: &Expr, var: &str) -> bool {
+    is_mobj_thinker_tag_check_op(expr, var, BinaryOp::Eq)
+}
+
+/// `is_mobj_thinker_tag_check`'s own generalization: `A_BrainAwake`'s own
+/// for-loop-shaped scan (`render_thinker_list_scan_for`) guards its body
+/// with the *negated* check (`if (thinker->function.acp1 !=
+/// (actionf_p1)P_MobjThinker) continue;`, `!=` rather than `==`) --
+/// otherwise byte-for-byte the same shape, so the comparison operator is
+/// threaded through as a parameter instead of duplicating the whole
+/// `Member`/`Cast` match a second time.
+fn is_mobj_thinker_tag_check_op(expr: &Expr, var: &str, op: BinaryOp) -> bool {
     let Expr::Binary {
-        op: BinaryOp::Eq,
+        op: actual_op,
         lhs,
         rhs,
     } = expr
     else {
         return false;
     };
+    if *actual_op != op {
+        return false;
+    }
     let Expr::Member {
         base,
         field,
@@ -2672,6 +2784,94 @@ fn render_thinker_list_scan(
     lines.push(format!("{}if {cond_text} {{", indent(depth + 2)));
     lines.extend(render_stmt(then_branch, &inner_ctx, depth + 3)?);
     lines.push(format!("{}}}", indent(depth + 2)));
+    lines.push(format!("{}}}", indent(depth + 1)));
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
+}
+
+/// Renders `for (var = thinkercap.next; var != &thinkercap; var =
+/// var->next) { if (tagcheck) continue; bind_var = (mobj_t*)var; <rest>
+/// }` -- `A_BrainAwake`'s own idiom, `render_thinker_list_scan`'s sibling
+/// for the for-loop-shaped scan (`is_thinker_list_scan_for`) with the
+/// continue-based tag-check-plus-cast-assignment body (rather than
+/// `render_thinker_list_scan`'s single combined `if (tagcheck && cond)
+/// stmt;`) -- both real, distinct AST shapes the corpus actually uses,
+/// confirmed by direct read rather than assumed to be the same idiom
+/// twice. `Arena::iter_with_handle()` (not `iter()`) supplies both the
+/// dereferenced `&Mobj` *and* its own `Handle`, since `<rest>` needs the
+/// latter too (`FnBodyContext::thinker_scan_handle_alias`'s own doc
+/// comment) -- `braintargets[numbraintargets] = m;` stores the scanned
+/// thinker's own handle, not a borrowed reference to its value.
+fn render_thinker_list_scan_for(
+    var: &str,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let Stmt::Compound(c) = body else {
+        return Err(
+            "render_thinker_list_scan_for: only a compound loop body is supported so far"
+                .to_string(),
+        );
+    };
+    let [
+        BlockItem::Stmt(Stmt::If {
+            cond: tag_cond,
+            then_branch,
+            else_branch: None,
+        }),
+        BlockItem::Stmt(Stmt::Expr(Some(Expr::Assign {
+            op: AssignOp::Assign,
+            lhs: bind_lhs,
+            rhs: bind_rhs,
+        }))),
+        rest @ ..,
+    ] = c.items.as_slice()
+    else {
+        return Err(
+            "render_thinker_list_scan_for: expected `if (tagcheck) continue; bind_var = (mobj_t*)var;` as the loop body's first two statements"
+                .to_string(),
+        );
+    };
+    if !matches!(then_branch.as_ref(), Stmt::Continue) {
+        return Err(
+            "render_thinker_list_scan_for: expected the tag check's own body to be a bare `continue;`"
+                .to_string(),
+        );
+    }
+    if !is_mobj_thinker_tag_check_op(tag_cond, var, BinaryOp::Ne) {
+        return Err("render_thinker_list_scan_for: unrecognized tag check".to_string());
+    }
+    let Expr::Ident(bind_var) = bind_lhs.as_ref() else {
+        return Err(
+            "render_thinker_list_scan_for: expected a bare local as the cast-assignment's own LHS"
+                .to_string(),
+        );
+    };
+    let cast_ok = matches!(bind_rhs.as_ref(), Expr::Cast { expr, .. }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == var));
+    if !cast_ok {
+        return Err(
+            "render_thinker_list_scan_for: expected `bind_var = (mobj_t*)var;` as the loop body's second statement"
+                .to_string(),
+        );
+    }
+    let inner_ctx = FnBodyContext {
+        thinker_scan_alias: Some((bind_var, "m")),
+        thinker_scan_handle_alias: Some((bind_var, "handle")),
+        active_goto_label: None,
+        active_for_continue_step: None,
+        ..*ctx
+    };
+    let mut lines = vec![format!(
+        "{}for (handle, thinker) in thinkers.iter_with_handle() {{",
+        indent(depth)
+    )];
+    lines.push(format!(
+        "{}if let Thinker::Mobj(m) = thinker {{",
+        indent(depth + 1)
+    ));
+    lines.extend(render_compound_items(rest, &inner_ctx, depth + 2)?);
     lines.push(format!("{}}}", indent(depth + 1)));
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
@@ -3328,8 +3528,25 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let lhs_is_option_handle_global = matches!(lhs.as_ref(), Expr::Ident(n)
             if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>"));
         let rhs_is_self = matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param);
+        // `braintargets[numbraintargets] = m;` (`A_BrainAwake`) -- storing
+        // a scanned thinker's own `Handle<Thinker>` (`FnBodyContext::
+        // thinker_scan_handle_alias`'s own doc comment covers why this
+        // can't be resolved at the identifier level the way `thinker_scan_
+        // alias` itself is). Checked directly against the raw RHS `Expr`,
+        // not the already-rendered `rhs_text` (which would already show
+        // `"m"`, the ordinary field-access rename `thinker_scan_alias`
+        // gives it -- too late to tell apart from a real plain-`&Mobj`
+        // use once it's just text).
+        let rhs_is_thinker_scan_handle_alias = ctx
+            .thinker_scan_handle_alias
+            .is_some_and(|(from, _)| matches!(rhs.as_ref(), Expr::Ident(n) if n == from));
         let rhs_text = if lhs_is_specialdata && rhs_is_null {
             "None".to_string()
+        } else if rhs_is_thinker_scan_handle_alias {
+            let (_, handle_var) = ctx
+                .thinker_scan_handle_alias
+                .expect("guarded by rhs_is_thinker_scan_handle_alias");
+            format!("Some({handle_var})")
         } else if lhs_is_option_handle_global && rhs_is_self {
             // Unlike `rhs_is_handle_local` just below (a real `Handle<
             // Thinker>`-valued local, correctly used bare), `rhs_text`
@@ -3548,6 +3765,31 @@ fn render_compound_items(
             i += 2;
             continue;
         }
+        // `A_BrainAwake`'s own redundant `thinker = thinkercap.next;`
+        // immediately before the real `for` loop -- dead code (the
+        // for's own init overwrites it before it's ever read), dropped
+        // silently rather than rendered.
+        if let BlockItem::Stmt(redundant_init) = &items[i]
+            && let Some(redundant_var) = is_thinker_list_scan_init(redundant_init)
+            && let Some(BlockItem::Stmt(for_stmt)) = items.get(i + 1)
+            && let Some((var, body)) = is_thinker_list_scan_for(for_stmt)
+            && redundant_var == var
+        {
+            out.extend(render_thinker_list_scan_for(var, body, ctx, depth)?);
+            i += 2;
+            continue;
+        }
+        // `A_BrainAwake`'s own for-loop-shaped scan (`is_thinker_list_
+        // scan_for`/`render_thinker_list_scan_for`'s own doc comments),
+        // without the redundant pre-statement the case just above
+        // consumes.
+        if let BlockItem::Stmt(for_stmt) = &items[i]
+            && let Some((var, body)) = is_thinker_list_scan_for(for_stmt)
+        {
+            out.extend(render_thinker_list_scan_for(var, body, ctx, depth)?);
+            i += 1;
+            continue;
+        }
         if let BlockItem::Decl(d) = &items[i]
             && d.declarators.len() == 1
             && declarator_name(&d.declarators[0].declarator).is_some_and(|n| scan_vars.contains(&n))
@@ -3577,6 +3819,30 @@ fn thinker_scan_var_names(items: &[BlockItem]) -> HashSet<String> {
             && is_thinker_list_scan_while(while_stmt, var).is_some()
         {
             names.insert(var.to_string());
+        }
+    }
+    // `A_BrainAwake`'s own for-loop-shaped scan needs *two* declarations
+    // dropped, not just one: the loop variable itself (`thinker`, fully
+    // absorbed into `thinkers.iter_with_handle()`'s own binding), and the
+    // cast-assignment's own bind variable (`m`, fully absorbed into the
+    // `if let Thinker::Mobj(m) = thinker` pattern match) -- both would
+    // otherwise render as orphaned `let mut` declarations `render_thinker_
+    // list_scan_for` itself never assigns or reads, the identical
+    // "provably dead once the scan swallows it" reasoning as the while-
+    // loop-shaped scan's own single variable.
+    for item in items {
+        let BlockItem::Stmt(stmt) = item else {
+            continue;
+        };
+        if let Some((var, body)) = is_thinker_list_scan_for(stmt) {
+            names.insert(var.to_string());
+            if let Stmt::Compound(c) = body
+                && let Some(BlockItem::Stmt(Stmt::Expr(Some(Expr::Assign { lhs, .. })))) =
+                    c.items.get(1)
+                && let Expr::Ident(bind_var) = lhs.as_ref()
+            {
+                names.insert(bind_var.to_string());
+            }
         }
     }
     names
@@ -4062,6 +4328,21 @@ fn render_fn_impl(
         &spawn_mobj_locals,
         &extra_cross_ref_idents,
     );
+    // `A_BrainAwake`'s own for-loop-shaped thinker scan
+    // (`render_thinker_list_scan_for`) always renders a real `thinkers.
+    // iter_with_handle()` call, unconditionally needing the read-only
+    // `thinkers: &Arena<Thinker>` parameter the same way `needs_target_
+    // deref` already triggers it -- nothing computed this far even looks
+    // for this shape (it predates it entirely), so without this check the
+    // signature would silently omit `thinkers` even though the body it's
+    // generated from calls straight through it (a real "undefined
+    // variable" `rustc` rejection, confirmed by rendering the naive
+    // version first). Only a top-level scan is checked, matching every
+    // real corpus example so far.
+    let needs_thinker_scan_for =
+        f.body.items.iter().any(
+            |item| matches!(item, BlockItem::Stmt(s) if is_thinker_list_scan_for(s).is_some()),
+        );
     // `A_SpawnFly`'s own idiom (self-removal *and* target-alias
     // dereferencing/spawned-mobj writes in the same body) is the first
     // real function needing both at once -- previously rejected outright.
@@ -4104,6 +4385,7 @@ fn render_fn_impl(
         bool_locals: &bool_locals,
         self_removal_ident,
         thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
     };
@@ -4119,7 +4401,7 @@ fn render_fn_impl(
         ""
     } else if needs_spawn_mut || composed_self_removal || needs_target_write {
         ", thinkers: &mut Arena<Thinker>"
-    } else if needs_target_deref || needs_linetarget {
+    } else if needs_target_deref || needs_linetarget || needs_thinker_scan_for {
         ", thinkers: &Arena<Thinker>"
     } else {
         ""
@@ -4204,6 +4486,7 @@ pub fn render_weapon_fn(
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &angle_t_locals,
         thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
@@ -5651,6 +5934,7 @@ pub fn render_spawn_fn(
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
@@ -6012,6 +6296,7 @@ pub fn render_trigger_fn(
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
@@ -6734,6 +7019,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -6828,6 +7114,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -6882,6 +7169,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -6957,6 +7245,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -7119,6 +7408,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -8276,6 +8566,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -8346,6 +8637,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -8442,6 +8734,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -8518,6 +8811,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -8595,6 +8889,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -8677,6 +8972,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -10134,6 +10430,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -10890,6 +11187,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             angle_t_locals: &HashSet::new(),
             self_removal_ident: "arena",
             thinker_scan_alias: None,
+            thinker_scan_handle_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
@@ -11934,6 +12232,87 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if actor.info.activesound != 0 && P_Random() < 3 {\n        \
              S_StartSound(actor, actor.info.activesound);\n    \
              }\n\
+             }"
+        );
+    }
+
+    /// `A_BrainAwake` (`p_enemy.c`) -- the last of the four this whole
+    /// section's `Arena<Thinker>` iteration entry originally named, and
+    /// the one requiring genuinely new capability, not just gap-closing:
+    /// its own scan is a *third* real AST shape (`is_thinker_list_scan_
+    /// for`), alongside `A_PainShootSkull`'s separate-statement `curvar =
+    /// thinkercap.next; while (..)` form, with a *different* body shape
+    /// too (`if (!tagcheck) continue; m = (mobj_t*)thinker; <rest>`,
+    /// rather than `render_thinker_list_scan`'s single combined `if
+    /// (tagcheck && cond) stmt;`) -- both confirmed by direct read, not
+    /// assumed to be the same idiom wearing a different hat.
+    /// `is_thinker_list_scan_for` checks all three of the `for`'s own
+    /// clauses against the exact idiom (`is_mobj_thinker_tag_check_op`
+    /// generalizes the existing tag-check matcher to the negated `!=`
+    /// form this shape's own guard uses); `render_thinker_list_scan_for`
+    /// renders the body through `thinkers.iter_with_handle()`, a new,
+    /// purely additive `Arena` method (`iter`'s own existing callers keep
+    /// compiling unchanged) yielding each live slot's own `Handle<T>`
+    /// alongside the borrowed reference `iter` alone already gave --
+    /// needed because `braintargets[numbraintargets] = m;` stores the
+    /// scanned thinker's own *handle*, not a borrowed value, the one
+    /// real reason this function couldn't just reuse `render_thinker_
+    /// list_scan`'s existing `Arena::iter()`-based rendering. The
+    /// redundant `thinker = thinkercap.next;` immediately before the real
+    /// `for` loop (dead in the original C too, immediately overwritten by
+    /// the for's own init) is silently dropped, the same "confirmed dead
+    /// by direct read" treatment `thinker_scan_var_names` already gives
+    /// a lone scan variable, extended here to drop *two* declarations
+    /// (`thinker` and `m`) instead of one. **The one genuinely new
+    /// mechanism**: `m` means two different things depending on how it's
+    /// used -- `m->type` wants the plain `&Mobj` (`thinker_scan_alias`'s
+    /// own existing rename, unchanged), but `braintargets[numbraintargets]
+    /// = m;` wants the `Handle` `iter_with_handle` just captured -- a
+    /// distinction `Expr::Ident`'s own rendering has no way to make
+    /// (both reach it through the identical bare-identifier call shape),
+    /// so `FnBodyContext::thinker_scan_handle_alias` is checked instead at
+    /// the one *write statement* shape that actually needs it, in `render_
+    /// expr_stmt`'s own assignment dispatch, sidestepping the ambiguity
+    /// rather than trying to resolve it locally. A **second-order gap**
+    /// this surfaced, the same class as `A_VileChase`'s own: nothing in
+    /// `render_fn_impl`'s signature-decision logic predates this new scan
+    /// shape at all, so without an explicit `needs_thinker_scan_for` check
+    /// the function's signature silently omitted `thinkers` even though
+    /// the body it generates calls straight through it -- confirmed a
+    /// real "undefined variable" `rustc` rejection by rendering the naive
+    /// version first, fixed by folding it into the same read-only-`thinkers`
+    /// disjunct `needs_target_deref`/`needs_linetarget` already use.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Arena`/`Handle`/`Mobj`/`World`/
+    /// `Thinker` stand-in (including a real `iter_with_handle`
+    /// implementation matching `runtime/arena.rs`'s own verbatim) and a
+    /// stub `S_StartSound` -- zero errors. `test_a_brain_awake_renders_
+    /// exactly`. 401/401 tests passing.
+    #[test]
+    fn test_a_brain_awake_renders_exactly() {
+        let field_types = field_types(&[]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainAwake",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainAwake(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             world.numbraintargets = 0;\n    \
+             world.braintargeton = 0;\n    \
+             for (handle, thinker) in thinkers.iter_with_handle() {\n        \
+             if let Thinker::Mobj(m) = thinker {\n            \
+             if m.r#type == MT_BOSSTARGET {\n                \
+             world.braintargets[world.numbraintargets as usize] = Some(handle);\n                \
+             world.numbraintargets += 1;\n            \
+             }\n        \
+             }\n    \
+             }\n    \
+             S_StartSound(None, sfx_bossit);\n\
              }"
         );
     }

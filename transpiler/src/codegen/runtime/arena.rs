@@ -159,6 +159,24 @@ impl<T> Arena<T> {
         self.slots.iter().filter_map(|slot| slot.as_ref())
     }
 
+    /// `iter`'s own sibling for the one real corpus shape `iter` alone
+    /// can't serve: `A_BrainAwake`'s own scan doesn't just read each live
+    /// thinker, it *records* the ones matching `MT_BOSSTARGET` into
+    /// `braintargets[]` for `A_BrainSpit` to fire at later -- that needs
+    /// each entry's own `Handle<T>`, not just a borrowed reference to its
+    /// value, and `iter` never had a reason to hand one out before now.
+    /// Additive rather than a breaking change to `iter` itself (every
+    /// existing caller keeps compiling against the plain `&T` shape
+    /// unchanged) -- indices line up with `iter`'s own since both walk
+    /// the same `self.slots`, in the same order, for the same
+    /// "tombstoned slots stay permanently `None`" reason documented above.
+    pub fn iter_with_handle(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|v| (Handle::new(i as u32), v)))
+    }
+
     /// One pass over every live slot, in insertion order -- mirrors
     /// `P_RunThinkers`' single forward traversal. `f` gets the item's own
     /// value, its handle, and the arena itself, so it can remove or insert
@@ -320,6 +338,21 @@ mod tests {
         arena.remove(a);
         let seen: Vec<i32> = arena.iter().copied().collect();
         assert_eq!(seen, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_iter_with_handle_yields_handles_get_can_look_back_up() {
+        let mut arena: Arena<i32> = Arena::new();
+        let a = arena.insert(1);
+        let b = arena.insert(2);
+        arena.remove(a);
+        let c = arena.insert(3);
+        let seen: Vec<(Handle<i32>, i32)> =
+            arena.iter_with_handle().map(|(h, v)| (h, *v)).collect();
+        assert_eq!(seen, vec![(b, 2), (c, 3)]);
+        for (h, v) in seen {
+            assert_eq!(arena.get(h), Some(&v));
+        }
     }
 
     #[test]
