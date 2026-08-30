@@ -852,6 +852,53 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (lhs_text, _) = render_expr(lhs, ctx)?;
             Ok((format!("{lhs_text}.0 as i32"), false))
         }
+        // `-ANG90/20` (`A_Saw`'s own angle-adjustment idiom, `p_pspr.c`)
+        // -- `ANGxx` macros render as opaque `u32`-typed pass-through
+        // text (matching every other place one's used directly against
+        // an `angle_t` field), so a bare Rust `-` on one doesn't even
+        // compile (`u32` has no `Neg` impl at all, the gap this renderer
+        // has carried since the `A_Punch` entry). Naively wrapping-
+        // negating the `u32` bit pattern *first* and then dividing as
+        // unsigned would be a real behavioral bug, not just a style
+        // choice: confirmed by hand-computing both paths and finding
+        // they diverge (dividing the wrapped-unsigned bit pattern by 20
+        // gives a completely different number than dividing the signed
+        // `-1073741824` by 20 and reinterpreting *that* as unsigned
+        // afterward) -- C computes `-ANG90` as a genuinely signed `int`
+        // (`ANG90` itself is an untyped literal macro) and divides in
+        // the signed domain, truncating toward zero, *before* the
+        // implicit unsigned conversion that only happens once this
+        // value meets a real `angle_t` operand at the comparison site.
+        // A second, independent real corpus example confirms this is a
+        // deliberate idiom, not a one-off: `p_user.c`'s own `delta >
+        // (unsigned)-ANG5` reinterprets the exact same way, just with an
+        // explicit C cast instead of relying on the implicit conversion
+        // this one does -- so this renders by staying in the signed
+        // domain through the cast and the division, only converting to
+        // `u32` at the very end, matching the signed division C itself
+        // performs. Scoped narrowly to a numerator that's a bare
+        // negated identifier by an `ANG`-prefixed name (this codebase's
+        // usual "hand-match the one real corpus shape" style, the same
+        // as `twoSided`/`getSide` -- there's no general per-identifier
+        // type registry here to say `ANG*` names are `u32` some other
+        // way) divided by a literal.
+        Expr::Binary {
+            op: BinaryOp::Div,
+            lhs: div_lhs,
+            rhs: div_rhs,
+        } if matches!(div_rhs.as_ref(), Expr::IntLiteral(_))
+            && matches!(div_lhs.as_ref(), Expr::Unary { op: UnaryOp::Minus, expr }
+                if matches!(expr.as_ref(), Expr::Ident(n) if n.starts_with("ANG"))) =>
+        {
+            let Expr::Unary { expr: neg_expr, .. } = div_lhs.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let Expr::Ident(name) = neg_expr.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let (divisor_text, _) = render_expr(div_rhs, ctx)?;
+            Ok((format!("(-({name} as i32) / {divisor_text}) as u32"), false))
+        }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
             let lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
@@ -9960,6 +10007,69 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n    \
              }\n    \
              P_SetMobjState(actor, actor.info.seestate);\n\
+             }"
+        );
+    }
+
+    /// `A_Saw` (`p_pspr.c`) -- closes the `-ANG90/20` gap this module's
+    /// docs had carried since the `A_Punch` entry (`render_binary_
+    /// operand`'s own doc comment there: "no existing corpus precedent
+    /// establishes how this should render"). Investigated first, not
+    /// guessed at: a naive `u32::wrapping_neg` would be wrong, not just
+    /// unproven -- hand-computing both paths shows dividing the wrapped-
+    /// unsigned bit pattern by 20 gives a different number than dividing
+    /// the *signed* `-1073741824` by 20 and reinterpreting *that* as
+    /// unsigned afterward, and `p_user.c`'s own `delta > (unsigned)
+    /// -ANG5` (found by grepping the whole corpus for `-ANG`, not
+    /// assumed to be the only example) confirms this "stay signed
+    /// through the division, convert to `u32` only at the final
+    /// comparison" reading is a deliberate idiom in the corpus itself,
+    /// not a one-off. Everything else in the function reuses machinery
+    /// already proven by `A_Punch` verbatim: `player->mo->angle`/`.x`/
+    /// `.y` reads and writes (`is_self_bare_handle_field`), the bare
+    /// `angle_t angle;` local's own compound-assign cast
+    /// (`angle_t_locals`), `linetarget` truthiness and dereferencing.
+    /// `angle - player->mo->angle`, compared against my new `-ANG90/20`
+    /// arm or a plain (positive) `ANG90/20`/`ANG90/21` division, needed
+    /// no changes to the comparison machinery itself -- the new arm
+    /// slots into the existing generic `Binary` operand rendering with
+    /// zero special-casing at the comparison level.
+    #[test]
+    fn test_a_saw_renders_exactly() {
+        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Saw", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Saw(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut angle;\n    \
+             let mut damage;\n    \
+             let mut slope;\n    \
+             damage = 2 * (P_Random() % 10 + 1);\n    \
+             angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n    \
+             angle += (P_Random() - P_Random() << 18) as u32;\n    \
+             slope = P_AimLineAttack(player.mo, angle, MELEERANGE + 1);\n    \
+             P_LineAttack(player.mo, angle, MELEERANGE + 1, slope, damage);\n    \
+             if world.linetarget.is_none() {\n        \
+             S_StartSound(player.mo, sfx_sawful);\n        \
+             return;\n    \
+             }\n    \
+             S_StartSound(player.mo, sfx_sawhit);\n    \
+             angle = R_PointToAngle2(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
+             if angle - match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } > ANG180 {\n        \
+             if angle - match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } < (-(ANG90 as i32) / 20) as u32 {\n            \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle = angle + ANG90 / 21; };\n        \
+             } else {\n            \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle -= ANG90 / 20; };\n        \
+             }\n    \
+             } else {\n        \
+             if angle - match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } > ANG90 / 20 {\n            \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle = angle - ANG90 / 21; };\n        \
+             } else {\n            \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle += ANG90 / 20; };\n        \
+             }\n    \
+             }\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.flags |= MF_JUSTATTACKED; };\n\
              }"
         );
     }
