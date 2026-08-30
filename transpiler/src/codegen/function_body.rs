@@ -184,6 +184,21 @@ struct FnBodyContext<'a> {
     /// local rather than a field. Empty for every context that isn't a
     /// plain tick/weapon-action function's own top-level locals.
     angle_t_locals: &'a HashSet<String>,
+    /// Names of `self_param`'s own sibling locals declared as a plain
+    /// `fixed_t` at the function's top level (`collect_fixed_t_locals`) --
+    /// `P_CheckMissileRange`'s own `dist` (unlike `A_SkullAttack`'s own
+    /// same-named local, genuinely declared `fixed_t dist;` in the C
+    /// source, not plain `int`). This project's `FixedT` newtype
+    /// deliberately has no `PartialOrd<i32>`/assignment-from-`i32` (the
+    /// whole point of the newtype is catching an accidental mix at compile
+    /// time, per `runtime/fixed.rs`'s own doc comment), so a bare `int`
+    /// literal compared against or assigned into one of these needs
+    /// wrapping in `FixedT(..)` -- the same "know the real C type, wrap
+    /// the literal side" idiom `self_field_types`'s own `FixedT`-field
+    /// write arm already established, just for a plain local instead of a
+    /// self-struct field. Empty for every context that isn't a plain
+    /// tick/action function's own top-level locals.
+    fixed_t_locals: &'a HashSet<String>,
     /// This function's own `static`-storage top-level locals
     /// (`collect_static_locals`), mapping each declared name to the
     /// `World` field it's homed on (`"easy"` -> `"a_brain_spit_easy"`,
@@ -1173,6 +1188,51 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (lhs_text, _) = render_expr(eq_lhs, ctx)?;
             let (rhs_text, _) = render_expr(state_num, ctx)?;
             Ok((format!("state_index({lhs_text}) == {rhs_text}"), false))
+        }
+        // `dist > 14*64`/`dist < 196`/`P_Random() < dist` (`P_CheckMissile
+        // Range`) -- a comparison between a genuinely `fixed_t`-declared
+        // local (`FnBodyContext::fixed_t_locals`) and a plain `int`-valued
+        // other side (a bare literal, a literal arithmetic expression, or
+        // an ordinary `int`-returning call like `P_Random()`) -- `FixedT`
+        // deliberately has no `PartialOrd<i32>` (the whole point of the
+        // newtype is catching an accidental raw-`int` mix at compile
+        // time), so the plain-`int` side needs wrapping in `FixedT(..)`.
+        // Guarded by `expr_is_fixed_t_valued` on the *other* side so this
+        // never double-wraps an already-`FixedT`-valued comparison operand
+        // (e.g. a self-struct `FixedT` field, or a `FRACUNIT`-scaled
+        // expression) -- only a genuinely bare-`int`-valued other side
+        // gets wrapped.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+            ) && (is_fixed_t_local_ident(lhs, ctx) != is_fixed_t_local_ident(rhs, ctx))
+                && !expr_is_fixed_t_valued(
+                    if is_fixed_t_local_ident(lhs, ctx) {
+                        rhs
+                    } else {
+                        lhs
+                    },
+                    ctx,
+                ) =>
+        {
+            let prec = binary_prec(*op);
+            let mut lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
+            let mut rhs_text = render_binary_operand(rhs, *op, prec, true, ctx)?;
+            if is_fixed_t_local_ident(lhs, ctx) {
+                rhs_text = format!("FixedT({rhs_text})");
+            } else {
+                lhs_text = format!("FixedT({lhs_text})");
+            }
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
         }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
@@ -3015,6 +3075,14 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
 /// `FixedT`," not "definitely plain `int`," so this only ever adds a
 /// wrap, never removes information a caller's already-typed value
 /// needs.
+/// Whether `e` is a bare reference to one of `self_param`'s own sibling
+/// locals declared genuinely `fixed_t` (`FnBodyContext::fixed_t_locals`,
+/// e.g. `P_CheckMissileRange`'s own `dist`) -- see that field's own doc
+/// comment.
+fn is_fixed_t_local_ident(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Ident(n) if ctx.fixed_t_locals.contains(n.as_str()))
+}
+
 fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
     match e {
         Expr::Ident(n) => n == "FRACUNIT",
@@ -3473,6 +3541,12 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let lhs_is_fixed_t_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT"));
+        // `dist = 200;`/`dist = 160;` (`P_CheckMissileRange`, clamping a
+        // genuinely `fixed_t`-declared local) -- the same raw-`int`-
+        // literal-into-`FixedT` gap `lhs_is_fixed_t_self_field` closes for
+        // a self-struct field, just for a plain local (`FnBodyContext::
+        // fixed_t_locals`) instead.
+        let lhs_is_fixed_t_local = is_fixed_t_local_ident(lhs, ctx);
         let rhs_is_int_literal = matches!(rhs.as_ref(), Expr::IntLiteral(_));
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
@@ -3689,7 +3763,10 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             text
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
-        } else if lhs_is_fixed_t_self_field && *op == AssignOp::Assign && rhs_is_int_literal {
+        } else if (lhs_is_fixed_t_self_field || lhs_is_fixed_t_local)
+            && *op == AssignOp::Assign
+            && rhs_is_int_literal
+        {
             format!("FixedT({rhs_text})")
         } else {
             rhs_text
@@ -4039,6 +4116,31 @@ fn collect_angle_t_locals(items: &[BlockItem]) -> HashSet<String> {
     names
 }
 
+/// Mirrors `collect_angle_t_locals`, but for a local declared `fixed_t`
+/// (`m_fixed.h`'s `typedef int fixed_t;`, `[TypeSpecifier::TypedefName(
+/// "fixed_t")]`) -- see `FnBodyContext::fixed_t_locals`'s own doc comment
+/// for why this is needed. Same deliberately shallow, top-level-only scan.
+fn collect_fixed_t_locals(items: &[BlockItem]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in items {
+        let BlockItem::Decl(d) = item else { continue };
+        if !matches!(
+            d.specifiers.type_specifiers.as_slice(),
+            [TypeSpecifier::TypedefName(n)] if n == "fixed_t"
+        ) {
+            continue;
+        }
+        for decl in &d.declarators {
+            if let DirectDeclarator::Ident(_) = decl.declarator.direct
+                && let Some(name) = declarator_name(&decl.declarator)
+            {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
 /// Lowercases `fn_name` and inserts `_` before each interior uppercase
 /// letter not already preceded by one (`"A_BrainSpit"` -> `"a_brain_
 /// spit"`) -- a minimal, single-purpose snake-case fold, not a general
@@ -4305,6 +4407,7 @@ fn render_fn_impl(
     }
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
     let static_locals = collect_static_locals(&f.body.items, fn_name);
     let bool_locals = collect_bool_locals(&f.body.items);
     // Only a tick function that actually removes itself somewhere in its
@@ -4431,6 +4534,7 @@ fn render_fn_impl(
         same_target_write: None,
         plain_int_locals: &plain_int_locals,
         angle_t_locals: &angle_t_locals,
+        fixed_t_locals: &fixed_t_locals,
         static_locals: &static_locals,
         bool_locals: &bool_locals,
         self_removal_ident,
@@ -4521,6 +4625,7 @@ pub fn render_weapon_fn(
         );
     }
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &player_param,
         self_field_types: player_field_types,
@@ -4535,6 +4640,7 @@ pub fn render_weapon_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &angle_t_locals,
+        fixed_t_locals: &fixed_t_locals,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         active_goto_label: None,
@@ -5983,6 +6089,7 @@ pub fn render_spawn_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         active_goto_label: None,
@@ -6345,6 +6452,7 @@ pub fn render_trigger_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         active_goto_label: None,
@@ -7068,6 +7176,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -7163,6 +7272,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -7218,6 +7328,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -7294,6 +7405,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -7457,6 +7569,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -8615,6 +8728,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -8686,6 +8800,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -8783,6 +8898,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -8860,6 +8976,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -8938,6 +9055,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -9021,6 +9139,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -9910,14 +10029,17 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// through the rescaling `FixedMul`/`FixedDiv` -- `runtime/fixed.rs`
     /// gains `Mul<FixedT> for i32`/`Mul<i32> for FixedT`/`Div<i32> for
     /// FixedT` (raw representation arithmetic, the same idea `Add`/`Sub`
-    /// already model for `+`/`-`) plus `AddAssign`/`SubAssign`. `dist`
-    /// itself is treated as a plain scalar throughout (declared `fixed_t`
-    /// in the original, but only ever divided by/compared against plain
-    /// `int`s after `P_AproxDistance` computes it here) -- the
-    /// verification harness's own `P_AproxDistance` stub returns `i32`
-    /// to match, the same "stub signature matches this real call site's
-    /// own usage, not necessarily the callee's eventual one" precedent
-    /// already documented for `S_StartSound` (`EV_VerticalDoor`).
+    /// already model for `+`/`-`) plus `AddAssign`/`SubAssign`. **Revised
+    /// once `P_CheckMissileRange` closed the general mechanism**: `dist`
+    /// is genuinely declared `fixed_t` here too, and its own comparison/
+    /// reassignment against a bare `int` literal (`if (dist < 1) dist =
+    /// 1;`) now correctly renders `FixedT(1)` on both sides via
+    /// `FnBodyContext::fixed_t_locals` -- this entry originally shipped
+    /// with the verification harness's own `P_AproxDistance` stub
+    /// deliberately returning `i32` (not the real corpus declaration's
+    /// `fixed_t`) specifically to dodge this exact gap; that dodge is
+    /// gone now that the general fix exists, and the harness's stub
+    /// return type is corrected to match the real `p_local.h` signature.
     /// `finecosine[exact]`/`finesine[exact]` need an explicit `as usize`
     /// even though `exact` is a plain index identifier (unlike
     /// `sidenum[side^1]`'s fresh, single-purpose local): `exact` is
@@ -9987,8 +10109,8 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              actor.momy = FixedMul(actor.info.speed, finesine[exact as usize]);\n    \
              dist = P_AproxDistance(match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - actor.y);\n    \
              dist = dist / actor.info.speed;\n    \
-             if dist < 1 {\n        \
-             dist = 1;\n    \
+             if dist < FixedT(1) {\n        \
+             dist = FixedT(1);\n    \
              }\n    \
              slope = (match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + 40 * FRACUNIT - actor.z) / dist;\n    \
              if slope < actor.momz {\n        \
@@ -10479,6 +10601,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             active_goto_label: None,
@@ -11235,6 +11358,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             same_target_write: None,
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             self_removal_ident: "arena",
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
@@ -12492,6 +12616,103 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              return false;\n    \
              }\n    \
              actor.movecount = P_Random() & 15;\n    \
+             return true;\n\
+             }"
+        );
+    }
+
+    /// `P_CheckMissileRange` (`p_enemy.c`) -- surfaced two genuinely new,
+    /// narrowly-scoped mechanisms, both caught by actually compiling the
+    /// naive output with `rustc` first rather than by inspection. (1) its
+    /// own `dist` local is declared *genuinely* `fixed_t` in the real C
+    /// source (unlike `A_SkullAttack`'s same-named local, declared plain
+    /// `int` there, needing the different `.0`-extraction treatment
+    /// `is_approx_distance_call` already covers) -- `FnBodyContext::
+    /// fixed_t_locals`/`collect_fixed_t_locals` register it, so `dist =
+    /// P_AproxDistance(..) - 64*FRACUNIT;`/`dist -= 128*FRACUNIT;`/`dist
+    /// >>= 16;` all stay real `FixedT` arithmetic with no wrap needed
+    /// (every operand involved is already `FixedT`-valued). (2) every
+    /// comparison against a bare `int` (`dist > 14*64`, `dist < 196`,
+    /// `dist = 200`, `P_Random() < dist`) needed the plain-`int` side
+    /// wrapped in `FixedT(..)`: this project's `FixedT` deliberately has
+    /// no `PartialOrd<i32>`/assignment-from-`i32` (the whole point of the
+    /// newtype is catching an accidental raw-`int` mix at compile time,
+    /// per `runtime/fixed.rs`'s own doc comment), so a bare comparison/
+    /// assignment against one of these locals needs the same "know the
+    /// real C type, wrap the literal/call side" idiom the self-struct
+    /// `FixedT`-field write arm already established, extended to a plain
+    /// local (assignment) and, new here, to comparisons in *either*
+    /// operand order (`P_Random() < dist` needed the literal-`int`-
+    /// returning call wrapped on the *left*). Guarded by the existing
+    /// `expr_is_fixed_t_valued` so an already-`FixedT`-valued other
+    /// operand is never double-wrapped. `actor->target->x`/`.y` (target
+    /// dereference read, inside the very same `P_AproxDistance` call
+    /// argument) and `P_CheckSight(actor, actor->target)` (a bare-`Option`
+    /// argument, `P_CheckMeleeRange`'s own precedent) needed no new work
+    /// at all. Compile-verified for real with a hand-written `FixedT`/
+    /// `Mobj`/`MobjInfo`/`Thinker`/`Arena`/`Handle`/`World` stand-in
+    /// (`rustc --edition 2021 --crate-type lib`) -- zero errors.
+    /// `test_p_check_missile_range_renders_exactly`. 405/405 tests passing.
+    #[test]
+    fn test_p_check_missile_range_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("reactiontime", "i32"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("type", "i32"),
+            ("target", "Option<Handle<Thinker>>"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_CheckMissileRange",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_CheckMissileRange(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) -> bool {\n    \
+             let mut dist;\n    \
+             if !P_CheckSight(actor, actor.target) {\n        \
+             return false;\n    \
+             }\n    \
+             if (actor.flags & MF_JUSTHIT) != 0 {\n        \
+             actor.flags &= !MF_JUSTHIT;\n        \
+             return true;\n    \
+             }\n    \
+             if actor.reactiontime != 0 {\n        \
+             return false;\n    \
+             }\n    \
+             dist = P_AproxDistance(actor.x - match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, actor.y - match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }) - 64 * FRACUNIT;\n    \
+             if actor.info.meleestate == 0 {\n        \
+             dist -= 128 * FRACUNIT;\n    \
+             }\n    \
+             dist >>= 16;\n    \
+             if actor.r#type == MT_VILE {\n        \
+             if dist > FixedT(14 * 64) {\n            \
+             return false;\n        \
+             }\n    \
+             }\n    \
+             if actor.r#type == MT_UNDEAD {\n        \
+             if dist < FixedT(196) {\n            \
+             return false;\n        \
+             }\n        \
+             dist >>= 1;\n    \
+             }\n    \
+             if actor.r#type == MT_CYBORG || actor.r#type == MT_SPIDER || actor.r#type == MT_SKULL {\n        \
+             dist >>= 1;\n    \
+             }\n    \
+             if dist > FixedT(200) {\n        \
+             dist = FixedT(200);\n    \
+             }\n    \
+             if actor.r#type == MT_CYBORG && dist > FixedT(160) {\n        \
+             dist = FixedT(160);\n    \
+             }\n    \
+             if FixedT(P_Random()) < dist {\n        \
+             return false;\n    \
+             }\n    \
              return true;\n\
              }"
         );
