@@ -821,6 +821,17 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "lowfloor" {
                 return Ok(("world.lowfloor".to_string(), false));
             }
+            // `validcount`/`soundtarget` (`p_setup.c`'s own file-scope
+            // `int validcount;`, `p_enemy.c`'s own file-scope `mobj_t*
+            // soundtarget;`, `P_RecursiveSound`/`P_NoiseAlert`'s idiom) --
+            // the same category `viletryx`/`linetarget` already
+            // established.
+            if name == "validcount" {
+                return Ok(("world.validcount".to_string(), false));
+            }
+            if name == "soundtarget" {
+                return Ok(("world.soundtarget".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -994,11 +1005,21 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // reference-typed needs its own narrow arm -- the same "no
         // general struct-field-type registry for anything but self/ctor"
         // reasoning `line->frontsector` already established just above,
-        // just one level further removed from `self_param`.
+        // just one level further removed from `self_param`. Widened to
+        // also match `emmiter->subsector->sector` (`P_NoiseAlert`'s own
+        // idiom, `p_enemy.c`) -- a bare `Handle<Thinker>`-registered
+        // *parameter* (not `self_param`) chained the identical way -- the
+        // rendered `base` text already resolves correctly either way
+        // (`self.subsector` via the generic self-field fallback, or
+        // `emmiter->subsector` via the existing bare-`Handle<Thinker>`
+        // `Member` arm above), so only this guard needed widening, not
+        // the rendering itself.
         Expr::Member { base, field, .. }
             if field == "sector"
                 && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
-                    if bf == "subsector" && matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)) =>
+                    if bf == "subsector"
+                        && (matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                            || matches!(bb.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>")))) =>
         {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].sector"), true))
@@ -1599,9 +1620,17 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // here (`render_expr`'s own `Expr::Ident` arm renames the
             // rendered *text* to `MOBJINFO` separately -- this guard
             // runs against the un-renamed AST node, so it still matches).
+            // `sec->lines[i]` (`P_RecursiveSound`, `p_enemy.c`) is the
+            // same shape once more, but for `Sector.lines: Vec<LineId>`:
+            // `i` is a fresh `for`-loop counter Rust *could* freely infer
+            // as `usize` from this one use alone, except it's *also*
+            // compared against `sec->linecount` (a genuine `i32` field)
+            // in that same loop's own header, so it must stay `i32`
+            // throughout and the index needs its own explicit cast here
+            // instead.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
                 || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "lines")
             {
                 format!("{index_text} as usize")
             } else {
@@ -3433,8 +3462,10 @@ fn is_fixed_t_local_ident(e: &Expr, ctx: &FnBodyContext) -> bool {
 }
 
 /// A *direct* self-struct field registered `"FixedT"` (`mo->momz`, not a
-/// further chain through it like `plat->sector->floorheight`) -- used by
-/// the literal-comparison-wrap arm below, deliberately narrower than
+/// further chain through it like `plat->sector->floorheight`), or a bare
+/// hand-matched-by-name `World` `FixedT` global (`openrange <= 0`,
+/// `P_RecursiveSound`'s own idiom -- `is_world_fixed_t_global`) -- used
+/// by the literal-comparison-wrap arm below, deliberately narrower than
 /// `expr_is_fixed_t_valued`'s own (already-correct, more permissive)
 /// notion of "definitely `FixedT`", since that arm's safety specifically
 /// depends on the *other* side being an unambiguous `Expr::IntLiteral`,
@@ -3443,6 +3474,7 @@ fn is_self_fixed_t_field(e: &Expr, ctx: &FnBodyContext) -> bool {
     matches!(e, Expr::Member { base, field, .. }
         if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
             && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT"))
+        || matches!(e, Expr::Ident(n) if is_world_fixed_t_global(n))
 }
 
 fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
@@ -4136,7 +4168,16 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         } else if (lhs_is_specialdata && rhs_is_ctor_var)
             || (lhs_is_target_or_tracer_self_field && rhs_is_handle_local)
             || (lhs_is_activeplats_index && rhs_is_handle_local)
+            || (lhs_is_option_handle_global && rhs_is_handle_local)
         {
+            // `soundtarget = target;` (`P_NoiseAlert`) -- the last real
+            // gap `lhs_is_option_handle_global`'s own `rhs_is_self` arm
+            // didn't cover: assigning a bare `Handle<Thinker>`-registered
+            // *parameter* (not `self_param` itself) into a hand-matched-
+            // by-name `Option<Handle<Thinker>>` global, the same `Some(..)`
+            // wrap every other bare-handle-into-`Option`-slot write in
+            // this function already gets, just for this one more LHS/RHS
+            // pairing.
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
             format!("{rhs_text} as i32")
@@ -5611,6 +5652,15 @@ fn collect_target_tracer_aliases_stmt(
 /// own type -- correct for every real corpus call site, since
 /// `frontsector`/`backsector` are only ever read off a real `line_t*`
 /// value regardless of how that value itself was obtained.
+///
+/// Two more shapes joined once `P_RecursiveSound` (`p_enemy.c`) needed
+/// them: `check = sec->lines[i];` (`Sector.lines: Vec<LineId>`, the
+/// first real local alias of an indexed cross-reference *array* field,
+/// not just a bare cross-reference field) -> `"LineId"`; `other =
+/// sides[check->sidenum[1]].sector;` (`side_t.sector`, the existing
+/// dedicated `sides[i].sector` `Expr::Member` arm's own shape, now also
+/// recognized as an alias *source*, not just a rendering target) ->
+/// `"SectorId"`.
 fn collect_line_sector_aliases(items: &[BlockItem]) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
     collect_line_sector_aliases_in(items, &mut aliases);
@@ -5621,6 +5671,15 @@ fn line_sector_field_alias_type(e: &Expr) -> Option<&'static str> {
     match e {
         Expr::Member { field, .. } if field == "frontsector" => Some("SectorId"),
         Expr::Member { field, .. } if field == "backsector" => Some("Option<SectorId>"),
+        Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "lines") => {
+            Some("LineId")
+        }
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides")) =>
+        {
+            Some("SectorId")
+        }
         _ => None,
     }
 }
@@ -7363,6 +7422,29 @@ pub fn render_world_fn(
     // afterward, not just read opaquely.
     let mut extra_cross_ref_idents = param_types.clone();
     extra_cross_ref_idents.extend(collect_line_sector_aliases(&f.body.items));
+    // `soundtarget` (`p_enemy.c`'s own file-scope `mobj_t* soundtarget;`,
+    // `P_RecursiveSound`'s own `sec->soundtarget = soundtarget;`) --
+    // registered the same conditional way `render_fn_impl` registers
+    // `linetarget`/`corpsehit`/`vileobj`, so the existing `Option<Handle
+    // <Thinker>>`-aware machinery (here, the `lhs_is_option_handle_global`
+    // write arm) applies to it automatically.
+    if body_has_any_ident_ref(&f.body.items, &["soundtarget"]) {
+        extra_cross_ref_idents.insert(
+            "soundtarget".to_string(),
+            "Option<Handle<Thinker>>".to_string(),
+        );
+    }
+    // `emmiter->subsector->sector` (`P_NoiseAlert`) -- a bare `Handle<
+    // Thinker>`-registered *parameter* (not a self-struct receiver, this
+    // shape has none) dereferenced through, needing a real `Arena` lookup
+    // the same way `render_fn_impl`'s own `needs_target_deref`/
+    // `needs_bare_handle_global` do -- measured directly against this
+    // function's own registered parameters (any real corpus caller of
+    // `render_world_fn` so far, `P_LineOpening`/`T_MovePlane`/
+    // `P_RecursiveSound`, has none, so this is a no-op for them).
+    let needs_thinkers = extra_cross_ref_idents.iter().any(|(name, ty)| {
+        ty == "Handle<Thinker>" && body_has_any_ident_ref(&f.body.items, &[name.as_str()])
+    });
     let ctx = FnBodyContext {
         self_param: "",
         self_field_types: &HashMap::new(),
@@ -7389,8 +7471,13 @@ pub fn render_world_fn(
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    let thinkers_part = if needs_thinkers {
+        ", thinkers: &Arena<Thinker>"
+    } else {
+        ""
+    };
     Ok(format!(
-        "pub fn {fn_name}({}, world: &mut World){return_arrow} {{\n{}\n}}",
+        "pub fn {fn_name}({}, world: &mut World{thinkers_part}){return_arrow} {{\n{}\n}}",
         rendered_params.join(", "),
         body_lines.join("\n")
     ))
@@ -14609,6 +14696,147 @@ pub fn P_ZMovement(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) 
             return;
         }
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_RecursiveSound` (`p_enemy.c`) -- `render_world_fn`'s existing
+    /// shape (`sec: SectorId, soundblocks: i32`, no self-struct, no
+    /// `Arena` access at all), needing three new, narrowly-scoped
+    /// pieces. (1) `validcount`/`soundtarget` -- two new hand-matched-by-
+    /// name `World` globals (`p_setup.c`'s own file-scope flood-fill
+    /// generation counter and `p_enemy.c`'s own file-scope `mobj_t*
+    /// soundtarget;`), the same category `viletryx`/`linetarget` already
+    /// established -- `sec->validcount == validcount` needed no new
+    /// rendering machinery at all (a `Sector` *field* named `validcount`
+    /// and this bare *global* of the same name are rendered through
+    /// entirely separate code paths, `Expr::Member` vs. `Expr::Ident`, so
+    /// there's no collision risk despite sharing a name). (2) `check =
+    /// sec->lines[i];`/`other = sides[check->sidenum[1]].sector;` --
+    /// `collect_line_sector_aliases` (`P_LineOpening`'s own collector)
+    /// gains two more recognized shapes: indexing a `Vec<LineId>` field
+    /// (`Sector.lines`) registers the result as `"LineId"`, and the
+    /// existing dedicated `sides[i].sector` rendering shape is now also
+    /// recognized as an alias *source* (`"SectorId"`), not just a
+    /// rendering target. `sec->lines[i]` also needed the by-name `as
+    /// usize` index-cast list extended to `field == "lines"`, since `i`
+    /// (a fresh loop counter that Rust *could* otherwise freely infer as
+    /// `usize`) is also compared against `sec->linecount` (a genuine
+    /// `i32` field) in the same loop header, so it must stay `i32`
+    /// throughout. (3) `openrange <= 0` -- `is_self_fixed_t_field` (the
+    /// narrow literal-comparison-wrap arm `P_ZMovement`'s own entry
+    /// added) widened to also recognize a bare `World`-global `FixedT`
+    /// identifier, not just a self-struct field, closing this gap for
+    /// both categories with the identical safe-by-construction reasoning.
+    /// Everything else (`P_LineOpening`'s own forward-referenced call,
+    /// the negated-non-comparison-`Binary` truthiness for `!(check->
+    /// flags & ML_TWOSIDED)`, the `for`-loop-to-`while` translation with
+    /// its own `continue`-hoists-the-step handling, the recursive self-
+    /// call using the original C argument list) reused wholly pre-
+    /// existing machinery. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against a hand-written `Sector`/`Side`/
+    /// `Line`/`World`/`FixedT` stand-in and a stub `P_LineOpening`
+    /// matching its own real signature -- zero errors. `test_p_recursive_
+    /// sound_renders_exactly`. 421/421 tests passing.
+    #[test]
+    fn test_p_recursive_sound_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId"), ("soundblocks", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_RecursiveSound",
+            &params,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_RecursiveSound(sec: SectorId, soundblocks: i32, world: &mut World) {
+    let mut i;
+    let mut check;
+    let mut other;
+    if world[sec].validcount == world.validcount && world[sec].soundtraversed <= soundblocks + 1 {
+        return;
+    }
+    world[sec].validcount = world.validcount;
+    world[sec].soundtraversed = soundblocks + 1;
+    world[sec].soundtarget = world.soundtarget;
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        if world[check].flags & ML_TWOSIDED == 0 {
+            i += 1;
+            continue;
+        }
+        P_LineOpening(check);
+        if world.openrange <= FixedT(0) {
+            i += 1;
+            continue;
+        }
+        if world[SideId(world[check].sidenum[0] as u32)].sector == sec {
+            other = world[SideId(world[check].sidenum[1] as u32)].sector;
+        } else {
+            other = world[SideId(world[check].sidenum[0] as u32)].sector;
+        }
+        if (world[check].flags & ML_SOUNDBLOCK) != 0 {
+            if soundblocks == 0 {
+                P_RecursiveSound(other, 1);
+            }
+        } else {
+            P_RecursiveSound(other, soundblocks);
+        }
+        i += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_NoiseAlert` (`p_enemy.c`) -- a small, three-statement
+    /// `render_world_fn` body, needing one new piece and one new
+    /// signature capability, both closing out gaps `P_RecursiveSound`'s
+    /// own entry above left open. (1) `emmiter->subsector->sector` --
+    /// the existing `actor->subsector->sector` dedicated `Expr::Member`
+    /// arm (`A_Look`'s own precedent) widened to also match a bare
+    /// `Handle<Thinker>`-registered *parameter* (not just `self_param`,
+    /// which this shape has none of) as the `subsector`'s own base --
+    /// the rendered `base` text already resolves correctly either way
+    /// (through the pre-existing bare-`Handle<Thinker>` `Member` arm,
+    /// `A_Punch`'s own precedent, generalized to any registered
+    /// identifier, not just a self-struct field), so only the guard
+    /// needed widening. (2) `render_world_fn` gains its own conditional
+    /// `thinkers: &Arena<Thinker>` parameter (mirroring `render_fn_impl`'s
+    /// `needs_target_deref`), added only once a real body dereferences
+    /// through a registered `"Handle<Thinker>"` parameter -- a no-op for
+    /// every earlier `render_world_fn` caller (`P_LineOpening`/
+    /// `T_MovePlane`/`P_RecursiveSound`), none of which have one.
+    /// `soundtarget = target;` needed one more new wrap combination
+    /// (`lhs_is_option_handle_global && rhs_is_handle_local`): assigning
+    /// a bare `Handle<Thinker>`-registered *parameter* (not `self_param`
+    /// itself, the only source `lhs_is_option_handle_global`'s own
+    /// `rhs_is_self` arm covered before) into the hand-matched-by-name
+    /// `Option<Handle<Thinker>>` global -- the same `Some(..)` wrap every
+    /// other bare-handle-into-`Option`-slot write in this module already
+    /// gets, just for this one more real pairing. `validcount++;` needed
+    /// nothing new at all: the existing generic standalone `PostIncDec`
+    /// arm already renders through any bare identifier's own `Expr::Ident`
+    /// rename, `validcount`'s included. Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against a hand-written
+    /// `World`/`Handle`/`Arena`/`Thinker`/`Mobj`/`Subsector`/`Sector`
+    /// stand-in and a stub `P_RecursiveSound` matching its own real call
+    /// site's argument shape -- zero errors. `test_p_noise_alert_renders_
+    /// exactly`. 422/422 tests passing.
+    #[test]
+    fn test_p_noise_alert_renders_exactly() {
+        let params = field_types(&[
+            ("target", "Handle<Thinker>"),
+            ("emmiter", "Handle<Thinker>"),
+        ]);
+        let rendered = render_world_fn(&corpus_dir(), "p_enemy.c", "P_NoiseAlert", &params, None)
+            .expect("should render cleanly");
+        let expected = "\
+pub fn P_NoiseAlert(target: Handle<Thinker>, emmiter: Handle<Thinker>, world: &mut World, thinkers: &Arena<Thinker>) {
+    world.soundtarget = Some(target);
+    world.validcount += 1;
+    P_RecursiveSound(world[match thinkers.get(emmiter) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector, 0);
 }";
         assert_eq!(rendered, expected);
     }

@@ -109,6 +109,19 @@
 //! and its caller communicate through" category `viletryx`/`viletryy`
 //! already established, just the window-through-a-two-sided-line values
 //! this particular function computes rather than reads.
+//! `validcount`/`soundtarget` joined once `P_RecursiveSound`/
+//! `P_NoiseAlert` (`p_enemy.c`) needed somewhere to hold `p_setup.c`'s
+//! own file-scope `int validcount;` (a level-wide flood-fill generation
+//! counter, incremented once per `P_NoiseAlert` call and compared
+//! against each `Sector`/`Line`'s own `validcount` *field* -- a
+//! different symbol despite the same name, no collision risk since a
+//! bare identifier and a `->field` access are rendered through entirely
+//! separate code paths) and `p_enemy.c`'s own file-scope `mobj_t*
+//! soundtarget;` -- the same "genuine mutable game state a callback and
+//! its caller communicate through" category `linetarget`/`corpsehit`
+//! already established, `soundtarget` genuinely nullable (`Option<
+//! Handle<Thinker>>`, matching `sector_t.soundtarget`'s own already-
+//! established mapping, which this exact global is copied into).
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -147,6 +160,8 @@ pub struct World {
     pub openbottom: FixedT,
     pub openrange: FixedT,
     pub lowfloor: FixedT,
+    pub validcount: i32,
+    pub soundtarget: Option<Handle<Thinker>>,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -262,6 +277,8 @@ mod tests {
         assert!(rendered.contains("pub openbottom: FixedT,"));
         assert!(rendered.contains("pub openrange: FixedT,"));
         assert!(rendered.contains("pub lowfloor: FixedT,"));
+        assert!(rendered.contains("pub validcount: i32,"));
+        assert!(rendered.contains("pub soundtarget: Option<Handle<Thinker>>,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
