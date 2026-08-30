@@ -602,6 +602,16 @@ fn is_self_bare_handle_field(
 fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> {
     match e {
         Expr::IntLiteral(s) => Ok((s.clone(), false)),
+        // `I_Error ("P_AddActivePlat: no more plats!");` -- the first
+        // corpus function needing a bare C string literal as a call
+        // argument. `Expr::StringLiteral`'s own stored text already
+        // includes its surrounding double quotes verbatim from the
+        // source (`parser::grammar`'s own lexing), and C's and Rust's
+        // string-literal syntax agree closely enough for every real
+        // corpus message (plain ASCII, no exotic escapes) that passing
+        // it through unchanged is correct -- not a general C-to-Rust
+        // string-escape translator, just the one shape actually needed.
+        Expr::StringLiteral(s) => Ok((s.clone(), false)),
         Expr::Ident(name) => {
             // `currentthinker` inside `render_thinker_list_scan`'s own
             // `for thinker in thinkers.iter() { if let Thinker::Mobj(m) =
@@ -679,6 +689,22 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             }
             if name == "braintargeton" {
                 return Ok(("world.braintargeton".to_string(), false));
+            }
+            // `activeplats` (`p_plats.c`'s own file-scope `plat_t*
+            // activeplats[MAXPLATS];`, `P_AddActivePlat`'s idiom) -- the
+            // same "genuine mutable game state, hand-matched by name"
+            // category as `braintargets` just above, a global array of
+            // `Option<Handle<Thinker>>` (`NULL` marks an empty slot,
+            // confirmed by `P_AddActivePlat`'s own `if (activeplats[i] ==
+            // NULL)` scan).
+            if name == "activeplats" {
+                return Ok(("world.activeplats".to_string(), false));
+            }
+            // `activeceilings` (`p_ceilng.c`'s own file-scope `ceiling_t*
+            // activeceilings[MAXCEILINGS];`, `P_AddActiveCeiling`'s idiom)
+            // -- `activeplats`'s own exact twin, one `Thinker` variant over.
+            if name == "activeceilings" {
+                return Ok(("world.activeceilings".to_string(), false));
             }
             // `corpsehit`/`vileobj`/`viletryx`/`viletryy` (`p_enemy.c`'s
             // own file-scope `mobj_t* corpsehit; mobj_t* vileobj; fixed_t
@@ -1321,7 +1347,7 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // rendered *text* to `MOBJINFO` separately -- this guard
             // runs against the un-renamed AST node, so it still matches).
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings")
                 || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")
             {
                 format!("{index_text} as usize")
@@ -3670,6 +3696,14 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && (field == "target" || field == "tracer"));
         let rhs_is_handle_local = matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
+        // `activeplats[i] = plat;` (`P_AddActivePlat`) -- storing a bare
+        // `Handle<Thinker>`-typed parameter straight into a slot of the
+        // `Option<Handle<Thinker>>`-typed global array, the same `Some(..)`
+        // wrap `lhs_is_target_or_tracer_self_field`'s own write already
+        // needs, just for an `Index` LHS (a global array element) instead
+        // of a self-struct field.
+        let lhs_is_activeplats_index = matches!(lhs.as_ref(), Expr::Index { base, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "activeplats" || n == "activeceilings"));
         // `corpsehit = thing;` (`PIT_VileCheck`) -- assigning `self` itself
         // (`thing`) straight into a *global* registered `Option<Handle<
         // Thinker>>` (`corpsehit`, `world.rs`'s own doc comment), not a
@@ -3715,6 +3749,7 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             "Some(handle)".to_string()
         } else if (lhs_is_specialdata && rhs_is_ctor_var)
             || (lhs_is_target_or_tracer_self_field && rhs_is_handle_local)
+            || (lhs_is_activeplats_index && rhs_is_handle_local)
         {
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
@@ -12973,6 +13008,93 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              return dx + dy - (dx >> 1);\n    \
              }\n    \
              return dx + dy - (dy >> 1);\n\
+             }"
+        );
+    }
+
+    /// `P_AddActivePlat` (`p_plats.c`) -- the first function reading/
+    /// writing `World::activeplats`, a global `[Option<Handle<Thinker>>;
+    /// MAXPLATS]` array (`NULL` marking an empty slot, matching this
+    /// exact function's own `if (activeplats[i] == NULL)` scan), the same
+    /// hand-matched-by-name category `braintargets` already established.
+    /// `Handle<Thinker>: PartialEq`/`Eq` (already hand-written in
+    /// `runtime/arena.rs`, not derived) makes `world.activeplats[i as
+    /// usize] == None` -- `Option<Handle<Thinker>>`'s own derived
+    /// equality against the `None` variant -- compile with no new trait
+    /// work at all; `activeplats[i] = plat;` needed a new `Some(..)` wrap
+    /// (`lhs_is_activeplats_index`), the array-index-write mirror of the
+    /// existing `lhs_is_target_or_tracer_self_field`'s own self-struct-
+    /// field write. Also the first function needing a bare C string-
+    /// literal call argument (`I_Error ("P_AddActivePlat: no more
+    /// plats!");`) -- `render_expr` gains an `Expr::StringLiteral` arm,
+    /// passing the AST's own already-quoted text straight through (not a
+    /// general C-to-Rust string-escape translator, just this one real
+    /// shape). Compile-verified for real with a hand-written `Handle`/
+    /// `Arena`/`Thinker`/`World` stand-in (`rustc --edition 2021
+    /// --crate-type lib`) -- zero errors. `test_p_add_active_plat_renders_exactly`.
+    #[test]
+    fn test_p_add_active_plat_renders_exactly() {
+        let params = field_types(&[("plat", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "P_AddActivePlat",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_AddActivePlat(plat: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             i = 0;\n    \
+             while i < MAXPLATS {\n        \
+             if world.activeplats[i as usize] == None {\n            \
+             world.activeplats[i as usize] = Some(plat);\n            \
+             return;\n        \
+             }\n        \
+             i += 1;\n    \
+             }\n    \
+             I_Error(\"P_AddActivePlat: no more plats!\");\n\
+             }"
+        );
+    }
+
+    /// `P_AddActiveCeiling` (`p_ceilng.c`) -- `P_AddActivePlat`'s own
+    /// exact twin, one `Thinker` variant over (`World::activeceilings`,
+    /// same hand-matched-by-name treatment), and slightly simpler: no
+    /// `I_Error` fallback at all, the loop just falls through if every
+    /// slot is full (confirmed by direct read of the real corpus body,
+    /// not assumed from its sibling's shape). No new mechanism needed
+    /// beyond `activeceilings` joining `activeplats` in the same by-name
+    /// lists. Compile-verified for real the same way. `test_p_add_active_ceiling_renders_exactly`.
+    #[test]
+    fn test_p_add_active_ceiling_renders_exactly() {
+        let params = field_types(&[("c", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "P_AddActiveCeiling",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_AddActiveCeiling(c: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             i = 0;\n    \
+             while i < MAXCEILINGS {\n        \
+             if world.activeceilings[i as usize] == None {\n            \
+             world.activeceilings[i as usize] = Some(c);\n            \
+             return;\n        \
+             }\n        \
+             i += 1;\n    \
+             }\n\
              }"
         );
     }
