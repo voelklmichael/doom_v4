@@ -79,6 +79,19 @@
 //! `vileobj` already established, just plain `bool` (the corpus's own
 //! `boolean` typedef, not `Option<Handle<Thinker>>` or `FixedT`) since
 //! neither is ever null or fixed-point.
+//! `itemrespawnque`/`itemrespawntime`/`iquehead`/`iquetail` joined once
+//! `P_RemoveMobj` (`p_mobj.c`) needed somewhere to hold its own file-scope
+//! `mapthing_t itemrespawnque[ITEMQUESIZE]; int itemrespawntime[ITEMQUESIZE];
+//! int iquehead; int iquetail;` (`ITEMQUESIZE` is a `#define`d `128`,
+//! `p_local.h`, confirmed by direct read -- this parser never expands
+//! macros, so the array length is written out literally here the same
+//! way every other hand-rendered `World` field already is) -- a circular
+//! queue of respawn points for special items, the same "genuine mutable
+//! game state a callback and its caller communicate through" category
+//! `corpsehit`/`vileobj`/`crushchange`/`nofit` already established, just
+//! a pair of fixed-size arrays (one of `MapThing` values, one of `i32`
+//! timestamps) alongside their own head/tail counters instead of a
+//! single value or a shorter special-purpose array.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -107,6 +120,10 @@ pub struct World {
     pub viletryy: FixedT,
     pub crushchange: bool,
     pub nofit: bool,
+    pub itemrespawnque: [MapThing; 128],
+    pub itemrespawntime: [i32; 128],
+    pub iquehead: i32,
+    pub iquetail: i32,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -186,6 +203,10 @@ mod tests {
         assert!(rendered.contains("pub viletryy: FixedT,"));
         assert!(rendered.contains("pub crushchange: bool,"));
         assert!(rendered.contains("pub nofit: bool,"));
+        assert!(rendered.contains("pub itemrespawnque: [MapThing; 128],"));
+        assert!(rendered.contains("pub itemrespawntime: [i32; 128],"));
+        assert!(rendered.contains("pub iquehead: i32,"));
+        assert!(rendered.contains("pub iquetail: i32,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));

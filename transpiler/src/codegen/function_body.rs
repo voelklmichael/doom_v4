@@ -765,6 +765,22 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "nofit" {
                 return Ok(("world.nofit".to_string(), false));
             }
+            // `itemrespawnque`/`itemrespawntime`/`iquehead`/`iquetail`
+            // (`p_mobj.c`'s own file-scope respawn-queue state,
+            // `P_RemoveMobj`'s idiom) -- the same category as
+            // `crushchange`/`nofit` just above.
+            if name == "itemrespawnque" {
+                return Ok(("world.itemrespawnque".to_string(), false));
+            }
+            if name == "itemrespawntime" {
+                return Ok(("world.itemrespawntime".to_string(), false));
+            }
+            if name == "iquehead" {
+                return Ok(("world.iquehead".to_string(), false));
+            }
+            if name == "iquetail" {
+                return Ok(("world.iquetail".to_string(), false));
+            }
             if name == "viletryx" {
                 return Ok(("world.viletryx".to_string(), false));
             }
@@ -1474,7 +1490,7 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // rendered *text* to `MOBJINFO` separately -- this guard
             // runs against the un-renamed AST node, so it still matches).
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
                 || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")
             {
                 format!("{index_text} as usize")
@@ -3241,6 +3257,16 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
             matches!(arg, Expr::Unary { op: UnaryOp::AddrOf, expr }
                 if matches!(expr.as_ref(), Expr::Member { base, field, arrow: true }
                     if field == "thinker" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
+                // `P_RemoveThinker((thinker_t*)mobj)` (`P_RemoveMobj`'s own
+                // idiom) -- a second, genuinely different real shape for
+                // the same "remove my own handle" call: a direct cast of
+                // the receiver itself to `thinker_t*`, not `&self->thinker`
+                // (`mobj_t`'s own embedded `thinker_t thinker;` header
+                // field is dropped entirely under this project's own
+                // memory model, so there's no `.thinker` to take the
+                // address of here -- the cast *is* the whole expression).
+                || matches!(arg, Expr::Cast { expr, .. }
+                    if matches!(expr.as_ref(), Expr::Ident(n) if n == self_param))
         }
         // `P_RemoveMobj(mo)` (`A_SpawnFly`'s own idiom, `p_mobj.c`'s real
         // declared shape `void P_RemoveMobj(mobj_t* mobj)`) -- a second,
@@ -14055,6 +14081,59 @@ pub fn PIT_ChangeSector(thing: &mut Mobj, world: &mut World, thinkers: &mut Aren
         if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momy = FixedT(P_Random() - P_Random() << 12); };
     }
     return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_RemoveMobj` (`p_mobj.c`) -- the canonical "remove this thing"
+    /// helper every already-translated caller (`PIT_ChangeSector`, and
+    /// `A_SpawnFly`'s own precedent before it) already calls by name.
+    /// `World` gains `itemrespawnque`/`itemrespawntime`/`iquehead`/
+    /// `iquetail` (its own file-scope respawn-queue state, `world.rs`'s
+    /// own doc comment), the same by-name global category `crushchange`/
+    /// `nofit` already established. `P_RemoveThinker((thinker_t*)mobj)` is
+    /// a second, genuinely different self-removal shape: a direct cast of
+    /// the receiver to `thinker_t*`, not `&self->thinker` (`mobj_t`'s own
+    /// embedded `thinker_t thinker;` header is dropped entirely under
+    /// this project's memory model, so there's no `.thinker` field to
+    /// take the address of here) -- `is_self_removal_call` gains a second
+    /// arm recognizing `P_RemoveThinker(Cast(self_param))` alongside its
+    /// existing `P_RemoveThinker(&self_param->thinker)` one.
+    /// `P_UnsetThingPosition`/`S_StopSound` are plain forward-referenced
+    /// calls needing nothing new. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against hand-written `Mobj`/
+    /// `MapThing`/`World`/`Handle`/`Arena` stand-ins and stub
+    /// `P_UnsetThingPosition`/`S_StopSound` matching this real call
+    /// site's own argument shapes -- zero errors.
+    /// `test_p_remove_mobj_renders_exactly`.
+    #[test]
+    fn test_p_remove_mobj_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("type", "i32"),
+            ("spawnpoint", "MapThing"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_RemoveMobj",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_RemoveMobj(mobj: &mut Mobj, world: &mut World, handle: Handle<Thinker>, arena: &mut Arena<Thinker>) {
+    if (mobj.flags & MF_SPECIAL) != 0 && mobj.flags & MF_DROPPED == 0 && mobj.r#type != MT_INV && mobj.r#type != MT_INS {
+        world.itemrespawnque[world.iquehead as usize] = mobj.spawnpoint;
+        world.itemrespawntime[world.iquehead as usize] = leveltime;
+        world.iquehead = world.iquehead + 1 & ITEMQUESIZE - 1;
+        if world.iquehead == world.iquetail {
+            world.iquetail = world.iquetail + 1 & ITEMQUESIZE - 1;
+        }
+    }
+    P_UnsetThingPosition(mobj);
+    S_StopSound(mobj);
+    arena.remove(handle);
 }";
         assert_eq!(rendered, expected);
     }
