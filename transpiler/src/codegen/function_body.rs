@@ -1101,6 +1101,53 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (divisor_text, _) = render_expr(div_rhs, ctx)?;
             Ok((format!("(-({name} as i32) / {divisor_text}) as u32"), false))
         }
+        // `player->mo->state == &states[S_PLAY_ATK1]` / `psp->state ==
+        // &states[S_SAW]` (`A_WeaponReady`) -- comparing a `&'static
+        // State` reference for equality, a genuinely different shape from
+        // `state_index`'s own reference-*subtraction* need just above
+        // (`==` between two references would need `std::ptr::eq`, this
+        // module's own docs had flagged, not `state_index`'s byte-offset
+        // arithmetic) -- but reusing `state_index` for the comparison
+        // itself sidesteps that: converting *both* sides to a plain
+        // index (`state_index(..)` for the reference, `S_PLAY_ATK1`'s
+        // own index is already the literal in `&states[S_PLAY_ATK1]`)
+        // and comparing indices avoids ever needing `State: PartialEq`
+        // or an `unsafe`-adjacent raw-pointer comparison, matching the
+        // "new, invented Rust-only infrastructure" `state_index` already
+        // is rather than adding a second, different mechanism for what's
+        // really the same underlying question ("is this state slot
+        // number N"). Scoped to this exact operand order (`state field ==
+        // &states[N]`) -- the only shape the real corpus uses; matched by
+        // the LHS's own field name (`"state"`), the same by-name style
+        // `state_index`'s own Sub arm above already uses, since both
+        // operands are plain `Member`/`Index` reads with no shape-level
+        // way to tell a state field from any other reference otherwise.
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: eq_lhs,
+            rhs: eq_rhs,
+        } if matches!(eq_lhs.as_ref(), Expr::Member { field, .. } if field == "state")
+            && matches!(eq_rhs.as_ref(), Expr::Unary { op: UnaryOp::AddrOf, expr }
+                if matches!(expr.as_ref(), Expr::Index { base, index }
+                    if matches!(base.as_ref(), Expr::Ident(n) if n == "states")
+                        && matches!(index.as_ref(), Expr::Ident(_)))) =>
+        {
+            let Expr::Unary {
+                expr: addrof_expr, ..
+            } = eq_rhs.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let Expr::Index {
+                index: state_num, ..
+            } = addrof_expr.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let (lhs_text, _) = render_expr(eq_lhs, ctx)?;
+            let (rhs_text, _) = render_expr(state_num, ctx)?;
+            Ok((format!("state_index({lhs_text}) == {rhs_text}"), false))
+        }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
             let lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
@@ -1453,13 +1500,48 @@ fn render_binary_operand(
     // (`plain_int_locals`/`static_locals`), not every bare `Unary::Not`
     // operand -- the un-typed general case (`!world[p.unwrap()].cards
     // [idx]`, a genuine `bool` array) still falls through unchanged.
+    // `player->pendingweapon != wp_nochange || !player->health` (`A_WeaponReady`)
+    // -- a further real-world instance of the exact same ambiguity, but
+    // for a *self-struct field* rather than a bare local: `player->health`
+    // has no `Option<..>`/`"bool"` registration in `self_field_types` (a
+    // real, checked `int` field, `player_t.health`), so this can tell it
+    // apart from an already-`bool` field (`cards[idx]`) the same
+    // confident way `plain_int_locals`/`static_locals` already let it for
+    // a bare local -- extended to a `Member` shape rather than a new,
+    // separate condition, since the check itself (registered, not
+    // `Option`-prefixed, not `"bool"`) is identical either way.
+    let not_of_known_int_field = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
+        if matches!(expr.as_ref(), Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx.self_field_types.get(field.as_str()).is_some_and(|t| t != "bool" && !t.starts_with("Option<"))));
     let not_of_known_int_local = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
-        if matches!(expr.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()) || ctx.static_locals.contains_key(n.as_str())));
+        if matches!(expr.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()) || ctx.static_locals.contains_key(n.as_str())))
+        || not_of_known_int_field;
+    // `!actor->target || !(actor->target->flags&MF_SHOOTABLE)` (`A_Chase`)
+    // -- unlike a negated `Member`/`Ident` (genuinely ambiguous: it might
+    // be a real Rust `bool` this codebase has no per-field type registry
+    // for, `cards[idx]` being the one confirmed real example), a negated
+    // *non-comparison* `Binary` is never ambiguous at all: this codebase
+    // has no idiom anywhere that combines two values through a bitwise/
+    // arithmetic operator (`&`/`|`/`+`/...) to produce a genuine `bool`
+    // result -- the un-negated sibling arm just above already treats a
+    // bare non-comparison `Binary` operand as unconditionally int-valued
+    // for exactly this reason, so the negated case can safely reuse
+    // `render_bool_expr`'s own already-correct top-level handling of it
+    // (`(x & FLAG) == 0`, or here, since Rust's own `&`-before-`==`
+    // precedence already lands on the right grouping unparenthesized,
+    // matching `T_MoveFloor`'s own `leveltime & 7 == 0` precedent) instead
+    // of the generic `Expr::Unary` fallback's bitwise-`!` (a real, silent
+    // wrong-behavior trap on an `i32`, confirmed by rendering the naive
+    // version first).
+    let not_of_non_comparison_binary = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
+        if matches!(expr.as_ref(), Expr::Binary { op, .. } if !is_comparison_or_logical(*op)));
     if matches!(parent_op, BinaryOp::LogAnd | BinaryOp::LogOr)
         && (matches!(operand, Expr::Member { .. })
             || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op))
             || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx))
-            || not_of_known_int_local)
+            || not_of_known_int_local
+            || not_of_non_comparison_binary)
     {
         return render_bool_expr(operand, ctx);
     }
@@ -1493,7 +1575,7 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
@@ -1696,7 +1778,58 @@ fn render_condition(
             let (hoisted, target_text) = hoist_pre_inc_dec(expr, *op, ctx, depth)?;
             Ok((hoisted, format!("{target_text} == 0")))
         }
+        // `--actor->movecount<0 || !P_Move(actor)` (`A_Chase`) -- a
+        // `PreIncDec` buried *inside* a larger condition (compared via
+        // `<`, itself one operand of a `||`), not the whole condition
+        // (the bare `--x`/`!--x` cases above) -- the generic `Expr::
+        // PreIncDec` arm in `render_expr` renders a compound-assignment
+        // fragment (`actor.movecount -= 1`), valid only as its own
+        // statement in Rust, not as a sub-expression value nested inside
+        // a comparison -- confirmed a real parse/type error by rendering
+        // the naive version first (`actor.movecount -= 1 < 0`, which
+        // doesn't even type-check: `-=` isn't a valid comparison operand
+        // in Rust). Hoists the decrement out (the same `hoist_pre_inc_dec`
+        // the two cases above use), then patches the *already-rendered*
+        // condition text, replacing that one compound-assignment fragment
+        // with the plain target text (C's own `--x` evaluates to the
+        // *new*, already-decremented value, exactly what the plain target
+        // reads once the hoisted statement runs first) -- a textual fix-
+        // up rather than an AST rewrite, since `render_expr`'s output is
+        // already known verbatim and reconstructing an `Expr::Ident` node
+        // from arbitrary already-rendered text (`"actor.movecount"`, not
+        // a bare C identifier) isn't meaningful the way it is for a real
+        // AST-level local. Scoped to the first `PreIncDec` found by a
+        // shallow `Binary`/`Unary` scan (`find_pre_inc_dec_in_expr`) --
+        // the one real corpus shape, not a fully general "hoist every
+        // side-effecting sub-expression" pass.
+        _ if find_pre_inc_dec_in_expr(cond).is_some() => {
+            let (target, op) = find_pre_inc_dec_in_expr(cond).expect("guarded above");
+            let (hoisted, target_text) = hoist_pre_inc_dec(target, op, ctx, depth)?;
+            let naive = render_bool_expr(cond, ctx)?;
+            let op_text = match op {
+                IncDecOp::Inc => "+= 1",
+                IncDecOp::Dec => "-= 1",
+            };
+            let fixed = naive.replace(&format!("{target_text} {op_text}"), &target_text);
+            Ok((hoisted, fixed))
+        }
         _ => Ok((Vec::new(), render_bool_expr(cond, ctx)?)),
+    }
+}
+
+/// Shallow `Binary`/`Unary` scan for the first bare `Expr::PreIncDec`
+/// anywhere inside `e` -- `render_condition`'s own last-resort hoisting
+/// arm needs to *find* one before it can hoist it; doesn't descend into
+/// `Call` arguments or `Index`/`Member` bases, since the one real corpus
+/// shape (`--actor->movecount<0 || !P_Move(actor)`) never needs that.
+fn find_pre_inc_dec_in_expr(e: &Expr) -> Option<(&Expr, IncDecOp)> {
+    match e {
+        Expr::PreIncDec { expr, op } => Some((expr, *op)),
+        Expr::Binary { lhs, rhs, .. } => {
+            find_pre_inc_dec_in_expr(lhs).or_else(|| find_pre_inc_dec_in_expr(rhs))
+        }
+        Expr::Unary { expr, .. } => find_pre_inc_dec_in_expr(expr),
+        _ => None,
     }
 }
 
@@ -3147,6 +3280,25 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         // `FnBodyContext::angle_t_locals`'s own doc comment.
         let lhs_is_angle_t_local =
             matches!(lhs.as_ref(), Expr::Ident(n) if ctx.angle_t_locals.contains(n.as_str()));
+        // `player->attackdown = true;` (`A_WeaponReady`) -- `true`/`false`
+        // are this corpus's own `boolean` enum constants (`doomtype.h`'s
+        // `typedef enum {false, true} boolean;`), valid C anywhere an
+        // `int` is expected via ordinary enum-to-int conversion -- but
+        // `attackdown`'s own real C declaration is a plain `int`, *not*
+        // `boolean` (confirmed by direct read of `d_player.h`), while
+        // `rust_ident_name` always renders a bare `true`/`false` as
+        // Rust's own boolean literal (correct for a genuinely `boolean`-
+        // typed field like `crush`, its only previous real corpus use) --
+        // assigning a real `bool` into an `i32` field doesn't compile.
+        // Scoped to a field registered as neither `"bool"` nor
+        // `Option<..>`-prefixed (the same "known, checked, plain" test
+        // `not_of_known_int_field` above already uses), converting the
+        // literal to its own underlying enum value (`0`/`1`) instead.
+        let lhs_is_known_non_bool_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx.self_field_types.get(field.as_str()).is_some_and(|t| t != "bool" && !t.starts_with("Option<")));
+        let rhs_is_true_or_false_literal =
+            matches!(rhs.as_ref(), Expr::Ident(n) if n == "true" || n == "false");
         // `actor->tracer = fog;` (`A_VileTarget`'s own idiom) -- writing a
         // bare `Handle<Thinker>`-typed local (`fog`, fresh out of
         // `P_SpawnMobj`) straight into `self`'s own `target`/`tracer`
@@ -3194,6 +3346,16 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
             format!("{rhs_text} as i32")
+        } else if lhs_is_known_non_bool_self_field
+            && *op == AssignOp::Assign
+            && rhs_is_true_or_false_literal
+        {
+            (if matches!(rhs.as_ref(), Expr::Ident(n) if n == "true") {
+                "1"
+            } else {
+                "0"
+            })
+            .to_string()
         } else if lhs_is_plain_int_local && *op == AssignOp::Assign && is_approx_distance_call {
             format!("({rhs_text}).0")
         } else if lhs_is_plain_int_local
@@ -3228,6 +3390,38 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             rhs_text
                 .replace("world.viletryx", "world.viletryx.0")
                 .replace("world.viletryy", "world.viletryy.0")
+        } else if lhs_is_plain_int_local && *op == AssignOp::Assign && {
+            let names = find_u32_self_field_names(rhs, ctx.self_param, ctx.self_field_types);
+            !names.is_empty()
+        } {
+            // `delta = actor->angle - (actor->movedir << 29);` (`A_Chase`)
+            // -- `rhs_is_u32_self_field`'s own sibling gap: that check
+            // only ever fires when the RHS *is* a bare `u32` self field
+            // (`angle = actor->angle;`), but here `actor->angle` (`u32`)
+            // is just one operand *inside* a larger `Binary` subtraction
+            // against a plain `i32` (`actor->movedir << 29`) -- `u32 -
+            // i32` doesn't compile in Rust at all (no mixed-type `Sub`),
+            // confirmed by rendering the naive version first. Every real
+            // corpus use of `angle_t` arithmetic elsewhere stays inside
+            // `u32` throughout (matching C's own unsigned-preserving
+            // usual-arithmetic-conversions), but `delta`'s own C
+            // declaration is plain `int` -- the same "one value, C
+            // reinterprets the bits, Rust needs it spelled out" idiom as
+            // `rhs_is_u32_self_field`, just needing the cast at the one
+            // `u32`-typed *operand* instead of the whole RHS. A plain
+            // textual substitution on the already-rendered string (each
+            // registered `u32` self field found anywhere in the RHS gets
+            // `as i32` appended at its own reference), not a `FnBodyContext`
+            // field threaded through every recursive call, matching
+            // `viletryx`'s own precedent just above for the identical
+            // reason: the one real need is narrow and single-function.
+            let mut text = rhs_text;
+            for name in find_u32_self_field_names(rhs, ctx.self_param, ctx.self_field_types) {
+                let needle = format!("{}.{name}", ctx.self_param);
+                let replacement = format!("({}.{name} as i32)", ctx.self_param);
+                text = text.replace(&needle, &replacement);
+            }
+            text
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
         } else {
@@ -4633,6 +4827,68 @@ fn stmt_has_self_handle_value(
             stmt_has_self_handle_value(body, self_param, spawn_locals, extra_cross_ref_idents)
         }
         _ => false,
+    }
+}
+
+/// Every `self_param.field` reference inside `e` (any nesting depth
+/// through `Binary`/`Unary`) whose own registered type is `"u32"` --
+/// `render_expr_stmt`'s own `delta = actor->angle - (actor->movedir <<
+/// 29);` fix-up needs to know *which* field(s), not just whether one
+/// exists, since it patches each one's own rendered text individually.
+/// Returns Rust field names (`rust_field_name`'s own output), deduplicated
+/// implicitly by the caller's own `str::replace` being idempotent past
+/// the first occurrence. Doesn't descend into `Call`/`Index` -- no real
+/// corpus shape needs that yet.
+fn find_u32_self_field_names(
+    e: &Expr,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    find_u32_self_field_names_in(e, self_param, self_field_types, &mut names);
+    names
+}
+
+fn find_u32_self_field_names_in(
+    e: &Expr,
+    self_param: &str,
+    self_field_types: &HashMap<String, String>,
+    names: &mut Vec<String>,
+) {
+    if let Expr::Member { base, field, .. } = e
+        && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)
+        && self_field_types.get(field.as_str()).map(String::as_str) == Some("u32")
+        && let Ok(name) = rust_field_name(field)
+        && !names.contains(&name)
+    {
+        names.push(name);
+    }
+    match e {
+        // Only descends through `Add`/`Sub`/`Mul`/`Div` (and comparisons,
+        // for completeness) -- the operators Rust actually requires
+        // matching operand types for. A shift (`actor->angle >>
+        // ANGLETOFINESHIFT`, `A_VileAttack`'s own `an` -- confirmed a
+        // real regression by running the existing suite first: casting
+        // `angle` here broke `test_a_vile_attack_renders_exactly`, since
+        // Rust's `Shr`/`Shl` already accept a differently-typed rhs
+        // natively, so `u32 >> i32` compiles as-is with no cast needed at
+        // all) never needs this -- deliberately *not* recursing into a
+        // `Shr`/`Shl`'s own operands, so a `u32` field only shifted (never
+        // added/subtracted against an `i32`) is correctly left alone.
+        Expr::Binary { op, lhs, rhs }
+            if is_comparison_or_logical(*op)
+                || matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                ) =>
+        {
+            find_u32_self_field_names_in(lhs, self_param, self_field_types, names);
+            find_u32_self_field_names_in(rhs, self_param, self_field_types, names);
+        }
+        Expr::Unary { expr, .. } => {
+            find_u32_self_field_names_in(expr, self_param, self_field_types, names)
+        }
+        _ => {}
     }
 }
 
@@ -11451,6 +11707,233 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n    \
              }\n    \
              A_Chase(actor);\n\
+             }"
+        );
+    }
+
+    /// `A_WeaponReady` (`p_pspr.c`) -- closes the state-pointer-equality
+    /// gap this section's own docs had explicitly left open since
+    /// `state_index`'s own entry, plus three more real gaps found while
+    /// rendering the whole function, not guessed at. (1) `player->mo->
+    /// state == &states[S_PLAY_ATK1]` -- reusing `state_index` for the
+    /// comparison itself (`state_index(x) == N`) rather than `std::ptr::
+    /// eq` or deriving `PartialEq` on `State`: converting both sides to a
+    /// plain index and comparing indices needs no new machinery at all,
+    /// and matches the "new, invented Rust-only infrastructure" category
+    /// `state_index` already is. A new `render_expr` arm recognizes this
+    /// exact shape (an `==` whose LHS is a bare `.state` `Member` and
+    /// whose RHS is `&states[N]`), matched by field name the same way
+    /// `state_index`'s own pointer-subtraction arm already is. (2) `!
+    /// player->health` -- a `&&`/`||`-chain operand this module's own
+    /// docs on `render_binary_operand` had left deliberately unrouted for
+    /// a *bare local* (`easy`, `A_BrainSpit`'s own entry), but never
+    /// extended to a *self-struct field*: `player->health` has no
+    /// `Option<..>`/`"bool"` registration in `self_field_types`, so
+    /// `not_of_known_int_local` gains a `Member` sibling (`not_of_known_
+    /// int_field`) checking the identical condition. (3) `player->
+    /// attackdown = true;` -- `true`/`false` are this corpus's own
+    /// `boolean` enum constants (`doomtype.h`'s `typedef enum {false,
+    /// true} boolean;`), valid anywhere an `int` is via ordinary enum-to-
+    /// int conversion, but `rust_ident_name` always renders them as
+    /// Rust's own `bool` literals (correct for a genuinely `boolean`-
+    /// typed field like `crush`, its only previous use) -- `attackdown`'s
+    /// real C declaration is a plain `int` (confirmed by direct read of
+    /// `d_player.h`), so assigning a real Rust `bool` into it doesn't
+    /// compile. Converts to the literal's own underlying value (`1`/`0`)
+    /// instead, scoped to a field registered as neither `bool` nor
+    /// `Option<..>` (the same check `not_of_known_int_field` uses).
+    /// `weaponinfo[player->readyweapon].downstate` and `psp->sx`/`.sy`
+    /// needed nothing at all -- already-general machinery proven by
+    /// `A_Lower`/`A_Raise` and friends. Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against hand-written
+    /// `Arena`/`Handle`/`Mobj`/`MobjInfo`/`State`/`Player`/
+    /// `PlayerSpriteState` stand-ins and stub forward-referenced
+    /// functions -- zero errors. `test_a_weapon_ready_renders_exactly`.
+    /// 398/398 tests passing.
+    #[test]
+    fn test_a_weapon_ready_renders_exactly() {
+        let field_types = field_types(&[
+            ("mo", "Handle<Thinker>"),
+            ("health", "i32"),
+            ("attackdown", "i32"),
+        ]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_WeaponReady", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_WeaponReady(player: &mut Player, psp: &mut PlayerSpriteState, thinkers: &Arena<Thinker>) {\n    \
+             let mut newstate;\n    \
+             let mut angle;\n    \
+             if state_index(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK1 || state_index(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK2 {\n        \
+             P_SetMobjState(player.mo, S_PLAY);\n    \
+             }\n    \
+             if player.readyweapon == wp_chainsaw && state_index(psp.state) == S_SAW {\n        \
+             S_StartSound(player.mo, sfx_sawidl);\n    \
+             }\n    \
+             if player.pendingweapon != wp_nochange || player.health == 0 {\n        \
+             newstate = weaponinfo[player.readyweapon as usize].downstate;\n        \
+             P_SetPsprite(player, ps_weapon, newstate);\n        \
+             return;\n    \
+             }\n    \
+             if (player.cmd.buttons & BT_ATTACK) != 0 {\n        \
+             if player.attackdown == 0 || player.readyweapon != wp_missile && player.readyweapon != wp_bfg {\n            \
+             player.attackdown = 1;\n            \
+             P_FireWeapon(player);\n            \
+             return;\n        \
+             }\n    \
+             } else {\n        \
+             player.attackdown = 0;\n    \
+             }\n    \
+             angle = 128 * leveltime & FINEMASK;\n    \
+             psp.sx = FRACUNIT + FixedMul(player.bob, finecosine[angle as usize]);\n    \
+             angle &= FINEANGLES / 2 - 1;\n    \
+             psp.sy = WEAPONTOP + FixedMul(player.bob, finesine[angle as usize]);\n\
+             }"
+        );
+    }
+
+    /// `A_Chase` (`p_enemy.c`) -- the last of this pair, closing three
+    /// more real gaps found by compiling the whole function, none of
+    /// them individually large but each a genuine `rustc` rejection or
+    /// silent wrong-behavior trap confirmed before fixing, not guessed
+    /// at. (1) `delta = actor->angle - (actor->movedir << 29);` -- `u32 -
+    /// i32` doesn't compile in Rust at all (no mixed-type `Sub`, unlike
+    /// `Shr`/`Shl`, which already tolerate a differently-typed operand
+    /// fine -- confirmed by first trying the *same* cast on `A_VileAttack`'s
+    /// own `an = actor->angle >> ANGLETOFINESHIFT;`, which doesn't need
+    /// one at all and regressed `test_a_vile_attack_renders_exactly` when
+    /// tried, a real test failure, not a guess). `find_u32_self_field_names`
+    /// (a `rhs_is_u32_self_field` sibling for a `u32` field buried inside
+    /// a larger expression rather than being the whole RHS) only
+    /// descends through `Add`/`Sub`/`Mul`/`Div`/comparisons -- the
+    /// operators Rust genuinely requires matching types for -- explicitly
+    /// *not* `Shr`/`Shl`, so `A_VileAttack`'s own shift-only case stays
+    /// untouched. (2) `--actor->movecount<0 || !P_Move(actor)` -- a
+    /// `PreIncDec` buried inside a larger condition, not the whole
+    /// condition (`render_condition`'s two existing bare-`--x`/`!--x`
+    /// cases) -- rendering it inline produces `actor.movecount -= 1 < 0`,
+    /// which doesn't even parse as a valid comparison. A new last-resort
+    /// arm (`find_pre_inc_dec_in_expr`) hoists the first `PreIncDec`
+    /// found anywhere in the condition, then patches the already-rendered
+    /// condition text, swapping the compound-assignment fragment for the
+    /// plain (already-hoisted, so already up to date) target text. (3)
+    /// `!(actor->target->flags&MF_SHOOTABLE)` -- a negated *non-
+    /// comparison* `Binary` chain operand: unlike a negated `Member`/
+    /// `Ident` (genuinely ambiguous -- might be a real `bool` this module
+    /// has no per-field registry for), a negated bitwise/arithmetic
+    /// `Binary` is *never* ambiguous -- this corpus has no idiom
+    /// combining two values through `&`/`|`/`+`/... into a genuine
+    /// `bool`, the same reasoning the *un-negated* sibling arm already
+    /// relies on for the same shape. Routes through `render_bool_expr`'s
+    /// own already-correct handling instead of the generic `Expr::Unary`
+    /// fallback's bitwise `!` (confirmed a real silent-wrong-behavior
+    /// trap by rendering the naive version first). `P_CheckMissileRange`/
+    /// `P_Move` (`p_enemy.c`, confirmed `boolean`-returning by direct
+    /// read) join `is_bool_returning_call`'s list -- without it, `!
+    /// P_CheckMissileRange(actor)` as a bare top-level condition rendered
+    /// `P_CheckMissileRange(actor) == 0`, comparing a real `bool` against
+    /// `0` (doesn't compile); `P_Move`'s own negation happened to render
+    /// correctly anyway (a chain operand's generic fallback always uses
+    /// bare `!`, right here since `P_Move` really is `bool`, purely
+    /// coincidental rather than principled), added for consistency. The
+    /// `nomissile:` goto target needed no new transform at all: both
+    /// `goto nomissile;` statements are nested one level inside an `if`,
+    /// exactly the same shape `A_Look`'s own already-implemented
+    /// transform handles (its real corpus example was already nested
+    /// inside an `if`/`else` too). Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against hand-written `Arena`/
+    /// `Handle`/`Mobj`/`MobjInfo`/`Thinker` stand-ins (concrete, non-
+    /// generic callee signatures throughout -- a generic stub, tried
+    /// first, wrongly *moves* `actor` instead of reborrowing it at each
+    /// call site, a real `rustc` E0382 this function's own many sequential
+    /// `actor` reuses surfaced that `A_VileChase`'s own single-`P_
+    /// SetMobjState`-reuse compile check never exercised) -- zero errors.
+    /// `test_a_chase_renders_exactly`. 399/399 tests passing.
+    #[test]
+    fn test_a_chase_renders_exactly() {
+        let field_types = field_types(&[
+            ("reactiontime", "i32"),
+            ("threshold", "i32"),
+            ("movedir", "i32"),
+            ("angle", "u32"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("flags", "i32"),
+            ("info", "&'static MobjInfo"),
+            ("movecount", "i32"),
+        ]);
+        let rendered = render_fn(&corpus_dir(), "p_enemy.c", "A_Chase", "Mobj", &field_types)
+            .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_Chase(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             'nomissile: {\n        \
+             let mut delta;\n        \
+             if actor.reactiontime != 0 {\n            \
+             actor.reactiontime -= 1;\n        \
+             }\n        \
+             if actor.threshold != 0 {\n            \
+             if actor.target.is_none() || match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 {\n                \
+             actor.threshold = 0;\n            \
+             } else {\n                \
+             actor.threshold -= 1;\n            \
+             }\n        \
+             }\n        \
+             if actor.movedir < 8 {\n            \
+             actor.angle &= (7 << 29) as u32;\n            \
+             delta = (actor.angle as i32) - (actor.movedir << 29);\n            \
+             if delta > 0 {\n                \
+             actor.angle -= (ANG90 / 2) as u32;\n            \
+             } else {\n                \
+             if delta < 0 {\n                    \
+             actor.angle += (ANG90 / 2) as u32;\n                \
+             }\n            \
+             }\n        \
+             }\n        \
+             if actor.target.is_none() || match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_SHOOTABLE == 0 {\n            \
+             if P_LookForPlayers(actor, true) {\n                \
+             return;\n            \
+             }\n            \
+             P_SetMobjState(actor, actor.info.spawnstate);\n            \
+             return;\n        \
+             }\n        \
+             if (actor.flags & MF_JUSTATTACKED) != 0 {\n            \
+             actor.flags &= !MF_JUSTATTACKED;\n            \
+             if gameskill != sk_nightmare && !fastparm {\n                \
+             P_NewChaseDir(actor);\n            \
+             }\n            \
+             return;\n        \
+             }\n        \
+             if actor.info.meleestate != 0 && P_CheckMeleeRange(actor) {\n            \
+             if actor.info.attacksound != 0 {\n                \
+             S_StartSound(actor, actor.info.attacksound);\n            \
+             }\n            \
+             P_SetMobjState(actor, actor.info.meleestate);\n            \
+             return;\n        \
+             }\n        \
+             if actor.info.missilestate != 0 {\n            \
+             if gameskill < sk_nightmare && !fastparm && actor.movecount != 0 {\n                \
+             break 'nomissile;\n            \
+             }\n            \
+             if !P_CheckMissileRange(actor) {\n                \
+             break 'nomissile;\n            \
+             }\n            \
+             P_SetMobjState(actor, actor.info.missilestate);\n            \
+             actor.flags |= MF_JUSTATTACKED;\n            \
+             return;\n        \
+             }\n    \
+             }\n    \
+             if netgame && actor.threshold == 0 && !P_CheckSight(actor, actor.target) {\n        \
+             if P_LookForPlayers(actor, true) {\n            \
+             return;\n        \
+             }\n    \
+             }\n    \
+             actor.movecount -= 1;\n    \
+             if actor.movecount < 0 || !P_Move(actor) {\n        \
+             P_NewChaseDir(actor);\n    \
+             }\n    \
+             if actor.info.activesound != 0 && P_Random() < 3 {\n        \
+             S_StartSound(actor, actor.info.activesound);\n    \
+             }\n\
              }"
         );
     }
