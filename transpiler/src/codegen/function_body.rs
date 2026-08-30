@@ -1801,6 +1801,16 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Ident(_) if is_option_valued(cond, ctx) => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
+        // `if (onfloor)` (`P_ThingHeightClip`) -- the un-negated sibling of
+        // the bare-`bool`-local `!x` arm above (`ctx.bool_locals`):
+        // `onfloor` is a `boolean`-declared local whose only assignment is
+        // a real comparison, so it's already a genuine Rust `bool` by the
+        // time this reads it -- a bare truthiness check needs no `!= 0`
+        // cast, the same "already `bool`" reasoning as the negated case,
+        // never needed until this first real corpus example (every earlier
+        // `boolean`-local truthiness check in this codebase's own corpus
+        // so far only ever appeared negated).
+        Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) => Ok(render_expr(cond, ctx)?.0),
         // `if (player->powers[pw_strength])` (`A_Punch`) -- a bare array-
         // element read used for truthiness, the `Expr::Index` sibling of
         // the plain-`Member`-field arm just below: `powers` is a plain
@@ -4242,13 +4252,17 @@ fn fn_name_to_snake_case(fn_name: &str) -> String {
 /// real corpus example declares a `static` anywhere but a function's own
 /// top level.
 /// A plain local assigned straight from a real-`bool`-returning call
-/// (`check = P_CheckPosition(..);`, `PIT_VileCheck`'s own idiom) --
-/// `FnBodyContext::bool_locals`'s own doc comment covers why this is
-/// needed. Mirrors `collect_target_tracer_aliases`'s own recursive-scan
-/// shape (an assignment-sourced trait, so it has to look inside `if`/
-/// `switch`/loop bodies too, unlike a decl-based collector like
-/// `collect_plain_int_locals`, which only ever looks at the function's
-/// own top-level declarations).
+/// (`check = P_CheckPosition(..);`, `PIT_VileCheck`'s own idiom) *or* a
+/// direct comparison/logical expression (`onfloor = (thing->z ==
+/// thing->floorz);`, `P_ThingHeightClip`'s own idiom -- the same
+/// `is_comparison_or_logical` op set `render_bool_expr`'s top-level
+/// dispatch already recognizes as producing a genuine Rust `bool`, not
+/// just a call) -- `FnBodyContext::bool_locals`'s own doc comment covers
+/// why this is needed. Mirrors `collect_target_tracer_aliases`'s own
+/// recursive-scan shape (an assignment-sourced trait, so it has to look
+/// inside `if`/`switch`/loop bodies too, unlike a decl-based collector
+/// like `collect_plain_int_locals`, which only ever looks at the
+/// function's own top-level declarations).
 fn collect_bool_locals(items: &[BlockItem]) -> HashSet<String> {
     let mut names = HashSet::new();
     collect_bool_locals_in(items, &mut names);
@@ -4263,6 +4277,11 @@ fn collect_bool_locals_in(items: &[BlockItem], names: &mut HashSet<String>) {
     }
 }
 
+fn is_bool_valued_rhs(expr: &Expr) -> bool {
+    is_bool_returning_call(expr)
+        || matches!(expr, Expr::Binary { op, .. } if is_comparison_or_logical(*op))
+}
+
 fn collect_bool_locals_stmt(s: &Stmt, names: &mut HashSet<String>) {
     if let Stmt::Expr(Some(Expr::Assign {
         op: AssignOp::Assign,
@@ -4270,7 +4289,7 @@ fn collect_bool_locals_stmt(s: &Stmt, names: &mut HashSet<String>) {
         rhs,
     })) = s
         && let Expr::Ident(name) = lhs.as_ref()
-        && is_bool_returning_call(rhs)
+        && is_bool_valued_rhs(rhs)
     {
         names.insert(name.clone());
     }
@@ -13316,6 +13335,65 @@ pub fn T_MovePlane(sector: SectorId, speed: FixedT, dest: FixedT, crush: bool, f
         _ => {}
     }
     return ok;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ThingHeightClip` (`p_map.c`) -- a plain `boolean`-returning
+    /// self-struct function, the same shape `render_bool_fn` already
+    /// handles for `P_CheckMeleeRange`/`P_CheckMissileRange`, needing no
+    /// new mechanism at all once actually checked against the real body:
+    /// `thing->z`/`.floorz`/`.ceilingz`/`.height` are all already-
+    /// registered `FixedT` `Mobj` fields, `boolean onfloor;` is a plain
+    /// `TypedefName` local already handled by `render_decl`'s deferred-
+    /// inference case and picked up by `collect_bool_locals` (so `if
+    /// (onfloor)` renders as real `if onfloor`, not a `!= 0` truthiness
+    /// cast), and `P_CheckPosition(thing, thing->x, thing->y)` is a plain
+    /// forward-referenced call (same convention as `S_StartSound`) whose
+    /// two "out parameters", `tmfloorz`/`tmceilingz`, are bare global
+    /// reads (same pass-through convention already established for
+    /// `leveltime`/`MISSILERANGE`, not something this function itself
+    /// writes). Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against hand-written `Mobj`/`World` stand-ins,
+    /// bare `tmfloorz`/`tmceilingz: FixedT` statics, and a stub
+    /// `P_CheckPosition(&mut Mobj, FixedT, FixedT)` matching this real
+    /// call site's own argument shape -- zero errors.
+    #[test]
+    fn test_p_thing_height_clip_renders_exactly() {
+        let field_types = field_types(&[
+            ("z", "FixedT"),
+            ("floorz", "FixedT"),
+            ("ceilingz", "FixedT"),
+            ("height", "FixedT"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "P_ThingHeightClip",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ThingHeightClip(thing: &mut Mobj, world: &mut World) -> bool {
+    let mut onfloor;
+    onfloor = thing.z == thing.floorz;
+    P_CheckPosition(thing, thing.x, thing.y);
+    thing.floorz = tmfloorz;
+    thing.ceilingz = tmceilingz;
+    if onfloor {
+        thing.z = thing.floorz;
+    } else {
+        if thing.z + thing.height > thing.ceilingz {
+            thing.z = thing.ceilingz - thing.height;
+        }
+    }
+    if thing.ceilingz - thing.floorz < thing.height {
+        return false;
+    }
+    return true;
 }";
         assert_eq!(rendered, expected);
     }
