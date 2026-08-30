@@ -865,6 +865,13 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "swingy" {
                 return Ok(("world.swingy".to_string(), false));
             }
+            // `bulletslope` (`p_pspr.c`'s own file-scope `fixed_t
+            // bulletslope;`, `P_BulletSlope`'s idiom) -- the same category
+            // `viletryx`/`attackrange`/`swingx`/`swingy` already
+            // established.
+            if name == "bulletslope" {
+                return Ok(("world.bulletslope".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -5764,7 +5771,22 @@ pub fn render_weapon_fn(
     // already makes for the self-struct-tick shape.
     let needs_self_handle_write =
         body_has_self_handle_write(&f.body.items, &player_param, player_field_types);
-    let world_part = if needs_linetarget {
+    // `bulletslope` (`A_FireShotgun2`'s own `P_LineAttack(..., bulletslope
+    // + .., ..)`, `p_pspr.c`) -- a *second*, independent reason a weapon
+    // action needs `world` at all, distinct from `needs_linetarget`:
+    // `P_BulletSlope`'s own entry above registers `bulletslope` as a
+    // `World` field (the same by-name category `viletryx`/`attackrange`/
+    // `swingx`/`swingy` already established), which this already-shipped
+    // caller reads but, until now, had no `world` parameter to read it
+    // through at all -- confirmed a real gap by the full suite itself
+    // (not assumed), the exact "re-run the full suite when generalizing"
+    // case this project's own discipline exists for. `needs_world` now
+    // covers both reasons instead of only `needs_linetarget`, so a future
+    // by-name `World` global reached from a weapon action gets the same
+    // treatment with no further signature-shape change needed.
+    let needs_bulletslope = body_has_any_ident_ref(&f.body.items, &["bulletslope"]);
+    let needs_world = needs_linetarget || needs_bulletslope;
+    let world_part = if needs_world {
         ", world: &mut World"
     } else {
         ""
@@ -12376,11 +12398,24 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// all (both sides are genuinely `u32`, matching the established
     /// "stub matches the caller's real usage" precedent). `bulletslope`
     /// (`p_pspr.c`'s own file-scope `fixed_t` global, set by the
-    /// forward-referenced `P_BulletSlope`) needs no new handling: an
-    /// unregistered bare identifier already renders as plain opaque
-    /// pass-through text (the same `MISSILERANGE`/`textureheight[]`
-    /// precedent), and `FixedT + i32` (`bulletslope + (...)<<5`) already
-    /// has a real trait impl from `A_Tracer`'s own earlier work.
+    /// forward-referenced `P_BulletSlope`) originally needed no new
+    /// handling here at all, rendering as a plain opaque bare-identifier
+    /// pass-through (the same `MISSILERANGE`/`textureheight[]` precedent)
+    /// -- **revised once `P_BulletSlope` itself was translated**:
+    /// registering `bulletslope` as a real `World` field there (the
+    /// `viletryx`/`attackrange`/`swingx`/`swingy` category) means this
+    /// already-shipped rendering must change too, from the bare
+    /// identifier to `world.bulletslope`, and `render_weapon_fn` needs its
+    /// own `world` parameter widened to fire on this reason as well as
+    /// `needs_linetarget` (`needs_bulletslope`, `body_has_any_ident_ref`)
+    /// -- confirmed a real gap by the full suite itself catching this
+    /// test regress, not assumed, the exact "re-run the full suite when
+    /// generalizing" case this project's own discipline exists for; fixed
+    /// by widening `needs_world` rather than narrowing `P_BulletSlope`'s
+    /// own `bulletslope` registration to dodge it, since the wider
+    /// `World` field is the more broadly correct rendering. `FixedT + i32`
+    /// (`world.bulletslope + (...)<<5`) already has a real trait impl
+    /// from `A_Tracer`'s own earlier work.
     #[test]
     fn test_a_fire_shotgun2_renders_exactly() {
         let field_types = field_types(&[("mo", "Handle<Thinker>")]);
@@ -12388,7 +12423,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_FireShotgun2(player: &mut Player, psp: &mut PlayerSpriteState, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_FireShotgun2(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
              let mut i;\n    \
              let mut angle;\n    \
              let mut damage;\n    \
@@ -12402,7 +12437,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              damage = 5 * (P_Random() % 3 + 1);\n        \
              angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n        \
              angle += (P_Random() - P_Random() << 19) as u32;\n        \
-             P_LineAttack(player.mo, angle, MISSILERANGE, bulletslope + (P_Random() - P_Random() << 5), damage);\n        \
+             P_LineAttack(player.mo, angle, MISSILERANGE, world.bulletslope + (P_Random() - P_Random() << 5), damage);\n        \
              i += 1;\n    \
              }\n\
              }"
@@ -16556,6 +16591,60 @@ pub fn P_FireWeapon(player: &mut Player, world: &mut World) {
     newstate = weaponinfo[player.readyweapon as usize].atkstate;
     P_SetPsprite(player, ps_weapon, newstate);
     P_NoiseAlert(player.mo, player.mo);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_BulletSlope` (`p_pspr.c`) translated -- an ordinary `Mobj`-
+    /// shaped self-struct function, needing only one small new piece:
+    /// `bulletslope` (this file's own file-scope `fixed_t bulletslope;`)
+    /// joins the by-name `World` global list (`viletryx`/`attackrange`/
+    /// `swingx`/`swingy`'s own category) -- a bare write (`bulletslope =
+    /// ..;`) needs no separate mechanism, the same "generic assignment
+    /// fallback already renders its own LHS through the same `Expr::Ident`
+    /// arm a read would use" precedent `swingx`/`swingy` already
+    /// established. `linetarget` (`P_AimLineAttack`'s own "did we hit
+    /// anything" side channel) reuses the already-established `World`
+    /// field and negated-truthiness handling (`A_Punch`'s own precedent)
+    /// unchanged -- registering it also unconditionally adds the
+    /// `thinkers: &Arena<Thinker>` parameter `render_fn_impl` already
+    /// always supplies once a body references `linetarget` at all (even
+    /// though this one only ever checks it for truthiness, never
+    /// dereferences through it). `an += 1<<26;`/`an -= 2<<26;` need
+    /// nothing new either: `an` is a genuinely `angle_t`-declared local
+    /// (`collect_angle_t_locals`), and the existing `lhs_is_angle_t_local`
+    /// compound-assign wrap (`A_Chase`'s own precedent) already casts each
+    /// RHS shift `as u32`. `P_AimLineAttack` is an ordinary forward-
+    /// referenced call (not yet translated), passed `mo`/`an`/a
+    /// `FRACUNIT`-scaled literal argument, needing nothing new. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Mobj`/`World`/`FixedT`/`Handle`/`Arena`/
+    /// `Thinker` stand-in and a stub `P_AimLineAttack` -- zero errors.
+    /// `test_p_bullet_slope_renders_exactly`.
+    #[test]
+    fn test_p_bullet_slope_renders_exactly() {
+        let field_types = field_types(&[("angle", "u32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_BulletSlope",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_BulletSlope(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {
+    let mut an;
+    an = mo.angle;
+    world.bulletslope = P_AimLineAttack(mo, an, 16 * 64 * FRACUNIT);
+    if world.linetarget.is_none() {
+        an += (1 << 26) as u32;
+        world.bulletslope = P_AimLineAttack(mo, an, 16 * 64 * FRACUNIT);
+        if world.linetarget.is_none() {
+            an -= (2 << 26) as u32;
+            world.bulletslope = P_AimLineAttack(mo, an, 16 * 64 * FRACUNIT);
+        }
+    }
 }";
         assert_eq!(rendered, expected);
     }
