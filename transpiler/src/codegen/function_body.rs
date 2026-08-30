@@ -1261,6 +1261,41 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // (e.g. a self-struct `FixedT` field, or a `FRACUNIT`-scaled
         // expression) -- only a genuinely bare-`int`-valued other side
         // gets wrapped.
+        // `bombdamage - dist` (`PIT_RadiusAttack`) -- subtracting a
+        // genuinely `fixed_t`-declared local (`dist`, already reassigned
+        // through `(dist - thing->radius) >> FRACBITS` a few lines
+        // earlier, converting it from a true fixed-point value into a
+        // plain map-unit scalar -- the same "one C variable, two roles"
+        // idiom already documented for `A_Tracer`'s own `dist`/`A_Brain
+        // Explode`'s `x`/`y`/`z`) from a bare plain-`int` value
+        // (`bombdamage`, this function's own file-scope global) used
+        // straight as a call argument whose real callee parameter
+        // (`P_DamageMobj`'s `damage: int`) is plain `int`, not `fixed_t`.
+        // Unlike the comparison-wrap arm just below (which only ever
+        // needs to make *both sides* comparable, so wrapping either one
+        // in `FixedT(..)` is equally correct), a `Sub` here produces a
+        // real *value* that must come out plain `i32` -- so this extracts
+        // the fixed-point local's own raw representation (`.0`) instead
+        // of wrapping the other side, the opposite direction from that
+        // arm. Deliberately narrow (`Sub` only, RHS a bare `fixed_t_locals`
+        // ident, LHS anything *not* already known `FixedT`-valued) --
+        // `Add<FixedT> for i32`'s own existing `Output = FixedT` choice
+        // would be actively wrong reused here, since this expression's
+        // real destination is a plain-`int` parameter, not a `FixedT`
+        // value; no general rule safely covers both destinations, so this
+        // stays its own scoped case rather than widening `Sub`'s trait
+        // impls in `runtime/fixed.rs`.
+        Expr::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } if is_fixed_t_local_ident(rhs, ctx) && !expr_is_fixed_t_valued(lhs, ctx) => {
+            let lhs_text =
+                render_binary_operand(lhs, BinaryOp::Sub, binary_prec(BinaryOp::Sub), false, ctx)?;
+            let rhs_text =
+                render_binary_operand(rhs, BinaryOp::Sub, binary_prec(BinaryOp::Sub), true, ctx)?;
+            Ok((format!("{lhs_text} - {rhs_text}.0"), false))
+        }
         Expr::Binary { op, lhs, rhs }
             if matches!(
                 op,
@@ -1551,6 +1586,27 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             Ok((
                 format!("{callee_text}({})", rendered_args.join(", ")),
                 is_crossref,
+            ))
+        }
+        // `dx>dy ? dx : dy` (`PIT_RadiusAttack`'s own idiom, C's ternary
+        // operator) -- the first real corpus function needing it. Rust's
+        // own `if`/`else` is already a real expression (no separate
+        // ternary syntax needed), so this renders directly as one,
+        // `render_bool_expr` for the condition (`>` here, but any real
+        // corpus condition shape) and plain `render_expr` for both
+        // branches (matching every other value-position sub-expression in
+        // this module).
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let cond_text = render_bool_expr(cond, ctx)?;
+            let then_text = render_expr(then_expr, ctx)?.0;
+            let else_text = render_expr(else_expr, ctx)?.0;
+            Ok((
+                format!("if {cond_text} {{ {then_text} }} else {{ {else_text} }}"),
+                false,
             ))
         }
         _ => Err(format!("render_expr: unsupported expression shape: {e:?}")),
@@ -4527,20 +4583,27 @@ fn render_fn_impl(
         extra_cross_ref_idents.insert("vileobj".to_string(), "Option<Handle<Thinker>>".to_string());
     }
     // `tmthing` (`p_map.c`'s own file-scope `mobj_t* tmthing;`,
-    // `PIT_StompThing`'s own idiom) -- registered *bare* `Handle<Thinker>`,
-    // not `Option`-wrapped like `corpsehit`/`vileobj`: confirmed by
-    // grepping every real reference to it across the whole file, it is
-    // never null-checked anywhere, always dereferenced or compared
-    // directly, the same "always valid in practice, never guarded"
-    // pattern a `P_SpawnMobj` result already gets. Unlike `corpsehit`/
-    // `vileobj`, this doesn't automatically light up `needs_target_deref`
-    // (`is_target_tracer_typed`'s own `Expr::Ident` arm only recognizes
-    // `Option<Handle<Thinker>>`, by design -- its sibling rendering arms
-    // hardcode `.unwrap()`, which would be wrong for a bare value), so it
-    // needs its own narrow read-access flag below.
-    let needs_tmthing = body_has_any_ident_ref(&f.body.items, &["tmthing"]);
-    if needs_tmthing {
-        extra_cross_ref_idents.insert("tmthing".to_string(), "Handle<Thinker>".to_string());
+    // `PIT_StompThing`'s own idiom), and its siblings `bombspot`/
+    // `bombsource` (`PIT_RadiusAttack`'s own "who caused this explosion"
+    // pair) -- all registered *bare* `Handle<Thinker>`, not `Option`-
+    // wrapped like `corpsehit`/`vileobj`: confirmed by grepping every real
+    // reference to each across the whole file, none is ever null-checked
+    // anywhere, always dereferenced or compared directly, the same
+    // "always valid in practice, never guarded" pattern a `P_SpawnMobj`
+    // result already gets. Unlike `corpsehit`/`vileobj`, none of these
+    // automatically light up `needs_target_deref` (`is_target_tracer_
+    // typed`'s own `Expr::Ident` arm only recognizes `Option<Handle
+    // <Thinker>>`, by design -- its sibling rendering arms hardcode
+    // `.unwrap()`, which would be wrong for a bare value), so they need
+    // their own narrow read-access flag below.
+    const BARE_HANDLE_GLOBALS: &[&str] = &["tmthing", "bombspot", "bombsource"];
+    let needs_bare_handle_global = BARE_HANDLE_GLOBALS
+        .iter()
+        .any(|name| body_has_any_ident_ref(&f.body.items, &[name]));
+    for name in BARE_HANDLE_GLOBALS {
+        if body_has_any_ident_ref(&f.body.items, &[name]) {
+            extra_cross_ref_idents.insert((*name).to_string(), "Handle<Thinker>".to_string());
+        }
     }
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
@@ -4699,7 +4762,11 @@ fn render_fn_impl(
         ""
     } else if needs_spawn_mut || composed_self_removal || needs_target_write {
         ", thinkers: &mut Arena<Thinker>"
-    } else if needs_target_deref || needs_linetarget || needs_thinker_scan_for || needs_tmthing {
+    } else if needs_target_deref
+        || needs_linetarget
+        || needs_thinker_scan_for
+        || needs_bare_handle_global
+    {
         ", thinkers: &Arena<Thinker>"
     } else {
         ""
@@ -13602,6 +13669,95 @@ pub fn PIT_StompThing(thing: &mut Mobj, world: &mut World, thinkers: &Arena<Thin
         return false;
     }
     P_DamageMobj(thing, tmthing, tmthing, 10000);
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `PIT_RadiusAttack` (`p_map.c`) -- another `boolean`-returning
+    /// `P_BlockThingsIterator`/`P_RadiusAttack` callback, generalizing the
+    /// bare-`Handle<Thinker>`-global registration `PIT_StompThing`'s own
+    /// `tmthing` needed to its two siblings `bombspot`/`bombsource`
+    /// (`p_map.c`'s own file-scope `mobj_t* bombspot;`/`bombsource;`,
+    /// grepped never null-checked anywhere either) -- zero new mechanism
+    /// for that part beyond widening the by-name list. Three genuinely new
+    /// pieces surfaced by this function specifically: (1) `dx>dy ? dx :
+    /// dy` -- C's ternary operator, never needed until now; Rust's own
+    /// `if`/`else` is already a real expression, so `Expr::Conditional`
+    /// renders straight into one, no new machinery beyond that one
+    /// `render_expr` arm. (2) `(dist - thing->radius) >> FRACBITS` --
+    /// shifting a `FixedT` by the real corpus `FRACBITS` constant, whose
+    /// real declared Rust type is `u32` (`runtime::FRACBITS`), not the
+    /// bare `i32` shift-count `Shr<i32> for FixedT` already handles (`dest
+    /// ->height>>1`) -- added `Shr<u32> for FixedT` alongside it (`runtime/
+    /// fixed.rs`), the same "both operand types get impl'd" precedent
+    /// `Add<i32>`/`Mul<i32>` already established (Rust's own `-` binding
+    /// tighter than `>>`, matching C's precedence exactly, means the
+    /// rendered text needs no parens here either). (3) `bombdamage - dist`
+    /// -- `dist` is genuinely `fixed_t`-declared (so far correctly
+    /// `FixedT`-typed throughout, including the `0`-clamp comparison just
+    /// above, via wholly pre-existing machinery), but by this point in the
+    /// function it's already been reassigned through the `>> FRACBITS`
+    /// shift into a plain map-unit scalar -- the same "one C variable, two
+    /// roles" idiom already documented for `A_Tracer`'s own `dist`/`A_
+    /// BrainExplode`'s `x`/`y`/`z`. Confirmed a real `rustc` rejection
+    /// first (`cannot subtract FixedT from i32`, no blind assumption): the
+    /// naive render leaves this as a bare `bombdamage - dist`, and neither
+    /// existing direction fits -- `Add<FixedT> for i32`'s own `Output =
+    /// FixedT` would be wrong reused here, since this value's real
+    /// destination (`P_DamageMobj`'s `damage: int` parameter) is plain
+    /// `i32`, not `FixedT`. Fixed with a new, deliberately narrow
+    /// `render_expr` arm (`Sub` only, RHS a bare `fixed_t_locals` ident,
+    /// LHS not already known `FixedT`-valued) that extracts the raw
+    /// representation (`.0`) rather than widening `runtime/fixed.rs`'s own
+    /// `Sub` impls with an output-type choice that would collide with
+    /// `Add`'s existing one for the identical operand pairing. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against hand-written `Mobj`/`World`/`Handle`/`Arena` stand-ins, bare
+    /// `Handle<Thinker>`-typed `bombspot`/`bombsource`, a plain `i32`
+    /// `bombdamage` static, and stub `P_CheckSight`/`P_DamageMobj`
+    /// matching this real call site's own argument shapes -- zero errors.
+    #[test]
+    fn test_pit_radius_attack_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("type", "i32"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("radius", "FixedT"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "PIT_RadiusAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn PIT_RadiusAttack(thing: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) -> bool {
+    let mut dx;
+    let mut dy;
+    let mut dist;
+    if thing.flags & MF_SHOOTABLE == 0 {
+        return true;
+    }
+    if thing.r#type == MT_CYBORG || thing.r#type == MT_SPIDER {
+        return true;
+    }
+    dx = FixedT((thing.x - match thinkers.get(bombspot) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }).0.abs());
+    dy = FixedT((thing.y - match thinkers.get(bombspot) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }).0.abs());
+    dist = if dx > dy { dx } else { dy };
+    dist = dist - thing.radius >> FRACBITS;
+    if dist < FixedT(0) {
+        dist = FixedT(0);
+    }
+    if dist >= FixedT(bombdamage) {
+        return true;
+    }
+    if P_CheckSight(thing, bombspot) {
+        P_DamageMobj(thing, bombspot, bombsource, bombdamage - dist.0);
+    }
     return true;
 }";
         assert_eq!(rendered, expected);

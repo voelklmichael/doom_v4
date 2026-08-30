@@ -223,6 +223,24 @@ impl ShrAssign<i32> for FixedT {
     }
 }
 
+/// `(dist - thing->radius) >> FRACBITS` (`PIT_RadiusAttack`) -- the same
+/// raw-bit-shift idiom as `Shr<i32>` above, just shifted by `FRACBITS`
+/// itself (`runtime::FRACBITS: u32`, not `i32` -- this parser never
+/// macro-expands `#define`s, so the rendered output always references the
+/// real corpus name bare, and needs the shift amount's own real declared
+/// Rust type to type-check). Kept as its own impl rather than widening
+/// `Shr<i32>`'s own signature: both shift-amount types appear in the real
+/// corpus (a literal shift count like `dest->height>>1` is `i32`-inferred,
+/// while `FRACBITS` itself is `u32`), so both need their own impl, the
+/// same "both operand types get impl'd" precedent `Add<i32>`/`Mul<i32>`
+/// already established for other operators.
+impl Shr<u32> for FixedT {
+    type Output = FixedT;
+    fn shr(self, rhs: u32) -> FixedT {
+        FixedT(self.0 >> rhs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +354,16 @@ mod tests {
         let height = FixedT(56 * FRACUNIT.0);
         assert_eq!(height >> 1, FixedT(height.0 >> 1));
         assert_eq!(height >> 1, FixedT(28 * FRACUNIT.0));
+    }
+
+    #[test]
+    fn test_fixed_shr_by_fracbits_like_pit_radius_attack() {
+        // `(dist - thing->radius) >> FRACBITS` (`PIT_RadiusAttack`) --
+        // shifting by the real `u32`-typed `FRACBITS` constant, not a
+        // bare `i32` literal shift count.
+        let dist = FixedT(56 * FRACUNIT.0);
+        assert_eq!(dist >> FRACBITS, FixedT(dist.0 >> FRACBITS));
+        assert_eq!(dist >> FRACBITS, FixedT(56));
     }
 
     #[test]
