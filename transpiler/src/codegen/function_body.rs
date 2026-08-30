@@ -272,6 +272,31 @@ struct FnBodyContext<'a> {
     /// label's own statement and everything following it render with an
     /// ordinary context, same as before the goto ever existed).
     active_goto_label: Option<&'a str>,
+    /// The already-rendered step text (e.g. `"i += 1"`) of the innermost
+    /// enclosing `for` loop, whenever a bare `continue;` reaching this
+    /// scope should run that step before jumping -- C's `for (init; cond;
+    /// step) body` runs `step` on every iteration, including one that
+    /// `continue`s, but `render_for`'s translation to a plain `while cond
+    /// { body; step; }` only reaches the trailing `step;` by falling off
+    /// the bottom of `body`, so a bare `continue;` (which lowers to
+    /// Rust's own `continue`, jumping straight to `cond`) would silently
+    /// skip it -- a real behavior change, not just a style mismatch
+    /// (`A_BFGSpray`'s own `if (!linetarget) continue;` still has to
+    /// advance `i`, or every remaining offset angle after the first miss
+    /// is skipped). `render_for` sets this to its own step text for its
+    /// body's context; `Stmt::Continue`'s own `render_stmt` arm emits the
+    /// step immediately before `continue;` whenever it's `Some`. Cleared
+    /// (`None`) while rendering a nested loop's own body (`render_while`,
+    /// and `render_for` itself when recursing into a nested `for`, since
+    /// each freshly overwrites this with its own step) -- that inner
+    /// loop's `continue` targets itself, the same as it would in C, and
+    /// needs no help from an outer `for`'s step. Left untouched while
+    /// rendering into a `switch`'s own arms (`render_switch` passes `ctx`
+    /// through unchanged), since a `continue` reached through a `switch`
+    /// still targets the nearest enclosing *loop*, not the switch. `None`
+    /// everywhere else, including every isolated-fragment test below that
+    /// doesn't exercise a `for` loop at all.
+    active_for_continue_step: Option<&'a str>,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -1818,7 +1843,18 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             step,
             body,
         } => render_for(init, cond, step, body, ctx, depth),
-        Stmt::Continue => Ok(vec![format!("{}continue;", indent(depth))]),
+        // A bare `continue;` reaching a `for` loop's own step
+        // (`active_for_continue_step`, set by `render_for` for its body's
+        // own context) needs that step run first -- see its doc comment.
+        // Every other `continue` (inside a `while`, or with no enclosing
+        // `for` at all) renders bare, same as before.
+        Stmt::Continue => match ctx.active_for_continue_step {
+            Some(step) => Ok(vec![
+                format!("{}{step};", indent(depth)),
+                format!("{}continue;", indent(depth)),
+            ]),
+            None => Ok(vec![format!("{}continue;", indent(depth))]),
+        },
         // A real loop-exiting `break` (`EV_DoFloor`'s own `lowerAndChange`
         // case, several levels inside a `for` loop's own body) -- distinct
         // from the switch-case-delimiter `break` `render_switch` consumes
@@ -2052,6 +2088,17 @@ fn render_while(
     let (rhs_text, _) = render_expr(rhs, ctx)?;
     let test = format!("{target_text} {} {rhs_text}", render_binop(*op));
 
+    // A `continue` reached inside this `while`'s own body targets this
+    // loop, not some outer `for` it happens to be nested in -- it needs
+    // no step of its own run first, so any `active_for_continue_step` an
+    // enclosing `for` set is cleared here rather than leaking through
+    // (`render_for` itself needs no matching reset: it always overwrites
+    // this field with its own step before rendering a nested `for`'s
+    // body anyway).
+    let body_ctx = FnBodyContext {
+        active_for_continue_step: None,
+        ..*ctx
+    };
     let mut lines = vec![format!("{}loop {{", indent(depth))];
     lines.push(format!(
         "{}{target_text} = {value_text};",
@@ -2060,7 +2107,7 @@ fn render_while(
     lines.push(format!("{}if !({test}) {{", indent(depth + 1)));
     lines.push(format!("{}break;", indent(depth + 2)));
     lines.push(format!("{}}}", indent(depth + 1)));
-    lines.extend(render_block(body, ctx, depth + 1)?);
+    lines.extend(render_block(body, &body_ctx, depth + 1)?);
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
 }
@@ -2261,6 +2308,7 @@ fn render_thinker_list_scan(
     let inner_ctx = FnBodyContext {
         thinker_scan_alias: Some((var, "m")),
         active_goto_label: None,
+        active_for_continue_step: None,
         ..*ctx
     };
     let (cond_text, _) = render_expr(real_cond, &inner_ctx)?;
@@ -2288,9 +2336,16 @@ fn render_thinker_list_scan(
 /// C89 itself allows) and an `x++`/`x--` step are supported; both become
 /// an ordinary statement, with the step appended *after* the body inside
 /// a Rust `while` -- correct as long as the body itself never
-/// `continue`s (rejected below), since C's own `for` still runs its step
-/// on `continue`, unlike a bare Rust `while`/`loop`, which would jump
-/// straight back to the condition and skip it.
+/// `continue`s, since a bare Rust `continue` jumps straight back to the
+/// condition and would skip the step C's own `for` still runs on a
+/// `continue`d iteration. Handled, not rejected: `body` renders through a
+/// context with `active_for_continue_step` set to this loop's own step
+/// text, so `Stmt::Continue`'s own `render_stmt` arm can emit the step
+/// immediately before the `continue;` it renders (`A_BFGSpray`'s own `if
+/// (!linetarget) continue;`, still has to advance `i` before moving on to
+/// the next offset angle, confirmed by compiling both ways -- the naive
+/// bare-`continue` translation builds but silently loops on the same `i`
+/// forever whenever `linetarget` first comes up empty).
 fn render_for(
     init: &Option<ForInit>,
     cond: &Option<Expr>,
@@ -2308,24 +2363,18 @@ fn render_for(
     let Some(step) = step else {
         return Err("render_for: a missing step is not supported yet".to_string());
     };
-    let bare_continue = match body {
-        Stmt::Compound(c) => body_has_bare_continue(&c.items),
-        other => stmt_has_bare_continue(other),
-    };
-    if bare_continue {
-        return Err(
-            "render_for: `continue` inside a for-loop body is not supported yet (the translated `while` would skip the step, unlike C's `for`)"
-                .to_string(),
-        );
-    }
 
     let init_text = render_expr_stmt(init_expr, ctx)?;
     let cond_text = render_bool_expr(cond, ctx)?;
     let step_text = render_for_step(step, ctx)?;
+    let body_ctx = FnBodyContext {
+        active_for_continue_step: Some(step_text.as_str()),
+        ..*ctx
+    };
 
     let mut lines = vec![format!("{}{init_text};", indent(depth))];
     lines.push(format!("{}while {cond_text} {{", indent(depth)));
-    lines.extend(render_block(body, ctx, depth + 1)?);
+    lines.extend(render_block(body, &body_ctx, depth + 1)?);
     lines.push(format!("{}{step_text};", indent(depth + 1)));
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
@@ -2343,39 +2392,6 @@ fn render_for_step(step: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         Expr::PostIncDec { .. } | Expr::PreIncDec { .. } => Ok(render_expr(step, ctx)?.0),
         Expr::Assign { .. } => render_expr_stmt(step, ctx),
         other => Err(format!("render_for: unsupported step shape: {other:?}")),
-    }
-}
-
-/// Detects a `continue` reaching a `for` loop's own body directly --
-/// stops descending at a nested `while`/`for`, since that inner loop
-/// consumes its own `continue` rather than letting it reach the outer
-/// one. Mirrors `body_has_self_removal`'s own recursive-scan shape.
-fn body_has_bare_continue(items: &[BlockItem]) -> bool {
-    items.iter().any(|item| match item {
-        BlockItem::Stmt(s) => stmt_has_bare_continue(s),
-        BlockItem::Decl(_) => false,
-    })
-}
-
-fn stmt_has_bare_continue(s: &Stmt) -> bool {
-    match s {
-        Stmt::Continue => true,
-        Stmt::Compound(c) => body_has_bare_continue(&c.items),
-        Stmt::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            stmt_has_bare_continue(then_branch)
-                || else_branch
-                    .as_ref()
-                    .is_some_and(|eb| stmt_has_bare_continue(eb))
-        }
-        Stmt::Switch { body, .. } => stmt_has_bare_continue(body),
-        Stmt::Case { stmt, .. } => stmt_has_bare_continue(stmt),
-        Stmt::Default(stmt) => stmt_has_bare_continue(stmt),
-        Stmt::While { .. } | Stmt::For { .. } => false,
-        _ => false,
     }
 }
 
@@ -3310,6 +3326,22 @@ fn render_fn_impl(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone())),
     );
+    // `linetarget` (`p_local.h`'s own `extern mobj_t* linetarget;`) --
+    // `render_weapon_fn`'s own idiom (`A_Punch`/`A_Saw`), needed here too
+    // now that a plain `mobj_t*`-self action function references it
+    // (`A_BFGSpray`'s own `if (!linetarget) continue;` and
+    // `linetarget->x`/`.y`/`.z`/`.height`). Registering it here the same
+    // way makes every generic cross-reference-aware rendering site
+    // (`.is_some()`/`.is_none()`, `thinkers.get(world.linetarget.unwrap())`
+    // member access) apply automatically -- they key off
+    // `extra_cross_ref_idents`, not off which caller built this `ctx`.
+    let needs_linetarget = body_has_linetarget_ref(&f.body.items);
+    if needs_linetarget {
+        extra_cross_ref_idents.insert(
+            "linetarget".to_string(),
+            "Option<Handle<Thinker>>".to_string(),
+        );
+    }
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
     // Only a tick function that actually removes itself somewhere in its
@@ -3406,6 +3438,7 @@ fn render_fn_impl(
         self_removal_ident,
         thinker_scan_alias: None,
         active_goto_label: None,
+        active_for_continue_step: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let handle_part = if needs_self_removal && !composed_self_removal {
@@ -3419,7 +3452,7 @@ fn render_fn_impl(
         ""
     } else if needs_spawn_mut || composed_self_removal || needs_target_write {
         ", thinkers: &mut Arena<Thinker>"
-    } else if needs_target_deref {
+    } else if needs_target_deref || needs_linetarget {
         ", thinkers: &Arena<Thinker>"
     } else {
         ""
@@ -3505,6 +3538,7 @@ pub fn render_weapon_fn(
         angle_t_locals: &angle_t_locals,
         thinker_scan_alias: None,
         active_goto_label: None,
+        active_for_continue_step: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let needs_self_handle_deref =
@@ -4830,6 +4864,7 @@ pub fn render_spawn_fn(
         angle_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         active_goto_label: None,
+        active_for_continue_step: None,
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -5188,6 +5223,7 @@ pub fn render_trigger_fn(
         angle_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         active_goto_label: None,
+        active_for_continue_step: None,
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -5907,6 +5943,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -5998,6 +6035,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -6049,6 +6087,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -6121,6 +6160,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -6280,6 +6320,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -7434,6 +7475,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -7501,6 +7543,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7594,6 +7637,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7667,6 +7711,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7741,6 +7786,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
         rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
@@ -7820,6 +7866,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -9274,6 +9321,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             angle_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
@@ -10027,6 +10075,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             self_removal_ident: "arena",
             thinker_scan_alias: None,
             active_goto_label: None,
+            active_for_continue_step: None,
         };
         let rendered = render_compound_items(&f.body.items[9..11], &ctx, 1)
             .expect("should render cleanly")
@@ -10430,6 +10479,88 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(newmobj) { m.target = actor.target; };\n    \
              A_SkullAttack(newmobj);\n\
+             }"
+        );
+    }
+
+    /// `A_BFGSpray` (`p_pspr.c`) -- closes two real gaps at once, both
+    /// confirmed necessary by compiling the naive translation first, not
+    /// guessed at. (1) `if (!linetarget) continue;` inside its outer `for
+    /// (i=0; i<40; i++)`: `render_for`'s own translation to a plain
+    /// `while` only reaches the trailing step by falling off the bottom
+    /// of the body, so a bare `continue` would silently skip advancing
+    /// `i` forever the first time `linetarget` comes up empty -- see
+    /// `FnBodyContext::active_for_continue_step`'s own doc comment for
+    /// the fix (the step now renders immediately before every `continue`
+    /// reaching the `for`'s own body directly). (2) `linetarget` itself
+    /// was already renderable as a bare identifier (`is_target_tracer_
+    /// typed`'s special-cased `"world.linetarget"` text), but only
+    /// `render_weapon_fn` ever *registered* it in `extra_cross_ref_idents`
+    /// so `.is_some()`/`.is_none()`/member-dereference-through-`Arena`
+    /// rendering would actually fire -- `render_fn`/`render_fn_impl`
+    /// (the plain `mobj_t*`-self shape `A_BFGSpray` itself uses) never
+    /// had, since no earlier `mobj_t*`-self function referenced the
+    /// global. Naive output before this fix: `if world.linetarget == 0`
+    /// and raw `world.linetarget.x` field access, both outright wrong
+    /// (`World::linetarget` is `Option<Handle<Thinker>>`, not a
+    /// dereferenceable pointer) -- fixed by giving `render_fn_impl` the
+    /// same `body_has_linetarget_ref` registration `render_weapon_fn`
+    /// already had, extending its `thinkers` parameter decision to match.
+    /// `an = mo->angle - ANG90/2 + ANG90/40*i;` -- a *plain*-assign RHS
+    /// mixing `mo->angle` (`u32`) with `i` (a bare `int` loop counter) --
+    /// needed no renderer change at all: `i`'s only real constraint is
+    /// this same expression, so Rust's own deferred-`let` inference
+    /// settles it as `u32` to match, the same way `prestep`'s ambiguous
+    /// typing in `A_PainShootSkull` resolved for free. `P_SpawnMobj(
+    /// linetarget->x, .y, .z + (.height>>2), MT_EXTRABFG);` and
+    /// `P_DamageMobj(linetarget, mo->target, mo->target, damage);` both
+    /// reuse already-proven machinery verbatim (`Arena`-mediated member
+    /// reads through a registered `Option<Handle<Thinker>>` identifier,
+    /// `Shr<i32> for FixedT`, an `Option`-typed argument passed straight
+    /// through with no unwrap, `A_PainShootSkull`'s and `A_TroopAttack`'s
+    /// own idiom respectively). The inner `for (j=0;j<15;j++) damage +=
+    /// (P_Random()&7)+1;` is an ordinary brace-less-body counted loop
+    /// with a compound-assign accumulate, both already-proven shapes.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written `Arena`/`Handle`/`Mobj`/`World`/
+    /// `Thinker`/`FixedT` stand-ins and stub forward-referenced
+    /// functions -- zero errors.
+    #[test]
+    fn test_a_bfgspray_renders_exactly() {
+        let field_types = field_types(&[("angle", "u32"), ("target", "Option<Handle<Thinker>>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "A_BFGSpray",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BFGSpray(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             let mut j;\n    \
+             let mut damage;\n    \
+             let mut an;\n    \
+             i = 0;\n    \
+             while i < 40 {\n        \
+             an = mo.angle - ANG90 / 2 + ANG90 / 40 * i;\n        \
+             P_AimLineAttack(mo.target, an, 16 * 64 * FRACUNIT);\n        \
+             if world.linetarget.is_none() {\n            \
+             i += 1;\n            \
+             continue;\n        \
+             }\n        \
+             P_SpawnMobj(match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + (match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.height, _ => unreachable!() } >> 2), MT_EXTRABFG);\n        \
+             damage = 0;\n        \
+             j = 0;\n        \
+             while j < 15 {\n            \
+             damage += (P_Random() & 7) + 1;\n            \
+             j += 1;\n        \
+             }\n        \
+             P_DamageMobj(world.linetarget, mo.target, mo.target, damage);\n        \
+             i += 1;\n    \
+             }\n\
              }"
         );
     }
