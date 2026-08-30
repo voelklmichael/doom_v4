@@ -39,7 +39,7 @@
 //! two *do* rescale by `FRACUNIT` (true fixed-point multiply/divide)
 //! and mixing the two meanings under one name would be wrong.
 
-use std::ops::{Add, AddAssign, Div, Mul, Neg, Shr, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Mul, Neg, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign};
 
 pub const FRACBITS: u32 = 16;
 pub const FRACUNIT: FixedT = FixedT(1 << FRACBITS);
@@ -176,6 +176,32 @@ impl Shr<i32> for FixedT {
     }
 }
 
+/// `corpsehit->height <<= 2; ... corpsehit->height >>= 2;`
+/// (`PIT_VileCheck`, temporarily inflating a corpse's collision height
+/// to test-fit a resurrection, then restoring it) -- the compound-assign
+/// siblings of `Shr<i32>` above, needed together since C pairs a
+/// `<<=`/`>>=` by the same shift amount as a matched save/restore idiom.
+/// Same "thin wrapping-arithmetic pass-through, stays `FixedT`" reasoning
+/// throughout.
+impl Shl<i32> for FixedT {
+    type Output = FixedT;
+    fn shl(self, rhs: i32) -> FixedT {
+        FixedT(self.0 << rhs)
+    }
+}
+
+impl ShlAssign<i32> for FixedT {
+    fn shl_assign(&mut self, rhs: i32) {
+        self.0 <<= rhs;
+    }
+}
+
+impl ShrAssign<i32> for FixedT {
+    fn shr_assign(&mut self, rhs: i32) {
+        self.0 >>= rhs;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +315,18 @@ mod tests {
         let height = FixedT(56 * FRACUNIT.0);
         assert_eq!(height >> 1, FixedT(height.0 >> 1));
         assert_eq!(height >> 1, FixedT(28 * FRACUNIT.0));
+    }
+
+    #[test]
+    fn test_shl_shr_assign_round_trip_like_pit_vile_check() {
+        // `corpsehit->height <<= 2; ... corpsehit->height >>= 2;`
+        // (`PIT_VileCheck`) -- inflate then restore, ending back at the
+        // original value.
+        let mut height = FixedT(56 * FRACUNIT.0);
+        let original = height;
+        height <<= 2;
+        assert_eq!(height, FixedT(original.0 << 2));
+        height >>= 2;
+        assert_eq!(height, original);
     }
 }

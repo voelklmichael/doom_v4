@@ -201,6 +201,20 @@ struct FnBodyContext<'a> {
     /// plain tick/action function's own top-level locals (no corpus
     /// example anywhere else needs a `static` local yet).
     static_locals: &'a HashMap<String, String>,
+    /// Names of a plain local assigned straight from a call `is_bool_
+    /// returning_call` already recognizes as real-`bool`-returning
+    /// (`check = P_CheckPosition(..);`, `PIT_VileCheck`'s own idiom) --
+    /// `collect_bool_locals`. Needed because a `boolean`-declared local's
+    /// own decl (`boolean check;`) carries no usable type information by
+    /// itself (`render_decl`'s deferred-inference `let mut check;`
+    /// treats every bare specifier the same), so without this, a later
+    /// `if (!check)` would fall through to `render_bool_expr`'s generic
+    /// `int`-truthiness `== 0` cast -- wrong for a value that's already a
+    /// real Rust `bool` (`bool == 0` doesn't even compile), the same
+    /// class of bug `is_bool_returning_call`'s own bare (non-negated) use
+    /// already avoids. Empty for every context that isn't a plain tick/
+    /// action function's own top-level locals.
+    bool_locals: &'a HashSet<String>,
     /// Set only while rendering the RHS of a write to one field of a
     /// `Handle<Thinker>`-typed local (the `P_SpawnMobj`-local write arm
     /// in `render_expr_stmt`) -- the name of that same local, if any
@@ -624,6 +638,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             }
             if name == "braintargeton" {
                 return Ok(("world.braintargeton".to_string(), false));
+            }
+            // `corpsehit`/`vileobj`/`viletryx`/`viletryy` (`p_enemy.c`'s
+            // own file-scope `mobj_t* corpsehit; mobj_t* vileobj; fixed_t
+            // viletryx; fixed_t viletryy;`, `PIT_VileCheck`/`A_VileChase`'s
+            // idiom) -- the same category as `braintargets` just above
+            // (see `world.rs`'s own doc comment).
+            if name == "corpsehit" {
+                return Ok(("world.corpsehit".to_string(), false));
+            }
+            if name == "vileobj" {
+                return Ok(("world.vileobj".to_string(), false));
+            }
+            if name == "viletryx" {
+                return Ok(("world.viletryx".to_string(), false));
+            }
+            if name == "viletryy" {
+                return Ok(("world.viletryy".to_string(), false));
             }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
@@ -1279,6 +1310,34 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             };
             Ok((format!("{target_text} {op_text}"), false))
         }
+        // `abs(thing->x - viletryx)` (`PIT_VileCheck`) -- C's `abs()` is a
+        // real function call, but Rust has no free `abs` function at all
+        // (only an inherent `.abs()` method on the numeric type itself),
+        // so a bare `abs(x)` isn't just wrong, it doesn't compile. `x`
+        // here is `FixedT`-valued (`expr_is_fixed_t_valued`, extended just
+        // above to recognize this exact `corpsehit`/`vileobj`-style
+        // target/tracer-chain shape too) -- `abs(thing->x - viletryx) >
+        // maxdist` then compares against a plain `int` (`mobjinfo_t.
+        // radius`'s own established plain-`int` typing), matching C's own
+        // "fixed_t genuinely is int at the C level" idiom, so the whole
+        // call unwraps to the raw magnitude via `FixedT`'s own public
+        // `.0` before calling `.abs()`, not a new `FixedT::abs()` method
+        // that would need its own `PartialOrd<i32>`/similar to compare
+        // against a plain `int` anyway. A plain (non-`FixedT`) argument
+        // just gets the ordinary `.abs()` method call instead -- no real
+        // corpus example needs that shape yet, but it costs nothing to
+        // get right since the same predicate already exists.
+        Expr::Call { callee, args } if matches!(callee.as_ref(), Expr::Ident(n) if n == "abs") => {
+            let [arg] = args.as_slice() else {
+                return Err("render_expr: abs() with other than one argument".to_string());
+            };
+            let (arg_text, _) = render_expr(arg, ctx)?;
+            if expr_is_fixed_t_valued(arg, ctx) {
+                Ok((format!("({arg_text}).0.abs()"), false))
+            } else {
+                Ok((format!("({arg_text}).abs()"), false))
+            }
+        }
         Expr::Call { callee, args } => {
             let (callee_text, _) = render_expr(callee, ctx)?;
             let mut rendered_args = Vec::with_capacity(args.len());
@@ -1434,7 +1493,7 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
@@ -1506,6 +1565,21 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             op: UnaryOp::Not,
             expr,
         } if is_bool_returning_call(expr) => Ok(format!("!{}", render_expr(expr, ctx)?.0)),
+        // `if (!check) return true;` (`PIT_VileCheck`, once `check =
+        // P_CheckPosition(..);` bound it) -- the bare-`Ident` sibling of
+        // `is_bool_returning_call`'s own arm just above: `check` isn't
+        // itself a call, but its *only* assignment is one this module
+        // already recognizes as real-`bool`-returning
+        // (`FnBodyContext::bool_locals`), so it's already a genuine Rust
+        // `bool` by the time this reads it -- `bool == 0` doesn't even
+        // compile, so this can't fall through to the generic `int`-
+        // truthiness arm below.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.bool_locals.contains(n.as_str())) => {
+            Ok(format!("!{}", render_expr(expr, ctx)?.0))
+        }
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -1873,6 +1947,57 @@ fn render_existing_thinker_mutation(
 
 fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String>, String> {
     match s {
+        // `corpsehit->momx = corpsehit->momy = 0;` (`PIT_VileCheck`) --
+        // a chained assignment, parsed as `Assign{lhs: momx, rhs:
+        // Assign{lhs: momy, rhs: 0}}` (`parse_assignment_expr`'s own
+        // right-recursive RHS). `render_expr` has no `Expr::Assign` arm
+        // at all -- an assignment is only ever a *statement* here, never
+        // a value this renderer produces -- so the naive single-
+        // statement translation fails outright rather than mistranslating
+        // (confirmed directly, not guessed at). Split into the two
+        // ordinary assignments C's own chain performs in sequence
+        // (innermost first, matching real evaluation order: `momy` is
+        // assigned before `momx` reads it back), each rendered through
+        // the ordinary single-assignment path below so every existing
+        // write-side special case (target/tracer writes, same-handle
+        // writes, ...) still applies to each piece independently --
+        // scoped to a plain `=` chain only, the one real corpus shape,
+        // not every possible mix of compound ops.
+        Stmt::Expr(Some(Expr::Assign {
+            op: AssignOp::Assign,
+            lhs,
+            rhs,
+        })) if matches!(
+            rhs.as_ref(),
+            Expr::Assign {
+                op: AssignOp::Assign,
+                ..
+            }
+        ) =>
+        {
+            let Expr::Assign {
+                lhs: inner_lhs,
+                rhs: inner_rhs,
+                ..
+            } = rhs.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let first = Expr::Assign {
+                op: AssignOp::Assign,
+                lhs: inner_lhs.clone(),
+                rhs: inner_rhs.clone(),
+            };
+            let second = Expr::Assign {
+                op: AssignOp::Assign,
+                lhs: lhs.clone(),
+                rhs: inner_lhs.clone(),
+            };
+            Ok(vec![
+                format!("{}{};", indent(depth), render_expr_stmt(&first, ctx)?),
+                format!("{}{};", indent(depth), render_expr_stmt(&second, ctx)?),
+            ])
+        }
         Stmt::Expr(Some(e)) => Ok(vec![format!(
             "{}{};",
             indent(depth),
@@ -2185,6 +2310,7 @@ fn render_while(
     let body_ctx = FnBodyContext {
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
         ..*ctx
     };
     let mut lines = vec![format!("{}loop {{", indent(depth))];
@@ -2398,6 +2524,7 @@ fn render_thinker_list_scan(
         active_goto_label: None,
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
         ..*ctx
     };
     let (cond_text, _) = render_expr(real_cond, &inner_ctx)?;
@@ -2545,8 +2672,25 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
     match e {
         Expr::Ident(n) => n == "FRACUNIT",
         Expr::Member { base, field, .. } => {
+            // `corpsehit->momy` (`PIT_VileCheck`) -- a third real source,
+            // alongside `self_param`'s own fields and a spawned `Handle<
+            // Thinker>` local's: a target/tracer-typed alias (`is_target_
+            // tracer_typed`, the same general mechanism `self.target`/
+            // `.tracer`/`corpsehit`/`vileobj` all share) dereferencing a
+            // field registered `FixedT` is just as much a real `FixedT`
+            // value as reading it straight off `self` -- confirmed
+            // necessary by `corpsehit->momx = corpsehit->momy;` wrongly
+            // double-wrapping an already-`FixedT` value in `FixedT(..)` a
+            // second time before this arm existed (a real `rustc`
+            // rejection, not a style nit).
             let base_is_self_or_handle_local = matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
-                || matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
+                || matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+                || is_target_tracer_typed(
+                    base,
+                    ctx.self_param,
+                    ctx.self_field_types,
+                    ctx.extra_cross_ref_idents,
+                );
             base_is_self_or_handle_local
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT")
         }
@@ -2826,16 +2970,24 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         // treatment for the identical borrow-scoping reason, just through
         // `is_target_tracer_typed`'s own `Option<Handle<Thinker>>`-typed
         // base (so the handle itself needs its own `.unwrap()`, unlike
-        // that arm's already-bare `Handle<Thinker>` local). Scoped to a
-        // plain `=` only, and with no `is_option_handle_field`/`rhs_is_
-        // self` case (unlike the arm above) -- no real corpus example
-        // writing *through* a target/tracer chain needs either yet.
-        if *op == AssignOp::Assign
-            && let Expr::Member {
-                base,
-                field: lhs_field,
-                ..
-            } = lhs.as_ref()
+        // that arm's already-bare `Handle<Thinker>` local), and with no
+        // `is_option_handle_field`/`rhs_is_self` case (unlike the arm
+        // above) -- no real corpus example writing *through* a target/
+        // tracer chain needs that yet. Originally scoped to a plain `=`
+        // only; `corpsehit->height <<= 2; ... >>= 2;` (`PIT_VileCheck`,
+        // temporarily inflating a corpse's height to test-fit a
+        // resurrection, then restoring it) is the first real corpus
+        // example needing a *compound* op through this exact chain, so
+        // the guard now accepts any `AssignOp` -- the `FixedT`-field-wrap
+        // logic just below stays scoped to plain `=` only, unchanged
+        // (see its own comment), since a shift amount (`2`) is a plain
+        // `i32` operand for `ShlAssign<i32>`/`ShrAssign<i32>`, never
+        // itself `FixedT`-valued.
+        if let Expr::Member {
+            base,
+            field: lhs_field,
+            ..
+        } = lhs.as_ref()
             && is_target_tracer_typed(
                 base,
                 ctx.self_param,
@@ -2849,7 +3001,10 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             // local write arm above (`A_BrainExplode`'s own idiom, just
             // reached through a target/tracer chain instead: no real
             // corpus example yet, but the same class of raw-`int`-into-
-            // `FixedT` field write could occur here too).
+            // `FixedT` field write could occur here too). Scoped to a
+            // plain `=` (`*op == AssignOp::Assign`) the same way that
+            // arm's own is -- see `PIT_VileCheck`'s own comment just
+            // above for why a compound op here must *not* wrap.
             let is_fixed_t_field = ctx
                 .self_field_types
                 .get(lhs_field.as_str())
@@ -2863,7 +3018,10 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 same_target_write: target_tracer_key(base, ctx.self_param),
                 ..*ctx
             };
-            let rhs_text = if is_fixed_t_field && !expr_is_fixed_t_valued(rhs, &rhs_ctx) {
+            let rhs_text = if *op == AssignOp::Assign
+                && is_fixed_t_field
+                && !expr_is_fixed_t_valued(rhs, &rhs_ctx)
+            {
                 format!("FixedT({})", render_expr(rhs, &rhs_ctx)?.0)
             } else {
                 render_expr(rhs, &rhs_ctx)?.0
@@ -2893,11 +3051,13 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 target_tracer_key(base, ctx.self_param),
             ) {
                 return Ok(format!(
-                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} = __rhs; }}"
+                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} __rhs; }}",
+                    render_assign_op(*op)
                 ));
             }
             return Ok(format!(
-                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} = {rhs_text}; }}"
+                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} {rhs_text}; }}",
+                render_assign_op(*op)
             ));
         }
         let (lhs_text, _) = render_expr(lhs, ctx)?;
@@ -3002,8 +3162,32 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && (field == "target" || field == "tracer"));
         let rhs_is_handle_local = matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
+        // `corpsehit = thing;` (`PIT_VileCheck`) -- assigning `self` itself
+        // (`thing`) straight into a *global* registered `Option<Handle<
+        // Thinker>>` (`corpsehit`, `world.rs`'s own doc comment), not a
+        // self-struct field the way `lhs_is_target_or_tracer_self_field`
+        // covers -- the same "self as a value needs `Some(handle)`, not
+        // its own bare `&mut Mobj` text" idiom as that arm, just for a
+        // bare-`Ident` LHS instead of a `Member`. `render_fn_impl`'s own
+        // `handle`/`arena` extra-parameter machinery (`body_has_self_
+        // handle_value`, extended alongside this to recognize the same
+        // shape) supplies the real `handle: Handle<Thinker>` this renders
+        // through, the same value `fog->target = actor;` already gets.
+        let lhs_is_option_handle_global = matches!(lhs.as_ref(), Expr::Ident(n)
+            if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>"));
+        let rhs_is_self = matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param);
         let rhs_text = if lhs_is_specialdata && rhs_is_null {
             "None".to_string()
+        } else if lhs_is_option_handle_global && rhs_is_self {
+            // Unlike `rhs_is_handle_local` just below (a real `Handle<
+            // Thinker>`-valued local, correctly used bare), `rhs_text`
+            // here is `self_param`'s own rendered name (e.g. `"thing"`)
+            // -- a `&mut Mobj`, not a `Handle<Thinker>` at all, so it
+            // can't be wrapped directly. `render_fn_impl`'s own fixed
+            // `handle` parameter (the same one `fog->target = actor;`
+            // already uses) is the real `Handle<Thinker>` value self
+            // actually has here.
+            "Some(handle)".to_string()
         } else if (lhs_is_specialdata && rhs_is_ctor_var)
             || (lhs_is_target_or_tracer_self_field && rhs_is_handle_local)
         {
@@ -3012,6 +3196,38 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             format!("{rhs_text} as i32")
         } else if lhs_is_plain_int_local && *op == AssignOp::Assign && is_approx_distance_call {
             format!("({rhs_text}).0")
+        } else if lhs_is_plain_int_local
+            && *op == AssignOp::Assign
+            && expr_has_any_ident_ref(rhs, &["viletryx", "viletryy"])
+        {
+            // `xl = (viletryx - bmaporgx - MAXRADIUS*2)>>MAPBLOCKSHIFT;`
+            // (`A_VileChase`) -- the same "C silently reinterprets the
+            // bits" idiom `is_approx_distance_call` just above already
+            // handles for a bare call, but here the `FixedT`-valued
+            // source (`world.viletryx`) is buried *inside* a larger
+            // arithmetic expression, not the whole RHS -- wrapping the
+            // whole rendered text in `.0` wouldn't even parse (`world.
+            // viletryx - bmaporgx` itself doesn't compile as `FixedT`
+            // arithmetic in the first place: `FixedT` has no `Sub<i32>`,
+            // only `Add<i32>`, confirmed by attempting the naive
+            // translation first). `xl`/`xh`/`yl`/`yh` are genuinely plain
+            // `int` here (a blockmap cell index, matching every later use
+            // -- `bx=xl; while bx<=xh`, passed straight to `P_BlockThings
+            // Iterator`'s own `int x, int y` parameters) -- `fixed_t`
+            // really is just `int` at the C level, so this was always raw
+            // integer arithmetic despite `viletryx`'s own more-precise
+            // `FixedT` declaration (needed elsewhere, in `PIT_VileCheck`'s
+            // own genuinely fixed-point distance check). Unwrapping each
+            // `world.viletryx`/`world.viletryy` occurrence to its own raw
+            // `.0` directly (a plain textual substitution on the already-
+            // rendered string, not a new `FnBodyContext` field threaded
+            // through every recursive call for what's currently a two-
+            // name, one-function need) makes the *whole* expression
+            // native `i32` arithmetic from the start, needing no `FixedT`
+            // trait impl at all.
+            rhs_text
+                .replace("world.viletryx", "world.viletryx.0")
+                .replace("world.viletryy", "world.viletryy.0")
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
         } else {
@@ -3344,6 +3560,60 @@ fn fn_name_to_snake_case(fn_name: &str) -> String {
 /// `collect_plain_int_locals`/`collect_angle_t_locals` already use --  no
 /// real corpus example declares a `static` anywhere but a function's own
 /// top level.
+/// A plain local assigned straight from a real-`bool`-returning call
+/// (`check = P_CheckPosition(..);`, `PIT_VileCheck`'s own idiom) --
+/// `FnBodyContext::bool_locals`'s own doc comment covers why this is
+/// needed. Mirrors `collect_target_tracer_aliases`'s own recursive-scan
+/// shape (an assignment-sourced trait, so it has to look inside `if`/
+/// `switch`/loop bodies too, unlike a decl-based collector like
+/// `collect_plain_int_locals`, which only ever looks at the function's
+/// own top-level declarations).
+fn collect_bool_locals(items: &[BlockItem]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_bool_locals_in(items, &mut names);
+    names
+}
+
+fn collect_bool_locals_in(items: &[BlockItem], names: &mut HashSet<String>) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_bool_locals_stmt(s, names);
+        }
+    }
+}
+
+fn collect_bool_locals_stmt(s: &Stmt, names: &mut HashSet<String>) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && is_bool_returning_call(rhs)
+    {
+        names.insert(name.clone());
+    }
+    match s {
+        Stmt::Compound(c) => collect_bool_locals_in(&c.items, names),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_bool_locals_stmt(then_branch, names);
+            if let Some(eb) = else_branch {
+                collect_bool_locals_stmt(eb, names);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_bool_locals_stmt(body, names),
+        Stmt::Case { stmt, .. } => collect_bool_locals_stmt(stmt, names),
+        Stmt::Default(stmt) => collect_bool_locals_stmt(stmt, names),
+        Stmt::While { body, .. } => collect_bool_locals_stmt(body, names),
+        Stmt::For { body, .. } => collect_bool_locals_stmt(body, names),
+        _ => {}
+    }
+}
+
 fn collect_static_locals(items: &[BlockItem], fn_name: &str) -> HashMap<String, String> {
     let mut locals = HashMap::new();
     for item in items {
@@ -3508,9 +3778,25 @@ fn render_fn_impl(
             "Option<Handle<Thinker>>".to_string(),
         );
     }
+    // `corpsehit`/`vileobj` (`p_enemy.c`'s own file-scope `mobj_t*
+    // corpsehit; mobj_t* vileobj;`, `PIT_VileCheck`/`A_VileChase`'s
+    // idiom) -- the same registration `linetarget` gets just above, so
+    // `is_target_tracer_typed`'s general alias check (and everything
+    // built on it: `.is_some()`/`.is_none()`, `Arena`-mediated member
+    // reads *and* writes, `needs_target_write`'s own mutable-`Arena`
+    // upgrade) applies to a bare `corpsehit`/`vileobj` reference exactly
+    // the way it already does for `linetarget`.
+    if body_has_any_ident_ref(&f.body.items, &["corpsehit", "vileobj"]) {
+        extra_cross_ref_idents.insert(
+            "corpsehit".to_string(),
+            "Option<Handle<Thinker>>".to_string(),
+        );
+        extra_cross_ref_idents.insert("vileobj".to_string(), "Option<Handle<Thinker>>".to_string());
+    }
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
     let static_locals = collect_static_locals(&f.body.items, fn_name);
+    let bool_locals = collect_bool_locals(&f.body.items);
     // Only a tick function that actually removes itself somewhere in its
     // body (`is_self_removal_call`, possibly nested arbitrarily deep in
     // `switch`/`if` -- `T_VerticalDoor` buries several inside two levels
@@ -3525,11 +3811,25 @@ fn render_fn_impl(
     // truthiness or passes it opaquely) gets the extra `thinkers` read-
     // only lookup parameter.
     let needs_self_removal = body_has_self_removal(&f.body.items, &param_name);
+    // `&extra_cross_ref_idents`, not just `&target_tracer_aliases` --
+    // `corpsehit`/`vileobj` (`PIT_VileCheck`) are registered straight
+    // into the fuller map (the same way `linetarget` already is), not
+    // into `target_tracer_aliases` (populated only by `collect_target_
+    // tracer_aliases`'s own narrower "local assigned from self.target/
+    // .tracer" scan) -- using the narrower map here missed them entirely
+    // (confirmed a real gap: `corpsehit->momy = ..`/`.height <<= 2`
+    // rendered correctly in isolation but the signature never gained the
+    // `thinkers` parameter those renderings actually call `thinkers.
+    // get_mut`/`.get` through, a real "undefined variable" `rustc`
+    // rejection). `extra_cross_ref_idents` is always a superset of
+    // `target_tracer_aliases` by construction (it's seeded from a clone
+    // of it), so this only ever detects a real need more completely, not
+    // less.
     let needs_target_deref = body_has_target_deref(
         &f.body.items,
         &param_name,
         self_field_types,
-        &target_tracer_aliases,
+        &extra_cross_ref_idents,
     );
     // `actor->target->momz = ..;`/`fire->x = ..;` (`A_VileAttack`) --
     // writing *through* a target/tracer chain, not just reading through
@@ -3541,7 +3841,7 @@ fn render_fn_impl(
         &f.body.items,
         &param_name,
         self_field_types,
-        &target_tracer_aliases,
+        &extra_cross_ref_idents,
     );
     // A body that assigns a local from `P_SpawnMobj(...)` and then
     // writes one of its fields (`A_Tracer`'s own `th->momz = ...;`)
@@ -3562,8 +3862,12 @@ fn render_fn_impl(
     // one also needs `arena.remove(handle)`; this one only ever reads
     // `handle` as a plain value), so it reuses the same fixed `handle`
     // parameter name without self-removal's own `arena` companion.
-    let needs_self_handle_value =
-        body_has_self_handle_value(&f.body.items, &param_name, &spawn_mobj_locals);
+    let needs_self_handle_value = body_has_self_handle_value(
+        &f.body.items,
+        &param_name,
+        &spawn_mobj_locals,
+        &extra_cross_ref_idents,
+    );
     // `A_SpawnFly`'s own idiom (self-removal *and* target-alias
     // dereferencing/spawned-mobj writes in the same body) is the first
     // real function needing both at once -- previously rejected outright.
@@ -3603,6 +3907,7 @@ fn render_fn_impl(
         plain_int_locals: &plain_int_locals,
         angle_t_locals: &angle_t_locals,
         static_locals: &static_locals,
+        bool_locals: &bool_locals,
         self_removal_ident,
         thinker_scan_alias: None,
         active_goto_label: None,
@@ -3708,6 +4013,7 @@ pub fn render_weapon_fn(
         active_goto_label: None,
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let needs_self_handle_deref =
@@ -3830,6 +4136,21 @@ fn stmt_has_target_write(
         }
         Stmt::Default(stmt) => stmt_has_target_write(stmt, self_param, self_field_types, aliases),
         Stmt::While { body, .. } => {
+            stmt_has_target_write(body, self_param, self_field_types, aliases)
+        }
+        // `A_VileChase`'s own `corpsehit->height <<= 2;`/`.flags = ..;`/
+        // `.health = ..;`/`.target = NULL;`, all nested inside `for (bx=
+        // xl;..) { for (by=yl;..) { if (..) { ..writes.. } } }` -- missing
+        // entirely before (this recursive scan had no `Stmt::For` arm at
+        // all, unlike its `body_has_target_deref` sibling just below,
+        // which already does), so every one of these real writes was
+        // silently invisible to this check -- confirmed a real gap, not
+        // hypothetical: the function's own signature never gained the
+        // `thinkers: &mut Arena<Thinker>` parameter its own body's
+        // `thinkers.get_mut(..)` calls need, a genuine "undefined
+        // variable" `rustc` rejection caught only by compiling the whole
+        // function, not any single write in isolation.
+        Stmt::For { body, .. } => {
             stmt_has_target_write(body, self_param, self_field_types, aliases)
         }
         _ => false,
@@ -4231,6 +4552,7 @@ fn is_self_handle_value_assign(
     s: &Stmt,
     self_param: &str,
     spawn_locals: &HashMap<String, String>,
+    extra_cross_ref_idents: &HashMap<String, String>,
 ) -> bool {
     let Stmt::Expr(Some(Expr::Assign {
         op: AssignOp::Assign,
@@ -4240,21 +4562,33 @@ fn is_self_handle_value_assign(
     else {
         return false;
     };
-    let Expr::Member { base, field, .. } = lhs.as_ref() else {
+    if !matches!(rhs.as_ref(), Expr::Ident(n) if n == self_param) {
         return false;
-    };
-    (field == "target" || field == "tracer")
-        && matches!(base.as_ref(), Expr::Ident(n) if spawn_locals.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
-        && matches!(rhs.as_ref(), Expr::Ident(n) if n == self_param)
+    }
+    if let Expr::Member { base, field, .. } = lhs.as_ref() {
+        return (field == "target" || field == "tracer")
+            && matches!(base.as_ref(), Expr::Ident(n) if spawn_locals.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
+    }
+    // `corpsehit = thing;` (`PIT_VileCheck`) -- the bare-`Ident`-LHS
+    // sibling of the `Member`-LHS shape just above: assigning `self`
+    // straight into a *global* registered `Option<Handle<Thinker>>`
+    // (`corpsehit`), not a spawned local's own `target`/`tracer` field.
+    // See `render_expr_stmt`'s own `lhs_is_option_handle_global` arm,
+    // which this flag exists to unlock the `handle` parameter for.
+    matches!(lhs.as_ref(), Expr::Ident(n)
+        if extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>"))
 }
 
 fn body_has_self_handle_value(
     items: &[BlockItem],
     self_param: &str,
     spawn_locals: &HashMap<String, String>,
+    extra_cross_ref_idents: &HashMap<String, String>,
 ) -> bool {
     items.iter().any(|item| match item {
-        BlockItem::Stmt(s) => stmt_has_self_handle_value(s, self_param, spawn_locals),
+        BlockItem::Stmt(s) => {
+            stmt_has_self_handle_value(s, self_param, spawn_locals, extra_cross_ref_idents)
+        }
         BlockItem::Decl(_) => false,
     })
 }
@@ -4263,26 +4597,41 @@ fn stmt_has_self_handle_value(
     s: &Stmt,
     self_param: &str,
     spawn_locals: &HashMap<String, String>,
+    extra_cross_ref_idents: &HashMap<String, String>,
 ) -> bool {
-    if is_self_handle_value_assign(s, self_param, spawn_locals) {
+    if is_self_handle_value_assign(s, self_param, spawn_locals, extra_cross_ref_idents) {
         return true;
     }
     match s {
-        Stmt::Compound(c) => body_has_self_handle_value(&c.items, self_param, spawn_locals),
+        Stmt::Compound(c) => {
+            body_has_self_handle_value(&c.items, self_param, spawn_locals, extra_cross_ref_idents)
+        }
         Stmt::If {
             then_branch,
             else_branch,
             ..
         } => {
-            stmt_has_self_handle_value(then_branch, self_param, spawn_locals)
-                || else_branch
-                    .as_ref()
-                    .is_some_and(|eb| stmt_has_self_handle_value(eb, self_param, spawn_locals))
+            stmt_has_self_handle_value(
+                then_branch,
+                self_param,
+                spawn_locals,
+                extra_cross_ref_idents,
+            ) || else_branch.as_ref().is_some_and(|eb| {
+                stmt_has_self_handle_value(eb, self_param, spawn_locals, extra_cross_ref_idents)
+            })
         }
-        Stmt::Switch { body, .. } => stmt_has_self_handle_value(body, self_param, spawn_locals),
-        Stmt::Case { stmt, .. } => stmt_has_self_handle_value(stmt, self_param, spawn_locals),
-        Stmt::Default(stmt) => stmt_has_self_handle_value(stmt, self_param, spawn_locals),
-        Stmt::While { body, .. } => stmt_has_self_handle_value(body, self_param, spawn_locals),
+        Stmt::Switch { body, .. } => {
+            stmt_has_self_handle_value(body, self_param, spawn_locals, extra_cross_ref_idents)
+        }
+        Stmt::Case { stmt, .. } => {
+            stmt_has_self_handle_value(stmt, self_param, spawn_locals, extra_cross_ref_idents)
+        }
+        Stmt::Default(stmt) => {
+            stmt_has_self_handle_value(stmt, self_param, spawn_locals, extra_cross_ref_idents)
+        }
+        Stmt::While { body, .. } => {
+            stmt_has_self_handle_value(body, self_param, spawn_locals, extra_cross_ref_idents)
+        }
         _ => false,
     }
 }
@@ -4505,8 +4854,13 @@ fn stmt_has_self_handle_field_deref(
 /// dereferencing through it (`linetarget->x`/`.y`). Mirrors `expr_has_
 /// self_handle_field_deref`'s exact recursion shape, just with a simpler
 /// leaf check (a bare name match, not a `Member`-base shape).
-fn expr_has_linetarget_ref(e: &Expr) -> bool {
-    if matches!(e, Expr::Ident(n) if n == "linetarget") {
+/// Whether `e` references any of `names` as a bare identifier -- generalized
+/// from a `linetarget`-only check once `PIT_VileCheck`/`A_VileChase`
+/// needed the exact same "does this body reference file-scope global(s)
+/// X" detection for a *different* set of names (`corpsehit`/`vileobj`),
+/// rather than duplicating the whole recursive walk a second time.
+fn expr_has_any_ident_ref(e: &Expr, names: &[&str]) -> bool {
+    if matches!(e, Expr::Ident(n) if names.contains(&n.as_str())) {
         return true;
     }
     match e {
@@ -4514,63 +4868,68 @@ fn expr_has_linetarget_ref(e: &Expr) -> bool {
         | Expr::PreIncDec { expr, .. }
         | Expr::PostIncDec { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::Sizeof(SizeofArg::Expr(expr)) => expr_has_linetarget_ref(expr),
+        | Expr::Sizeof(SizeofArg::Expr(expr)) => expr_has_any_ident_ref(expr, names),
         Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
-            expr_has_linetarget_ref(lhs) || expr_has_linetarget_ref(rhs)
+            expr_has_any_ident_ref(lhs, names) || expr_has_any_ident_ref(rhs, names)
         }
         Expr::Assign { lhs, rhs, .. } => {
-            expr_has_linetarget_ref(lhs) || expr_has_linetarget_ref(rhs)
+            expr_has_any_ident_ref(lhs, names) || expr_has_any_ident_ref(rhs, names)
         }
         Expr::Conditional {
             cond,
             then_expr,
             else_expr,
         } => {
-            expr_has_linetarget_ref(cond)
-                || expr_has_linetarget_ref(then_expr)
-                || expr_has_linetarget_ref(else_expr)
+            expr_has_any_ident_ref(cond, names)
+                || expr_has_any_ident_ref(then_expr, names)
+                || expr_has_any_ident_ref(else_expr, names)
         }
         Expr::Call { callee, args } => {
-            expr_has_linetarget_ref(callee) || args.iter().any(expr_has_linetarget_ref)
+            expr_has_any_ident_ref(callee, names)
+                || args.iter().any(|a| expr_has_any_ident_ref(a, names))
         }
         Expr::Index { base, index } => {
-            expr_has_linetarget_ref(base) || expr_has_linetarget_ref(index)
+            expr_has_any_ident_ref(base, names) || expr_has_any_ident_ref(index, names)
         }
-        Expr::Member { base, .. } => expr_has_linetarget_ref(base),
+        Expr::Member { base, .. } => expr_has_any_ident_ref(base, names),
         _ => false,
     }
 }
 
-fn body_has_linetarget_ref(items: &[BlockItem]) -> bool {
-    items.iter().any(|item| {
-        match item {
+fn body_has_any_ident_ref(items: &[BlockItem], names: &[&str]) -> bool {
+    items.iter().any(|item| match item {
         BlockItem::Decl(d) => d.declarators.iter().any(|decl| {
-            matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_linetarget_ref(e))
+            matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_any_ident_ref(e, names))
         }),
-        BlockItem::Stmt(s) => stmt_has_linetarget_ref(s),
-    }
+        BlockItem::Stmt(s) => stmt_has_any_ident_ref(s, names),
     })
 }
 
-fn stmt_has_linetarget_ref(s: &Stmt) -> bool {
+fn stmt_has_any_ident_ref(s: &Stmt, names: &[&str]) -> bool {
     match s {
-        Stmt::Expr(Some(e)) => expr_has_linetarget_ref(e),
+        Stmt::Expr(Some(e)) => expr_has_any_ident_ref(e, names),
         Stmt::Expr(None) => false,
-        Stmt::Compound(c) => body_has_linetarget_ref(&c.items),
+        Stmt::Compound(c) => body_has_any_ident_ref(&c.items, names),
         Stmt::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            expr_has_linetarget_ref(cond)
-                || stmt_has_linetarget_ref(then_branch)
-                || else_branch.as_ref().is_some_and(|eb| stmt_has_linetarget_ref(eb))
+            expr_has_any_ident_ref(cond, names)
+                || stmt_has_any_ident_ref(then_branch, names)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_any_ident_ref(eb, names))
         }
-        Stmt::Switch { cond, body } => expr_has_linetarget_ref(cond) || stmt_has_linetarget_ref(body),
-        Stmt::Case { expr, stmt } => expr_has_linetarget_ref(expr) || stmt_has_linetarget_ref(stmt),
-        Stmt::Default(stmt) => stmt_has_linetarget_ref(stmt),
+        Stmt::Switch { cond, body } => {
+            expr_has_any_ident_ref(cond, names) || stmt_has_any_ident_ref(body, names)
+        }
+        Stmt::Case { expr, stmt } => {
+            expr_has_any_ident_ref(expr, names) || stmt_has_any_ident_ref(stmt, names)
+        }
+        Stmt::Default(stmt) => stmt_has_any_ident_ref(stmt, names),
         Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
-            expr_has_linetarget_ref(cond) || stmt_has_linetarget_ref(body)
+            expr_has_any_ident_ref(cond, names) || stmt_has_any_ident_ref(body, names)
         }
         Stmt::For {
             init,
@@ -4580,17 +4939,21 @@ fn stmt_has_linetarget_ref(s: &Stmt) -> bool {
         } => {
             init.as_ref().is_some_and(|i| match i {
                 ForInit::Decl(d) => d.declarators.iter().any(|decl| {
-                    matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_linetarget_ref(e))
+                    matches!(&decl.initializer, Some(Initializer::Expr(e)) if expr_has_any_ident_ref(e, names))
                 }),
-                ForInit::Expr(e) => expr_has_linetarget_ref(e),
-            }) || cond.as_ref().is_some_and(expr_has_linetarget_ref)
-                || step.as_ref().is_some_and(expr_has_linetarget_ref)
-                || stmt_has_linetarget_ref(body)
+                ForInit::Expr(e) => expr_has_any_ident_ref(e, names),
+            }) || cond.as_ref().is_some_and(|c| expr_has_any_ident_ref(c, names))
+                || step.as_ref().is_some_and(|s| expr_has_any_ident_ref(s, names))
+                || stmt_has_any_ident_ref(body, names)
         }
-        Stmt::Return(Some(e)) => expr_has_linetarget_ref(e),
-        Stmt::Labeled { stmt, .. } => stmt_has_linetarget_ref(stmt),
+        Stmt::Return(Some(e)) => expr_has_any_ident_ref(e, names),
+        Stmt::Labeled { stmt, .. } => stmt_has_any_ident_ref(stmt, names),
         _ => false,
     }
+}
+
+fn body_has_linetarget_ref(items: &[BlockItem]) -> bool {
+    body_has_any_ident_ref(items, &["linetarget"])
 }
 
 /// True for `var = Z_Malloc(...);` -- the allocation call itself, always
@@ -5035,6 +5398,7 @@ pub fn render_spawn_fn(
         active_goto_label: None,
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -5395,6 +5759,7 @@ pub fn render_trigger_fn(
         active_goto_label: None,
         active_for_continue_step: None,
         static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -6116,6 +6481,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -6209,6 +6575,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -6262,6 +6629,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -6336,6 +6704,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -6497,6 +6866,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -7653,6 +8023,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -7722,6 +8093,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7817,6 +8189,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7892,6 +8265,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7968,6 +8342,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
         rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
@@ -8049,6 +8424,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -9505,6 +9881,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
@@ -10260,6 +10637,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             active_goto_label: None,
             active_for_continue_step: None,
             static_locals: &HashMap::new(),
+            bool_locals: &HashSet::new(),
         };
         let rendered = render_compound_items(&f.body.items[9..11], &ctx, 1)
             .expect("should render cleanly")
@@ -10833,6 +11211,246 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(newmobj) { m.target = targ; };\n    \
              let __rhs = (match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - mo.y) / match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() } / match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }.tics; if let Some(Thinker::Mobj(m)) = thinkers.get_mut(newmobj) { m.reactiontime = __rhs; };\n    \
              S_StartSound(None, sfx_bospit);\n\
+             }"
+        );
+    }
+
+    /// `PIT_VileCheck` (`p_enemy.c`, `A_VileChase`'s own callback) --
+    /// closes five real gaps at once, each confirmed by compiling the
+    /// naive translation first. (1) `corpsehit`/`vileobj`/`viletryx`/
+    /// `viletryy` (`world.rs`'s own new fields) join the same registration
+    /// `linetarget` already gets in `render_fn_impl` (generalized to a
+    /// name-parameterized `body_has_any_ident_ref`/`expr_has_any_ident_ref`
+    /// once a *second* real caller needed the identical "does this body
+    /// reference file-scope global X" scan, rather than duplicating the
+    /// whole recursive walk again). (2) `corpsehit->momx = corpsehit->
+    /// momy = 0;` -- a chained assignment `render_expr` has no arm for at
+    /// all (an assignment is only ever a *statement* here) -- split into
+    /// two ordinary assignments in evaluation order, each still going
+    /// through every existing write-side special case independently.
+    /// (3) `abs(thing->x - viletryx) > maxdist` -- Rust has no free `abs`
+    /// function, only an inherent method; `thing->x - viletryx` is
+    /// `FixedT`-valued (`expr_is_fixed_t_valued`, extended to also
+    /// recognize a target/tracer-chain member read, not just `self`'s own
+    /// fields or a spawned local's -- confirmed necessary when `corpsehit
+    /// ->momx = corpsehit->momy;` first double-wrapped an already-`FixedT`
+    /// value), so `abs(..)` unwraps to the raw `i32` magnitude via `.0`
+    /// before calling `.abs()`, matching `fixed_t` genuinely being `int`
+    /// at the C level, then compares against a plain `int` (`mobjinfo_t.
+    /// radius`) with no further cast needed. (4) `corpsehit->height <<=
+    /// 2; ... >>= 2;` -- `FixedT` had `Shr<i32>` but no `Shl<i32>`/
+    /// `ShlAssign<i32>`/`ShrAssign<i32>` yet (`runtime/fixed.rs`), and the
+    /// target/tracer write arm itself was scoped to a plain `=` only,
+    /// rejecting any compound op through that chain -- both closed
+    /// together, with the `FixedT`-field wrap logic staying `=`-only
+    /// (a shift amount is a plain `i32` operand, never itself `FixedT`).
+    /// `corpsehit = thing;` (assigning `self` into the *global* `Option<
+    /// Handle<Thinker>>`, not a spawned local's own field the existing
+    /// `Some(handle)` arm covered) needed the identical treatment
+    /// generalized to a bare-`Ident` LHS (`is_self_handle_value_assign`,
+    /// extended alongside `render_expr_stmt`'s own new `lhs_is_option_
+    /// handle_global` arm). **A second-order gap this all surfaced**:
+    /// `needs_target_deref`/`needs_target_write` were computed against
+    /// `target_tracer_aliases` (the narrow, spawn-derived alias map)
+    /// instead of the fuller `extra_cross_ref_idents` `corpsehit`/
+    /// `vileobj` actually register into (the same map `linetarget` uses)
+    /// -- every render above was individually correct, but the function's
+    /// own *signature* never gained the `thinkers: &mut Arena<Thinker>`
+    /// parameter those renderings call `thinkers.get_mut`/`.get` through,
+    /// a real "undefined variable" `rustc` rejection caught only once the
+    /// *whole* function was compiled, not from any single-statement
+    /// check. Fixed by widening both checks to the superset map (`extra_
+    /// cross_ref_idents` is always a superset of `target_tracer_aliases`
+    /// by construction, so this only ever detects a real need more
+    /// completely, never less -- confirmed by the full suite staying
+    /// green). (5) `check = P_CheckPosition(..); if (!check) return
+    /// true;` -- `check`'s own decl (`boolean check;`) carries no usable
+    /// type info by itself, so without tracking that its *only*
+    /// assignment source is a call `is_bool_returning_call` already
+    /// recognizes, `!check` would've fallen through to the generic `int`-
+    /// truthiness `== 0` cast -- `bool == 0` doesn't even compile. New
+    /// `FnBodyContext::bool_locals`/`collect_bool_locals` closes this the
+    /// same way `plain_int_locals`/`angle_t_locals` already track other
+    /// locally-inferred typing gaps. `thing.flags & MF_CORPSE == 0`
+    /// (`!(thing->flags & MF_CORPSE)`) needed no change at all: Rust's own
+    /// `&`-binds-tighter-than-`==` precedence already lands on the same
+    /// grouping C's explicit parens forced, the same coincidence
+    /// `T_MoveFloor`'s own `leveltime & 7 == 0` already established.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written `Arena`/`Handle`/`Mobj`/`MobjInfo`/
+    /// `World`/`Thinker`/`FixedT` stand-ins and a stub forward-referenced
+    /// `P_CheckPosition` -- zero errors. `test_pit_vile_check_renders_
+    /// exactly`. 396/396 tests passing.
+    #[test]
+    fn test_pit_vile_check_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("tics", "i32"),
+            ("info", "&'static MobjInfo"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("height", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "PIT_VileCheck",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn PIT_VileCheck(thing: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) -> bool {\n    \
+             let mut maxdist;\n    \
+             let mut check;\n    \
+             if thing.flags & MF_CORPSE == 0 {\n        \
+             return true;\n    \
+             }\n    \
+             if thing.tics != -1 {\n        \
+             return true;\n    \
+             }\n    \
+             if thing.info.raisestate == S_NULL {\n        \
+             return true;\n    \
+             }\n    \
+             maxdist = thing.info.radius + MOBJINFO[MT_VILE as usize].radius;\n    \
+             if (thing.x - world.viletryx).0.abs() > maxdist || (thing.y - world.viletryy).0.abs() > maxdist {\n        \
+             return true;\n    \
+             }\n    \
+             world.corpsehit = Some(handle);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.momy = FixedT(0); };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.momx = m.momy; };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.height <<= 2; };\n    \
+             check = P_CheckPosition(world.corpsehit, match thinkers.get(world.corpsehit.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.corpsehit.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.height >>= 2; };\n    \
+             if !check {\n        \
+             return true;\n    \
+             }\n    \
+             return false;\n\
+             }"
+        );
+    }
+
+    /// `A_VileChase` (`p_enemy.c`, `PIT_VileCheck`'s own caller) -- closes
+    /// out the pair with two more real gaps, both confirmed by compiling
+    /// the naive translation first. (1) `needs_target_deref`/`needs_
+    /// target_write` were computed against `target_tracer_aliases` (the
+    /// narrow, spawn-derived alias map) instead of the fuller `extra_
+    /// cross_ref_idents` `corpsehit`/`vileobj` actually register into --
+    /// see `test_pit_vile_check_renders_exactly`'s own entry for the full
+    /// story; this function's own `stmt_has_target_write` additionally
+    /// had *no* `Stmt::For` arm at all (unlike its `stmt_has_target_deref`
+    /// sibling, which already does), so `corpsehit->height <<= 2;`/
+    /// `.flags = ..;`/`.health = ..;`/`.target = NULL;` -- all nested
+    /// inside `for (bx=xl;..) { for (by=yl;..) { if (..) { ..writes.. }
+    /// } }` -- were entirely invisible to it, missing the `thinkers: &mut
+    /// Arena<Thinker>` parameter those writes actually need. (2) `xl =
+    /// (viletryx - bmaporgx - MAXRADIUS*2)>>MAPBLOCKSHIFT;` -- `viletryx`
+    /// is genuinely `FixedT` (needed as such in `PIT_VileCheck`'s own
+    /// distance check), but `xl`/`xh`/`yl`/`yh` are plain-`int`-declared
+    /// blockmap cell indices, the same "one value, genuinely mixed
+    /// `FixedT`/`int` usage across call sites" idiom `A_SkullAttack`'s
+    /// own `dist` already established, just on a *global* this time
+    /// rather than a local. `is_approx_distance_call`'s existing `.0`-
+    /// unwrap wraps the *whole* rendered RHS, which doesn't work here --
+    /// `world.viletryx - bmaporgx` doesn't even compile as `FixedT`
+    /// arithmetic in the first place (`FixedT` has `Add<i32>` but no
+    /// `Sub<i32>`, confirmed by attempting the naive version) -- so each
+    /// `world.viletryx`/`world.viletryy` occurrence unwraps to its own
+    /// raw `.0` individually instead (a plain textual substitution on the
+    /// already-rendered string, scoped to a plain-`int`-local `=` target
+    /// containing either name), making the whole expression native `i32`
+    /// arithmetic needing no new `FixedT` trait impl at all. Everything
+    /// else reuses already-proven machinery verbatim: `vileobj = actor;`
+    /// (`Some(handle)` into a global, `PIT_VileCheck`'s own `corpsehit =
+    /// thing;` idiom), `temp = actor->target; actor->target = corpsehit;
+    /// A_FaceTarget(actor); actor->target = temp;` (a save/restore
+    /// through `is_target_tracer_typed`'s ordinary alias/self-field
+    /// mechanism, no `Some(..)` wrap needed on either side since both
+    /// sides are already `Option`-typed), `info = corpsehit->info;`
+    /// (an ordinary target/tracer-chain read yielding a real `&'static
+    /// MobjInfo`, no different from `newmobj->state` in `A_BrainSpit`),
+    /// and `corpsehit->target = NULL;` (the already-general, unconditional
+    /// `NULL` -> `None` rename, needing no per-field awareness at all).
+    /// `!P_BlockThingsIterator(bx,by,PIT_VileCheck)` needed only a one-
+    /// line addition to `is_bool_returning_call`'s list (its own real
+    /// declared C return type, confirmed by direct read of `p_local.h`),
+    /// and passing `PIT_VileCheck` itself by bare name as the callback
+    /// argument needed nothing at all -- an ordinary, already-general
+    /// identifier reference. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against hand-written `Arena`/
+    /// `Handle`/`Mobj`/`MobjInfo`/`World`/`Thinker`/`FixedT` stand-ins and
+    /// stub forward-referenced functions (a generic stub for `P_
+    /// SetMobjState`, called with two genuinely different argument shapes
+    /// in this one function -- `actor`, a `&mut Mobj`, and `world.
+    /// corpsehit`, an `Option<Handle<Thinker>>` -- sidesteps this
+    /// project's own already-documented, separate "cross-function
+    /// signature wiring" gap rather than needing it solved here) -- zero
+    /// errors. `test_a_vile_chase_renders_exactly`. 397/397 tests
+    /// passing.
+    #[test]
+    fn test_a_vile_chase_renders_exactly() {
+        let field_types = field_types(&[
+            ("movedir", "i32"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("info", "&'static MobjInfo"),
+            ("target", "Option<Handle<Thinker>>"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_VileChase",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_VileChase(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
+             let mut xl;\n    \
+             let mut xh;\n    \
+             let mut yl;\n    \
+             let mut yh;\n    \
+             let mut bx;\n    \
+             let mut by;\n    \
+             let mut info;\n    \
+             let mut temp;\n    \
+             if actor.movedir != DI_NODIR {\n        \
+             world.viletryx = actor.x + actor.info.speed * xspeed[actor.movedir as usize];\n        \
+             world.viletryy = actor.y + actor.info.speed * yspeed[actor.movedir as usize];\n        \
+             xl = world.viletryx.0 - bmaporgx - MAXRADIUS * 2 >> MAPBLOCKSHIFT;\n        \
+             xh = world.viletryx.0 - bmaporgx + MAXRADIUS * 2 >> MAPBLOCKSHIFT;\n        \
+             yl = world.viletryy.0 - bmaporgy - MAXRADIUS * 2 >> MAPBLOCKSHIFT;\n        \
+             yh = world.viletryy.0 - bmaporgy + MAXRADIUS * 2 >> MAPBLOCKSHIFT;\n        \
+             world.vileobj = Some(handle);\n        \
+             bx = xl;\n        \
+             while bx <= xh {\n            \
+             by = yl;\n            \
+             while by <= yh {\n                \
+             if !P_BlockThingsIterator(bx, by, PIT_VileCheck) {\n                    \
+             temp = actor.target;\n                    \
+             actor.target = world.corpsehit;\n                    \
+             A_FaceTarget(actor);\n                    \
+             actor.target = temp;\n                    \
+             P_SetMobjState(actor, S_VILE_HEAL1);\n                    \
+             S_StartSound(world.corpsehit, sfx_slop);\n                    \
+             info = match thinkers.get(world.corpsehit.unwrap()) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() };\n                    \
+             P_SetMobjState(world.corpsehit, info.raisestate);\n                    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.height <<= 2; };\n                    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.flags = info.flags; };\n                    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.health = info.spawnhealth; };\n                    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.target = None; };\n                    \
+             return;\n                \
+             }\n                \
+             by += 1;\n            \
+             }\n            \
+             bx += 1;\n        \
+             }\n    \
+             }\n    \
+             A_Chase(actor);\n\
              }"
         );
     }

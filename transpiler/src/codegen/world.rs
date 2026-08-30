@@ -63,6 +63,15 @@
 //! nothing to initialize *to* yet; whichever future piece builds that
 //! constructor is responsible for seeding this at `0`, matching the C
 //! initializer's own "runs once, at program start" semantics.
+//! `corpsehit`/`vileobj`/`viletryx`/`viletryy` joined once `PIT_VileCheck`/
+//! `A_VileChase` (`p_enemy.c`) needed somewhere to hold their own shared
+//! file-scope `mobj_t* corpsehit; mobj_t* vileobj; fixed_t viletryx;
+//! fixed_t viletryy;` -- the same "genuine mutable game state a callback
+//! and its caller communicate through" category `linetarget`/
+//! `braintargets` already established, just a pair of single values
+//! (`corpsehit`/`vileobj`, `Option<Handle<Thinker>>`) and a pair of
+//! coordinates (`viletryx`/`viletryy`, `FixedT`) instead of one value or
+//! an array.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -85,6 +94,10 @@ pub struct World {
     pub numbraintargets: i32,
     pub braintargeton: i32,
     pub a_brain_spit_easy: i32,
+    pub corpsehit: Option<Handle<Thinker>>,
+    pub vileobj: Option<Handle<Thinker>>,
+    pub viletryx: FixedT,
+    pub viletryy: FixedT,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -158,6 +171,10 @@ mod tests {
         assert!(rendered.contains("pub numbraintargets: i32,"));
         assert!(rendered.contains("pub braintargeton: i32,"));
         assert!(rendered.contains("pub a_brain_spit_easy: i32,"));
+        assert!(rendered.contains("pub corpsehit: Option<Handle<Thinker>>,"));
+        assert!(rendered.contains("pub vileobj: Option<Handle<Thinker>>,"));
+        assert!(rendered.contains("pub viletryx: FixedT,"));
+        assert!(rendered.contains("pub viletryy: FixedT,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
