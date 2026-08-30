@@ -1215,6 +1215,39 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (rhs_text, _) = render_expr(state_num, ctx)?;
             Ok((format!("state_index({lhs_text}) == {rhs_text}"), false))
         }
+        // `thing == tmthing` (`PIT_StompThing`'s own "don't clip against
+        // self" check) -- comparing the function's own receiver's
+        // *identity* against a foreign `Handle<Thinker>`-typed cross-
+        // reference (`ctx.self_param` alone renders as `&mut Mobj`, not a
+        // `Handle<Thinker>`, so this doesn't type-check as a bare
+        // passthrough). `render_fn_impl`'s own signature extension
+        // (`body_has_self_identity_comparison`) supplies a real `handle:
+        // Handle<Thinker>` parameter whenever this shape is found, so the
+        // self-side substitutes that fixed name; the other side renders
+        // normally (already a `Handle<Thinker>`-typed value).
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (matches!(lhs.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    || matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param))
+                && (matches!(lhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+                    || matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))) =>
+        {
+            let is_self = |e: &Expr| matches!(e, Expr::Ident(n) if n == ctx.self_param);
+            let lhs_text = if is_self(lhs) {
+                "handle".to_string()
+            } else {
+                render_expr(lhs, ctx)?.0
+            };
+            let rhs_text = if is_self(rhs) {
+                "handle".to_string()
+            } else {
+                render_expr(rhs, ctx)?.0
+            };
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
         // `dist > 14*64`/`dist < 196`/`P_Random() < dist` (`P_CheckMissile
         // Range`) -- a comparison between a genuinely `fixed_t`-declared
         // local (`FnBodyContext::fixed_t_locals`) and a plain `int`-valued
@@ -4493,6 +4526,22 @@ fn render_fn_impl(
         );
         extra_cross_ref_idents.insert("vileobj".to_string(), "Option<Handle<Thinker>>".to_string());
     }
+    // `tmthing` (`p_map.c`'s own file-scope `mobj_t* tmthing;`,
+    // `PIT_StompThing`'s own idiom) -- registered *bare* `Handle<Thinker>`,
+    // not `Option`-wrapped like `corpsehit`/`vileobj`: confirmed by
+    // grepping every real reference to it across the whole file, it is
+    // never null-checked anywhere, always dereferenced or compared
+    // directly, the same "always valid in practice, never guarded"
+    // pattern a `P_SpawnMobj` result already gets. Unlike `corpsehit`/
+    // `vileobj`, this doesn't automatically light up `needs_target_deref`
+    // (`is_target_tracer_typed`'s own `Expr::Ident` arm only recognizes
+    // `Option<Handle<Thinker>>`, by design -- its sibling rendering arms
+    // hardcode `.unwrap()`, which would be wrong for a bare value), so it
+    // needs its own narrow read-access flag below.
+    let needs_tmthing = body_has_any_ident_ref(&f.body.items, &["tmthing"]);
+    if needs_tmthing {
+        extra_cross_ref_idents.insert("tmthing".to_string(), "Handle<Thinker>".to_string());
+    }
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
     let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
@@ -4584,6 +4633,13 @@ fn render_fn_impl(
         f.body.items.iter().any(
             |item| matches!(item, BlockItem::Stmt(s) if is_thinker_list_scan_for(s).is_some()),
         );
+    // `thing == tmthing` (`PIT_StompThing`) -- the comparison-side sibling
+    // of `needs_self_handle_value`'s own assignment-side check (see
+    // `body_has_self_identity_comparison`'s own doc comment); drives the
+    // same `handle: Handle<Thinker>` parameter for a genuinely different
+    // reason, so it's its own flag rather than folded into that one.
+    let needs_self_identity_comparison =
+        body_has_self_identity_comparison(&f.body.items, &param_name, &extra_cross_ref_idents);
     // `A_SpawnFly`'s own idiom (self-removal *and* target-alias
     // dereferencing/spawned-mobj writes in the same body) is the first
     // real function needing both at once -- previously rejected outright.
@@ -4598,7 +4654,7 @@ fn render_fn_impl(
     // separately-named `arena` parameter. `needs_self_handle_value`
     // combined with self-removal has no real corpus example yet (unlike
     // this one), so that combination is left rejected rather than guessed.
-    if needs_self_removal && needs_self_handle_value {
+    if needs_self_removal && (needs_self_handle_value || needs_self_identity_comparison) {
         return Err(format!(
             "{fn_name}: needs both self-removal and a spawned mobj's own handle value -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
         ));
@@ -4634,7 +4690,7 @@ fn render_fn_impl(
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let handle_part = if needs_self_removal && !composed_self_removal {
         ", handle: Handle<Thinker>, arena: &mut Arena<Thinker>"
-    } else if needs_self_removal || needs_self_handle_value {
+    } else if needs_self_removal || needs_self_handle_value || needs_self_identity_comparison {
         ", handle: Handle<Thinker>"
     } else {
         ""
@@ -4643,7 +4699,7 @@ fn render_fn_impl(
         ""
     } else if needs_spawn_mut || composed_self_removal || needs_target_write {
         ", thinkers: &mut Arena<Thinker>"
-    } else if needs_target_deref || needs_linetarget || needs_thinker_scan_for {
+    } else if needs_target_deref || needs_linetarget || needs_thinker_scan_for || needs_tmthing {
         ", thinkers: &Arena<Thinker>"
     } else {
         ""
@@ -5352,6 +5408,96 @@ fn stmt_has_self_handle_value(
         }
         Stmt::While { body, .. } => {
             stmt_has_self_handle_value(body, self_param, spawn_locals, extra_cross_ref_idents)
+        }
+        _ => false,
+    }
+}
+
+/// `thing == tmthing` (`PIT_StompThing`'s own "don't clip against self"
+/// check) -- comparing the function's own receiver's *identity* against
+/// a foreign `Handle<Thinker>`-typed cross-reference (here a bare global,
+/// `tmthing`, registered the same by-name way `corpsehit`/`vileobj`
+/// already are). The comparison-side sibling of `is_self_handle_value_
+/// assign`'s own assignment-side check: `self_param` alone renders as a
+/// `&mut Mobj`, not the `Handle<Thinker>` this comparison actually needs,
+/// so it doesn't type-check directly -- needs the same fixed `handle`
+/// parameter substitution `render_fn_impl`'s signature extension already
+/// supplies for `body_has_self_handle_value`'s own case, just triggered
+/// by a different real shape. Unlike that assignment-only check, this
+/// lives inside a *condition*, so it recurses into `if`/`while`'s own
+/// `cond` expressions too, not just nested statement bodies.
+fn body_has_self_identity_comparison(
+    items: &[BlockItem],
+    self_param: &str,
+    extra_cross_ref_idents: &HashMap<String, String>,
+) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => {
+            stmt_has_self_identity_comparison(s, self_param, extra_cross_ref_idents)
+        }
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn expr_has_self_identity_comparison(
+    e: &Expr,
+    self_param: &str,
+    extra_cross_ref_idents: &HashMap<String, String>,
+) -> bool {
+    let Expr::Binary { op, lhs, rhs } = e else {
+        return false;
+    };
+    if !matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+        return false;
+    }
+    let is_self = |x: &Expr| matches!(x, Expr::Ident(n) if n == self_param);
+    let is_handle_cross_ref = |x: &Expr| {
+        matches!(x, Expr::Ident(n)
+            if extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+    };
+    (is_self(lhs) && is_handle_cross_ref(rhs)) || (is_self(rhs) && is_handle_cross_ref(lhs))
+}
+
+fn stmt_has_self_identity_comparison(
+    s: &Stmt,
+    self_param: &str,
+    extra_cross_ref_idents: &HashMap<String, String>,
+) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => {
+            expr_has_self_identity_comparison(e, self_param, extra_cross_ref_idents)
+        }
+        Stmt::Compound(c) => {
+            body_has_self_identity_comparison(&c.items, self_param, extra_cross_ref_idents)
+        }
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_self_identity_comparison(cond, self_param, extra_cross_ref_idents)
+                || stmt_has_self_identity_comparison(
+                    then_branch,
+                    self_param,
+                    extra_cross_ref_idents,
+                )
+                || else_branch.as_ref().is_some_and(|eb| {
+                    stmt_has_self_identity_comparison(eb, self_param, extra_cross_ref_idents)
+                })
+        }
+        Stmt::Switch { cond, body } => {
+            expr_has_self_identity_comparison(cond, self_param, extra_cross_ref_idents)
+                || stmt_has_self_identity_comparison(body, self_param, extra_cross_ref_idents)
+        }
+        Stmt::Case { stmt, .. } => {
+            stmt_has_self_identity_comparison(stmt, self_param, extra_cross_ref_idents)
+        }
+        Stmt::Default(stmt) => {
+            stmt_has_self_identity_comparison(stmt, self_param, extra_cross_ref_idents)
+        }
+        Stmt::While { cond, body } => {
+            expr_has_self_identity_comparison(cond, self_param, extra_cross_ref_idents)
+                || stmt_has_self_identity_comparison(body, self_param, extra_cross_ref_idents)
         }
         _ => false,
     }
@@ -13393,6 +13539,69 @@ pub fn P_ThingHeightClip(thing: &mut Mobj, world: &mut World) -> bool {
     if thing.ceilingz - thing.floorz < thing.height {
         return false;
     }
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `PIT_StompThing` (`p_map.c`) -- a `boolean`-returning callback
+    /// function (`P_BlockThingsIterator`'s own `func` parameter shape,
+    /// already proven passable as a bare forward-referenced identifier by
+    /// `A_VileChase`'s own `P_BlockThingsIterator(bx, by, PIT_VileCheck)`)
+    /// dereferencing `tmthing` -- a bare, file-scope `mobj_t* tmthing;`
+    /// (`p_map.c`), confirmed by grepping every real reference to it
+    /// across the whole file: never null-checked anywhere, so registered
+    /// *bare* `Handle<Thinker>` (`render_fn_impl`'s new `needs_tmthing`
+    /// check), not `Option`-wrapped like `corpsehit`/`vileobj`.
+    /// `tmthing->radius`/`.player` then render through the fully generic,
+    /// already-existing `Handle<Thinker>` `Expr::Member` arm with zero new
+    /// rendering code. **One genuinely new shape**: `thing == tmthing`
+    /// compares the function's own receiver's *identity* (`thing`, a
+    /// `&mut Mobj`) against `tmthing` (a `Handle<Thinker>` *value*) --
+    /// doesn't type-check as a bare passthrough, needing the function's
+    /// own `handle: Handle<Thinker>` parameter (`body_has_self_identity_
+    /// comparison`, the comparison-side sibling of `body_has_self_handle_
+    /// value`'s own assignment-side check) and a new `render_expr` arm
+    /// substituting `handle` for the self side of the comparison.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written `Mobj`/`World`/`Handle`/`Arena` stand-ins,
+    /// a bare `Handle<Thinker>`-typed `tmthing`/`FixedT`-typed `tmx`/`tmy`
+    /// static, and a stub `P_DamageMobj` matching this real call site's
+    /// own argument shape -- zero errors.
+    #[test]
+    fn test_pit_stomp_thing_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("radius", "FixedT"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("player", "Option<PlayerId>"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "PIT_StompThing",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn PIT_StompThing(thing: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>, handle: Handle<Thinker>) -> bool {
+    let mut blockdist;
+    if thing.flags & MF_SHOOTABLE == 0 {
+        return true;
+    }
+    blockdist = thing.radius + match thinkers.get(tmthing) { Some(Thinker::Mobj(m)) => m.radius, _ => unreachable!() };
+    if FixedT((thing.x - tmx).0.abs()) >= blockdist || FixedT((thing.y - tmy).0.abs()) >= blockdist {
+        return true;
+    }
+    if handle == tmthing {
+        return true;
+    }
+    if match thinkers.get(tmthing) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_none() && gamemap != 30 {
+        return false;
+    }
+    P_DamageMobj(thing, tmthing, tmthing, 10000);
     return true;
 }";
         assert_eq!(rendered, expected);
