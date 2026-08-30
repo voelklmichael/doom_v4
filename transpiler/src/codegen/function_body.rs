@@ -1176,6 +1176,42 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `(activeplats[i])->status = (activeplats[i])->oldstatus;`
+        // (`P_ActivateInStasis`) -- the RHS reads a *different* field of
+        // the exact *same* handle the LHS write's own `get_mut` already
+        // holds mutably; resolving it through a second, independent
+        // `thinkers.get(..)` call would be a real borrow conflict (the
+        // identical hazard `same_handle_write`'s own doc comment already
+        // documents for `A_FatAttack1`'s `mo`), so it reuses the write's
+        // already-bound match variable instead. Checked before the
+        // general array-read arm just below, which would otherwise
+        // (wrongly, unsoundly) spawn a fresh `get(..)` here.
+        Expr::Member { base, field, .. } if matches!(active_array_variant(base), Some((_, var)) if ctx.same_handle_write == Some(var)) =>
+        {
+            let (_, var) = active_array_variant(base).expect("guarded above");
+            Ok((format!("{var}.{}", rust_field_name(field)?), false))
+        }
+        // `(activeplats[i])->field` / `(activeceilings[j])->field` --
+        // reading a field through a `Handle<Thinker>` stored in one of
+        // the two global "active movers" arrays (`P_ActivateInStasis`/
+        // `EV_StopPlat`'s own idiom), the array-index sibling of
+        // `is_self_bare_handle_field`'s own arm just above (same fresh-
+        // per-access `thinkers.get(..)` discipline, just a different
+        // base shape and always `Option`-wrapped so it needs its own
+        // `.unwrap()` -- every real corpus call site already guards the
+        // whole block behind `if (activeplats[i] && ...)`, so this is
+        // always genuinely `Some` by the time it's reached).
+        Expr::Member { base, field, .. } if active_array_variant(base).is_some() => {
+            let (variant, var) = active_array_variant(base).expect("guarded above");
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!(
+                    "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::{variant}({var})) => {var}.{}, _ => unreachable!() }}",
+                    rust_field_name(field)?
+                ),
+                false,
+            ))
+        }
         Expr::Member { base, field, .. } => {
             if !ctx.ctor_var.is_empty()
                 && matches!(base.as_ref(), Expr::Ident(n) if n == ctx.ctor_var)
@@ -1548,6 +1584,30 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
                 false,
             ))
+        }
+        // `(activeplats[j])->tag == line->tag` (`EV_StopPlat`/
+        // `P_ActivateInStasisCeiling`/`EV_CeilingCrushStop`) -- a genuine
+        // `i16`-vs-`i32` mismatch, the same category `EV_LightTurnOn`'s
+        // own deferred blocker is (see `docs/03_TRANSPILER.md`), but one-
+        // directional and narrowly scoped here: `plat_t.tag`/`ceiling_t.
+        // tag` are plain `int` (`i32`, confirmed by direct read of
+        // `p_spec.h`), while `line_t.tag` is `i16` (`struct_fields.rs`'s
+        // own mapping) -- Rust's `==` needs identical types on both
+        // sides, so `line`'s own `i16` side gets an explicit widening
+        // `as i32` (always lossless, matching C's own implicit int
+        // promotion here), rather than the general `Expr::Binary`
+        // fallback just below, which has no per-field width tracking at
+        // all.
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+        } if matches!(lhs.as_ref(), Expr::Member { base, field, .. } if field == "tag" && active_array_variant(base).is_some())
+            && matches!(rhs.as_ref(), Expr::Member { base, field, .. } if field == "tag" && matches!(base.as_ref(), Expr::Ident(n) if n == "line")) =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            Ok((format!("{lhs_text} == {rhs_text} as i32"), false))
         }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
@@ -1977,10 +2037,18 @@ fn render_binary_operand(
     // version first).
     let not_of_non_comparison_binary = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
         if matches!(expr.as_ref(), Expr::Binary { op, .. } if !is_comparison_or_logical(*op)));
+    // `activeplats[i] && (activeplats[i])->tag == tag && ...`
+    // (`P_ActivateInStasis`) -- a bare `Option<Handle<Thinker>>`-valued
+    // global-array element as one `&&` operand, the `Expr::Index` sibling
+    // of the bare-`Ident` `Option`-valued arm just below (`is_option_valued`
+    // already recognizes this shape).
+    let is_option_valued_index =
+        matches!(operand, Expr::Index { .. }) && is_option_valued(operand, ctx);
     if matches!(parent_op, BinaryOp::LogAnd | BinaryOp::LogOr)
         && (matches!(operand, Expr::Member { .. })
             || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op))
             || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx))
+            || is_option_valued_index
             || not_of_known_int_local
             || not_of_non_comparison_binary)
     {
@@ -2034,6 +2102,12 @@ fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
             Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>") | Some("Option<SectorId>")
         ),
         Expr::Member { field, .. } if field == "player" => true,
+        // `activeplats[i]`/`activeceilings[j]` (`P_ActivateInStasis`/
+        // `EV_StopPlat`'s own scan) -- the global-array sibling of the
+        // cases just below, `Option<Handle<Thinker>>`-valued the same way
+        // `P_AddActivePlat`'s own `if (activeplats[i] == NULL)` scan
+        // already established.
+        Expr::Index { .. } if active_array_variant(expr).is_some() => true,
         // `!actor->target` (`A_PosAttack` and friends) -- `target`'s
         // registered type (`Mobj.target: Option<Handle<Thinker>>`, per
         // `struct_fields.rs`'s own self-referential-field mapping) is the
@@ -2157,6 +2231,16 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // the plain-`Member`-field arm just below: `powers` is a plain
         // `int` array (a tic-count flag, not `Option`-valued), so this is
         // ordinary C truthiness, `!= 0`.
+        // `if (activeplats[i])` / `activeplats[i] && ...` (`P_ActivateInStasis`)
+        // -- a bare `Option<Handle<Thinker>>`-valued global-array element
+        // used for truthiness (a null-pointer check in the original), the
+        // `Expr::Index` sibling of the bare-`Member`/bare-`Ident` `Option`-
+        // valued arms above. Checked before the generic `!= 0` arm just
+        // below, which would otherwise wrongly apply plain-`int`
+        // truthiness to a real `Option`.
+        Expr::Index { .. } if is_option_valued(cond, ctx) => {
+            Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
+        }
         Expr::Index { .. } => Ok(format!("{} != 0", render_expr(cond, ctx)?.0)),
         // `if (actor->info->painsound)` (`A_Pain`) -- a bare struct-field
         // reference used for truthiness, same as `specialdata` above, but
@@ -2608,6 +2692,16 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             }
             Ok(lines)
         }
+        // `(activeplats[i])->thinker.function.acp1 = (actionf_p1)
+        // T_PlatRaise;` (`P_ActivateInStasis`/`EV_StopPlat`) -- discarded
+        // entirely, matching `is_function_pointer_assign`'s own reasoning
+        // for a constructor's identical idiom (see
+        // `is_active_array_function_pointer_assign`'s own doc comment).
+        // Checked here, in plain `render_stmt`, rather than a spawn
+        // function's own item-filtering loop, since this idiom appears
+        // nested inside a trigger function's `if` body, not at a
+        // constructor's top level.
+        Stmt::Expr(Some(e)) if is_active_array_function_pointer_assign(e) => Ok(vec![]),
         Stmt::Expr(Some(e)) => Ok(vec![format!(
             "{}{};",
             indent(depth),
@@ -3780,6 +3874,31 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             return Ok(format!(
                 "if let Some(Thinker::{}({})) = thinkers.get_mut({}) {{ {}.{field} = {rhs_text}; }}",
                 mh.rust_type, mh.var, mh.handle_expr, mh.var
+            ));
+        }
+        // `(activeplats[i])->field = expr;` -- the array-index sibling of
+        // the `mutating_handle` write arm just above, same fresh-per-
+        // access `thinkers.get_mut(..)` discipline, for the two global
+        // "active movers" arrays instead of a constructor's own back-
+        // reference (`P_ActivateInStasis`'s own `(activeplats[i])->status
+        // = (activeplats[i])->oldstatus;`).
+        if *op == AssignOp::Assign
+            && let Expr::Member {
+                base,
+                field: lhs_field,
+                ..
+            } = lhs.as_ref()
+            && let Some((variant, var)) = active_array_variant(base)
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            let rhs_ctx = FnBodyContext {
+                same_handle_write: Some(var),
+                ..*ctx
+            };
+            let (rhs_text, _) = render_expr(rhs, &rhs_ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            return Ok(format!(
+                "if let Some(Thinker::{variant}({var})) = thinkers.get_mut({base_text}.unwrap()) {{ {var}.{field} = {rhs_text}; }}"
             ));
         }
         // `th->field = expr;` / `th->field -= expr;` -- writing a field of
@@ -6694,26 +6813,81 @@ fn is_add_thinker_call(s: &Stmt) -> bool {
     matches!(callee.as_ref(), Expr::Ident(n) if n == "P_AddThinker")
 }
 
+/// `activeplats[i]`/`activeceilings[j]` (`Option<Handle<Thinker>>`
+/// global arrays, `P_AddActivePlat`/`P_AddActiveCeiling`'s own idiom) --
+/// which `Thinker` variant, and what to call the bound match-arm
+/// variable, a dereference through that array element needs.
+/// Hand-matched by array name, the same "no general struct-field-type
+/// registry, name it explicitly" style `sides`/`sectors` already
+/// established for their own dedicated `Expr::Index` arms -- there are
+/// only these two such global arrays in the whole corpus.
+fn active_array_variant(expr: &Expr) -> Option<(&'static str, &'static str)> {
+    let Expr::Index { base, .. } = expr else {
+        return None;
+    };
+    match base.as_ref() {
+        Expr::Ident(n) if n == "activeplats" => Some(("Plat", "p")),
+        Expr::Ident(n) if n == "activeceilings" => Some(("Ceiling", "c")),
+        _ => None,
+    }
+}
+
+/// The deepest `Member` in a chain (closest to its own real base),
+/// alongside that member's own field name -- e.g. `var->thinker.
+/// function.acp1` walks past `.acp1`/`.function` to land on `(var,
+/// "thinker")`. Shared by `is_function_pointer_assign` (a constructor's
+/// own `var` base, a plain `Ident`) and `is_active_array_function_
+/// pointer_assign` (an existing thinker found through `activeplats[i]`/
+/// `activeceilings[j]`, an `Expr::Index` base) -- the two real corpus
+/// shapes that reassign a thinker's function pointer, on genuinely
+/// different base expressions but the identical "walk to the innermost
+/// `.thinker`" logic.
+fn innermost_member_field(e: &Expr) -> Option<(&Expr, &str)> {
+    let Expr::Member { base, field, .. } = e else {
+        return None;
+    };
+    match base.as_ref() {
+        Expr::Member { .. } => innermost_member_field(base),
+        other => Some((other, field.as_str())),
+    }
+}
+
 /// True for `var->thinker.function.acpN = (cast) FnName;` -- the deepest
 /// `Member` in the chain (closest to `var`) names field `"thinker"`,
 /// regardless of how many `.function`/`.acpN` levels sit on top of it.
 /// Always discarded: the enum variant tag already encodes which function
 /// this is.
 fn is_function_pointer_assign(s: &Stmt, ctor_var: &str) -> bool {
-    fn innermost_base_and_field(e: &Expr) -> Option<(&str, &str)> {
-        let Expr::Member { base, field, .. } = e else {
-            return None;
-        };
-        match base.as_ref() {
-            Expr::Ident(name) => Some((name.as_str(), field.as_str())),
-            inner => innermost_base_and_field(inner),
-        }
-    }
     let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s else {
         return false;
     };
-    innermost_base_and_field(lhs)
-        .is_some_and(|(base, field)| base == ctor_var && field == "thinker")
+    matches!(innermost_member_field(lhs), Some((Expr::Ident(name), field)) if name == ctor_var && field == "thinker")
+}
+
+/// True for `(activeplats[i])->thinker.function.acp1 = (actionf_p1)
+/// T_PlatRaise;` / `.acv = (actionf_v)NULL;` (`P_ActivateInStasis`/
+/// `EV_StopPlat`'s own idiom, restarting/pausing an *existing* thinker
+/// found through one of the two global "active movers" arrays) -- the
+/// same discard `is_function_pointer_assign` already applies to a
+/// constructor's own `var->thinker.function.acpN = ...;`, just for this
+/// different base shape (an `activeplats[i]`/`activeceilings[j]` index,
+/// not a plain ctor-var identifier). The enum variant tag already fixes
+/// which function a `Plat`/`Ceiling` dispatches to, so reassigning (or
+/// nulling) the function pointer changes nothing real in the translated
+/// design -- confirmed by `T_PlatRaise`'s own already-translated
+/// `in_stasis => {}` no-op arm, which already makes "the tick function is
+/// skipped entirely" and "the tick function runs but does nothing"
+/// behaviorally identical, so this discard is exact, not an
+/// approximation. Checked directly against `Stmt::Expr`'s own inner
+/// expression (unlike `is_function_pointer_assign`, called from ordinary
+/// `render_stmt`, not a constructor's own item-filtering loop, since this
+/// idiom appears nested inside a plain trigger function's `if` body, not
+/// at a spawn function's top level).
+fn is_active_array_function_pointer_assign(e: &Expr) -> bool {
+    let Expr::Assign { lhs, .. } = e else {
+        return false;
+    };
+    matches!(innermost_member_field(lhs), Some((base, "thinker")) if active_array_variant(base).is_some())
 }
 
 /// `var->field = expr;`, split into which field and the right-hand side
@@ -15127,6 +15301,199 @@ pub fn EV_TurnTagLightsOff(line: &Line, world: &mut World) {
         }
         j += 1;
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ActivateInStasis` (`p_plats.c`) -- the first function
+    /// dereferencing *through* a `Handle<Thinker>` stored in one of the
+    /// two global "active movers" arrays (`activeplats`/`activeceilings`,
+    /// `P_AddActivePlat`/`P_AddActiveCeiling`'s own arrays, previously
+    /// only ever compared against `None`/assigned a fresh handle, never
+    /// read/written *through*). `active_array_variant` (hand-matched by
+    /// array name, the same style `sides`/`sectors` already established
+    /// for their own dedicated `Expr::Index` arms) resolves which
+    /// `Thinker` variant and bound match-arm name (`Plat`/`p`,
+    /// `Ceiling`/`c`) a dereference needs; a bare `activeplats[i]` used
+    /// for truthiness (`is_option_valued`'s own new `Expr::Index` arm)
+    /// gets `.is_some()`, matching `P_AddActivePlat`'s own established
+    /// `Option<Handle<Thinker>>`-array semantics. Each field read gets a
+    /// fresh `thinkers.get(..)` call at its own point of use (the same
+    /// per-access-borrow discipline `mutating_handle`'s own read arm
+    /// already established), *except* when the read is of a *different*
+    /// field of the exact same handle a sibling write in the same
+    /// statement already holds mutably (`(activeplats[i])->status =
+    /// (activeplats[i])->oldstatus;`) -- reusing `same_handle_write`
+    /// (keyed here by the fixed bound name, `"p"`/`"c"`, rather than a
+    /// bare identifier) avoids a real overlapping-borrow rejection a
+    /// naive second `thinkers.get(..)` inside the write's own `get_mut`
+    /// block would hit. `(activeplats[i])->thinker.function.acp1 =
+    /// (actionf_p1) T_PlatRaise;` is discarded entirely (`is_active_
+    /// array_function_pointer_assign`, a new `render_stmt` arm returning
+    /// an empty `Vec`): the enum variant tag already fixes which function
+    /// a `Plat` dispatches to, so reassigning the function pointer
+    /// changes nothing real in the translated design -- confirmed by
+    /// `T_PlatRaise`'s own already-translated `in_stasis => {}` no-op
+    /// arm, which already makes "the tick function is skipped entirely"
+    /// and "the tick function runs but does nothing" behaviorally
+    /// identical. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Plat`/`World`/`Handle`/
+    /// `Arena`/`Thinker` stand-in -- zero errors. `test_p_activate_in_stasis_renders_exactly`.
+    #[test]
+    fn test_p_activate_in_stasis_renders_exactly() {
+        let params = field_types(&[("tag", "i32")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "P_ActivateInStasis",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ActivateInStasis(tag: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut i;
+    i = 0;
+    while i < MAXPLATS {
+        if world.activeplats[i as usize].is_some() && match thinkers.get(world.activeplats[i as usize].unwrap()) { Some(Thinker::Plat(p)) => p.tag, _ => unreachable!() } == tag && match thinkers.get(world.activeplats[i as usize].unwrap()) { Some(Thinker::Plat(p)) => p.status, _ => unreachable!() } == in_stasis {
+            if let Some(Thinker::Plat(p)) = thinkers.get_mut(world.activeplats[i as usize].unwrap()) { p.status = p.oldstatus; };
+        }
+        i += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_StopPlat` (`p_plats.c`) -- `P_ActivateInStasis`'s own sibling
+    /// (pausing rather than resuming), needing exactly one new piece:
+    /// `(activeplats[j])->tag == line->tag` is a genuine `i16`-vs-`i32`
+    /// mismatch, the same category `EV_LightTurnOn`'s own deferred
+    /// blocker is (see `docs/03_TRANSPILER.md`), but one-directional and
+    /// narrowly scoped here (a read-only comparison, never written back):
+    /// `plat_t.tag` is plain `int` (`i32`, confirmed by direct read of
+    /// `p_spec.h`), while `line_t.tag` is `i16` (`struct_fields.rs`'s own
+    /// mapping) -- a new, narrowly-scoped `Expr::Binary` arm (checked
+    /// before the generic fallback) widens `line`'s own `i16` side with
+    /// an explicit `as i32` (always lossless, matching C's own implicit
+    /// int promotion here). Everything else reuses `P_ActivateInStasis`'s
+    /// own machinery unchanged: `(activeplats[j])->status != in_stasis`
+    /// (a plain `i32`-vs-`i32` comparison, no cast), the two-field same-
+    /// handle write (`oldstatus = status`), a plain-literal-RHS write
+    /// (`status = in_stasis`), and the discarded function-pointer-null
+    /// reassignment. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Plat`/`Line`/`World`/
+    /// `Handle`/`Arena`/`Thinker` stand-in -- zero errors. `test_ev_stop_plat_renders_exactly`.
+    #[test]
+    fn test_ev_stop_plat_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "EV_StopPlat",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_StopPlat(line: &Line, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut j;
+    j = 0;
+    while j < MAXPLATS {
+        if world.activeplats[j as usize].is_some() && match thinkers.get(world.activeplats[j as usize].unwrap()) { Some(Thinker::Plat(p)) => p.status, _ => unreachable!() } != in_stasis && match thinkers.get(world.activeplats[j as usize].unwrap()) { Some(Thinker::Plat(p)) => p.tag, _ => unreachable!() } == line.tag as i32 {
+            if let Some(Thinker::Plat(p)) = thinkers.get_mut(world.activeplats[j as usize].unwrap()) { p.oldstatus = p.status; };
+            if let Some(Thinker::Plat(p)) = thinkers.get_mut(world.activeplats[j as usize].unwrap()) { p.status = in_stasis; };
+        }
+        j += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ActivateInStasisCeiling` (`p_ceilng.c`) -- `P_ActivateInStasis`'s
+    /// own exact twin, one `Thinker` variant over (`Ceiling`/`c`,
+    /// `activeceilings`), including the same `i16`-vs-`i32` `tag`
+    /// comparison `EV_StopPlat` needed (`ceiling_t.tag` is plain `int`
+    /// too, confirmed by direct read of `p_spec.h`). The whole `for`
+    /// loop's body is wrapped in its own extra (redundant, but present in
+    /// the real corpus) `{ }` block this time, needing no new rendering
+    /// at all: `render_block`'s existing `Stmt::Compound` arm already
+    /// renders a nested compound at the *same* depth its own caller
+    /// passed in, so the output is identical either way. No other new
+    /// mechanism needed. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against a hand-written `Ceiling`/`Line`/
+    /// `World`/`Handle`/`Arena`/`Thinker` stand-in -- zero errors. `test_p_activate_in_stasis_ceiling_renders_exactly`.
+    #[test]
+    fn test_p_activate_in_stasis_ceiling_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "P_ActivateInStasisCeiling",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ActivateInStasisCeiling(line: &Line, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut i;
+    i = 0;
+    while i < MAXCEILINGS {
+        if world.activeceilings[i as usize].is_some() && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.tag, _ => unreachable!() } == line.tag as i32 && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.direction, _ => unreachable!() } == 0 {
+            if let Some(Thinker::Ceiling(c)) = thinkers.get_mut(world.activeceilings[i as usize].unwrap()) { c.direction = c.olddirection; };
+        }
+        i += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_CeilingCrushStop` (`p_ceilng.c`) -- `EV_StopPlat`'s own
+    /// `Ceiling`-shaped twin, `int`-returning (`0`/`1`, matching a plain
+    /// `boolean`-style result the original spells as a bare `int`) via
+    /// `render_trigger_fn`'s existing `return_type` parameter, needing no
+    /// new mechanism beyond what `P_ActivateInStasisCeiling`/`EV_StopPlat`
+    /// already established: a plain `int rtn` local (unrelated to any
+    /// thinker/array machinery) assigned `0`/`1` and returned normally,
+    /// `direction != 0` (no cast -- both `i32`), and a plain-literal-RHS
+    /// same-array write (`direction = 0`) alongside the same-handle write
+    /// (`olddirection = direction`) and the discarded function-pointer-
+    /// null reassignment. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against the same stand-ins as its sibling
+    /// -- zero errors. `test_ev_ceiling_crush_stop_renders_exactly`.
+    #[test]
+    fn test_ev_ceiling_crush_stop_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "EV_CeilingCrushStop",
+            &params,
+            &HashMap::new(),
+            None,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_CeilingCrushStop(line: &Line, world: &mut World, thinkers: &mut Arena<Thinker>) -> i32 {
+    let mut i;
+    let mut rtn;
+    rtn = 0;
+    i = 0;
+    while i < MAXCEILINGS {
+        if world.activeceilings[i as usize].is_some() && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.tag, _ => unreachable!() } == line.tag as i32 && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.direction, _ => unreachable!() } != 0 {
+            if let Some(Thinker::Ceiling(c)) = thinkers.get_mut(world.activeceilings[i as usize].unwrap()) { c.olddirection = c.direction; };
+            if let Some(Thinker::Ceiling(c)) = thinkers.get_mut(world.activeceilings[i as usize].unwrap()) { c.direction = 0; };
+            rtn = 1;
+        }
+        i += 1;
+    }
+    return rtn;
 }";
         assert_eq!(rendered, expected);
     }
