@@ -2482,9 +2482,36 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         // deferred-inference local (unconditionally `mut`, the same as
         // every uninitialized decl below, rather than analyzing whether
         // this particular one is ever reassigned).
+        // `fixed_t height = MAXINT;` / `= 0;` (`P_FindLowestCeilingSurrounding`
+        // /`P_FindHighestCeilingSurrounding`, `p_spec.c`) -- a `fixed_t`-
+        // declared local's own initializer, straight from an opaque macro
+        // constant or a bare integer literal, with no `FRACUNIT`/cross-ref
+        // involvement `expr_is_fixed_t_valued` would already recognize.
+        // Unlike a self-struct field *write* (already wrapped elsewhere),
+        // a plain local's own declaration was rendered wholly inline before
+        // now -- Rust would then fix this binding's type from the bare
+        // `i32`-valued initializer alone, conflicting the moment the loop
+        // body reassigns a real `FixedT` (`world[other.unwrap()]
+        // .ceilingheight`) into the same binding, confirmed a real `E0308`
+        // by direct `rustc` reproduction before adding this. Guarded by
+        // `expr_is_fixed_t_valued` the same way the self-struct-field-write
+        // wrap already is, so an initializer that's already genuinely
+        // `FixedT`-valued (`sec->floorheight`, `-500*FRACUNIT`, ...) is
+        // never double-wrapped.
+        let is_fixed_t_decl = matches!(
+            d.specifiers.type_specifiers.as_slice(),
+            [TypeSpecifier::TypedefName(n)] if n == "fixed_t"
+        );
         let init_text = match &decl.initializer {
             None => String::new(),
-            Some(Initializer::Expr(e)) => format!(" = {}", render_expr(e, ctx)?.0),
+            Some(Initializer::Expr(e)) => {
+                let (text, _) = render_expr(e, ctx)?;
+                if is_fixed_t_decl && !expr_is_fixed_t_valued(e, ctx) {
+                    format!(" = FixedT({text})")
+                } else {
+                    format!(" = {text}")
+                }
+            }
             Some(Initializer::List(_)) => {
                 return Err(
                     "render_decl: a brace-list initializer is not supported so far".to_string(),
@@ -15100,6 +15127,98 @@ pub fn P_FindHighestFloorSurrounding(sec: SectorId, world: &mut World) -> FixedT
         i += 1;
     }
     return floor;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FindLowestCeilingSurrounding`/`P_FindHighestCeilingSurrounding`
+    /// (`p_spec.c`) translated -- the two functions the previous entry
+    /// above deliberately left blocked on a `fixed_t`-declared local's own
+    /// declaration initializer needing a `FixedT(..)` wrap when it comes
+    /// from an opaque macro (`MAXINT`) or bare integer literal (`0`), with
+    /// no `FRACUNIT`/cross-ref involvement `expr_is_fixed_t_valued` already
+    /// recognizes. `render_decl` now applies that wrap whenever the
+    /// declared type is `fixed_t` and the initializer isn't already
+    /// `expr_is_fixed_t_valued` -- guarded the same way the pre-existing
+    /// self-struct-field-write wrap already is, so `sec->floorheight`/
+    /// `-500*FRACUNIT`-shaped initializers (the previous entry's own two
+    /// functions) are never double-wrapped; confirmed by re-running their
+    /// own tests unchanged, and the full suite (439/439, no regression)
+    /// since this generalizes `render_decl` itself, not just adds a new
+    /// narrow arm nothing else could hit. Otherwise these two are wholly
+    /// identical in shape to `P_FindLowestFloorSurrounding`/`P_Find
+    /// HighestFloorSurrounding`, needing nothing else new. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Sector`/`Line`/`World`/`FixedT`/stub-
+    /// `getNextSector` stand-in for both -- zero errors.
+    /// `test_p_find_lowest_ceiling_surrounding_renders_exactly`,
+    /// `test_p_find_highest_ceiling_surrounding_renders_exactly`.
+    #[test]
+    fn test_p_find_lowest_ceiling_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindLowestCeilingSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindLowestCeilingSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut height = FixedT(MAXINT);
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].ceilingheight < height {
+            height = world[other.unwrap()].ceilingheight;
+        }
+        i += 1;
+    }
+    return height;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn test_p_find_highest_ceiling_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindHighestCeilingSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindHighestCeilingSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut height = FixedT(0);
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].ceilingheight > height {
+            height = world[other.unwrap()].ceilingheight;
+        }
+        i += 1;
+    }
+    return height;
 }";
         assert_eq!(rendered, expected);
     }
