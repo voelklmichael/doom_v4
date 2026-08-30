@@ -1739,9 +1739,15 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // *parameter* (`card_t`, an `i32` under this project's own
             // locally-typedef'd-enum mapping), not a local Rust could
             // freely infer as `usize` here.
+            // `player->psprites[ps_weapon]` (`P_BringUpWeapon`) is the
+            // same shape once more: `ps_weapon` is a bare `psprnum_t`
+            // enum-constant identifier, fixed `i32` elsewhere in the
+            // generated crate, not a fresh local Rust could freely infer
+            // as `usize` here -- `psprites` joins `powers`/`lines`/`cards`
+            // in the by-name self-array-field list for the same reason.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
                 || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "lines" || field == "cards")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "lines" || field == "cards" || field == "psprites")
             {
                 format!("{index_text} as usize")
             } else {
@@ -16432,6 +16438,78 @@ pub fn P_CalcSwing(player: &mut Player, world: &mut World) {
         let expected = "\
 pub fn P_DropWeapon(player: &mut Player, world: &mut World) {
     P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_BringUpWeapon` (`p_pspr.c`) translated -- the array-of-struct-
+    /// typed self field this project's previous rounds flagged as a
+    /// genuinely new mechanism (`player->psprites[ps_weapon].sy =
+    /// WEAPONBOTTOM;`, `psprites: pspdef_t[NUMPSPRITES]`, `p_pspr.h`).
+    /// Turns out to need only one small, narrow addition once actually
+    /// read against the real renderer: `psprites` joins the existing by-
+    /// name self-array-field index-cast list (`powers`/`lines`/`cards`,
+    /// `pw_strength`'s own precedent) so `ps_weapon` -- a bare `psprnum_t`
+    /// enum-constant identifier, fixed `i32` elsewhere in the generated
+    /// crate, not a fresh local Rust could infer as `usize` here -- gets
+    /// its own explicit cast; the write itself (`self.psprites[ps_weapon
+    /// as usize].sy = WEAPONBOTTOM;`) needed no new rendering code at all,
+    /// since it isn't a *direct* self field (nested through an `Index`
+    /// instead), so none of the existing self-field-write special cases
+    /// match and it falls straight through to the wholly generic
+    /// assignment fallback -- correct as-is, the same way `sides[i].
+    /// toptexture = ..;`-shaped writes already are. `WEAPONBOTTOM`
+    /// (`p_pspr.c`'s own file-scope `#define WEAPONBOTTOM 128*FRACUNIT`)
+    /// renders as a bare opaque identifier, the same `CEILSPEED` precedent
+    /// (a `#define`d alias this parser never macro-expands, `T_MoveCeiling`'s
+    /// own entry): no wrap fires for it (its RHS is neither a self-field
+    /// write nor an `Expr::IntLiteral`), so it passes through unwrapped,
+    /// correct provided the eventual generated crate gives it a real
+    /// `FixedT` type of its own, the same deferred responsibility
+    /// `CEILSPEED` already carries. Reading `player->mo` in `S_StartSound
+    /// (player->mo, sfx_sawup)` reuses the already-proven "registered
+    /// `Handle<Thinker>` self field read as a plain opaque value" case
+    /// (`A_FireShotgun2`'s own entry). Reading `weaponinfo[player->
+    /// pendingweapon].upstate` reuses `P_DropWeapon`'s own already-
+    /// established `weaponinfo[..].field` access unchanged (the index
+    /// here is itself a `Member` read, already covered generically).
+    /// The `statenum_t newstate;` local needs nothing new either -- a
+    /// locally-`typedef`'d enum name falls into the same bare-
+    /// `TypedefName`-specifier bucket every other deferred-inference
+    /// local already does. Verified compiling
+    /// for real (`rustc --edition 2021 --crate-type lib`) against a hand-
+    /// written `Player`/`World`/`Handle`/`FixedT` stand-in and a stub
+    /// `S_StartSound`/`P_SetPsprite`/`weaponinfo`/`WEAPONBOTTOM` -- zero
+    /// errors. `test_p_bring_up_weapon_renders_exactly`.
+    #[test]
+    fn test_p_bring_up_weapon_renders_exactly() {
+        let field_types = field_types(&[
+            ("pendingweapon", "i32"),
+            ("readyweapon", "i32"),
+            ("mo", "Handle<Thinker>"),
+            ("psprites", "[PlayerSpriteState; NUMPSPRITES]"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_BringUpWeapon",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_BringUpWeapon(player: &mut Player, world: &mut World) {
+    let mut newstate;
+    if player.pendingweapon == wp_nochange {
+        player.pendingweapon = player.readyweapon;
+    }
+    if player.pendingweapon == wp_chainsaw {
+        S_StartSound(player.mo, sfx_sawup);
+    }
+    newstate = weaponinfo[player.pendingweapon as usize].upstate;
+    player.pendingweapon = wp_nochange;
+    player.psprites[ps_weapon as usize].sy = WEAPONBOTTOM;
+    P_SetPsprite(player, ps_weapon, newstate);
 }";
         assert_eq!(rendered, expected);
     }
