@@ -6712,6 +6712,75 @@ pub fn render_pure_fn(
     ))
 }
 
+/// `render_pure_fn`'s own twin for a function that touches no `self`-
+/// struct receiver and no `Arena<Thinker>`, but *does* read/write real
+/// sector state directly through its own plain parameters --
+/// `T_MovePlane` (`p_floor.c`), called by every already-translated
+/// sector-mover tick function (`T_MoveFloor`/`T_MoveCeiling`/
+/// `T_PlatRaise`/`T_VerticalDoor`, all of which already call it as a
+/// forward-referenced stub, e.g. `T_MoveFloor`'s own rendered
+/// `T_MovePlane(floor.sector, floor.speed, floor.floordestheight,
+/// floor.crush, 0, floor.direction)`) but never itself a
+/// `state_t.action` entry, thinker-list constructor, or tagged-sector
+/// trigger. Its `sector` parameter is a plain `SectorId` -- `is_cross_ref`
+/// already resolves `sector->floorheight` to `world[sector].floorheight`
+/// from `extra_cross_ref_idents` alone (the same generic mechanism a
+/// trigger's own loop-local `sec`/`sector` already uses), so the only
+/// genuinely new piece is the signature shape itself: `world: &mut
+/// World` (mutable, unlike every real caller's own read-only-through-
+/// `world[..]` access, since this is the one function that actually
+/// assigns `sector->floorheight`/`.ceilingheight`), with no
+/// `Arena<Thinker>` parameter at all (this function never touches a
+/// `Thinker` -- no self-removal, no target/tracer, no spawn). Neither
+/// `render_pure_fn` (no `World` access) nor `render_trigger_fn` (always
+/// appends both `world` *and* `thinkers`, and assumes a `LineId`-tagged-
+/// sector loop shape this function doesn't have) fits, so this is its
+/// own thin variant rather than a misfit reuse of either.
+pub fn render_world_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    param_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+    let rendered_params = render_params(f, fn_name, param_types)?;
+    let plain_int_locals = collect_plain_int_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
+    let ctx = FnBodyContext {
+        self_param: "",
+        self_field_types: &HashMap::new(),
+        extra_cross_ref_idents: param_types,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
+        embedded_ctor: None,
+        mutating_handle: None,
+        same_handle_write: None,
+        same_target_write: None,
+        self_removal_ident: "arena",
+        plain_int_locals: &plain_int_locals,
+        angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &fixed_t_locals,
+        thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
+        active_goto_label: None,
+        active_for_continue_step: None,
+        static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
+    };
+
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    Ok(format!(
+        "pub fn {fn_name}({}, world: &mut World){return_arrow} {{\n{}\n}}",
+        rendered_params.join(", "),
+        body_lines.join("\n")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13097,5 +13166,157 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n\
              }"
         );
+    }
+
+    /// `T_MovePlane` (`p_floor.c`) -- the sector-mutating helper every
+    /// already-translated mover tick function (`T_MoveFloor`/
+    /// `T_MoveCeiling`/`T_PlatRaise`/`T_VerticalDoor`) has called as a
+    /// forward-referenced stub since its own entry closed, itself never
+    /// translated until now. Confirmed by reading the whole function
+    /// first (`linuxdoom-1.10/p_floor.c`): a nested `switch(floorOrCeiling)`
+    /// / `switch(direction)`, no `default:` on either (case `0`/`1` and
+    /// case `-1`/`1` respectively, needing a synthetic trailing `_ => {}`
+    /// each), each innermost `if`/`else` reading/writing
+    /// `sector->floorheight`/`.ceilingheight` directly and calling the
+    /// not-yet-translated `P_ChangeSector` (a forward-reference stub,
+    /// same convention as `S_StartSound`). No new renderer mechanism was
+    /// actually needed: `sector`'s own plain `SectorId` parameter type
+    /// already resolves through `is_cross_ref`/`extra_cross_ref_idents`
+    /// to `world[sector].field` with zero new code (the same generic
+    /// path a trigger loop's own `sec`/`sector` local already uses), and
+    /// `boolean flag;`/`fixed_t lastpos;` (both `TypedefName` locals)
+    /// already fall through `render_decl`'s existing deferred-inference
+    /// case. `render_world_fn` (new) is only a thin signature-shape
+    /// wrapper: no `self`, no `Arena<Thinker>`, just `world: &mut World`
+    /// appended, since neither `render_pure_fn` (no `World` at all) nor
+    /// `render_trigger_fn` (always appends `Arena<Thinker>` too, and
+    /// assumes a tagged-sector-loop body shape this function doesn't
+    /// have) fits. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against hand-written `World`/`Sector` stand-ins
+    /// and a stub `P_ChangeSector(SectorId, bool) -> bool` matching this
+    /// real call site's own argument shape -- zero errors.
+    #[test]
+    fn test_t_move_plane_renders_exactly() {
+        let params = field_types(&[
+            ("sector", "SectorId"),
+            ("speed", "FixedT"),
+            ("dest", "FixedT"),
+            ("crush", "bool"),
+            ("floorOrCeiling", "i32"),
+            ("direction", "i32"),
+        ]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_floor.c",
+            "T_MovePlane",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_MovePlane(sector: SectorId, speed: FixedT, dest: FixedT, crush: bool, floorOrCeiling: i32, direction: i32, world: &mut World) -> i32 {
+    let mut flag;
+    let mut lastpos;
+    match floorOrCeiling {
+        0 => {
+            match direction {
+                -1 => {
+                    if world[sector].floorheight - speed < dest {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight -= speed;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                            return crushed;
+                        }
+                    }
+                }
+                1 => {
+                    if world[sector].floorheight + speed > dest {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight += speed;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            if crush == true {
+                                return crushed;
+                            }
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                            return crushed;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        1 => {
+            match direction {
+                -1 => {
+                    if world[sector].ceilingheight - speed < dest {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].ceilingheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight -= speed;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            if crush == true {
+                                return crushed;
+                            }
+                            world[sector].ceilingheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                            return crushed;
+                        }
+                    }
+                }
+                1 => {
+                    if world[sector].ceilingheight + speed > dest {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].ceilingheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight += speed;
+                        flag = P_ChangeSector(sector, crush);
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return ok;
+}";
+        assert_eq!(rendered, expected);
     }
 }
