@@ -2115,7 +2115,7 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move" || n == "P_ThingHeightClip"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move" || n == "P_ThingHeightClip" || n == "P_CheckAmmo"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
@@ -16510,6 +16510,52 @@ pub fn P_BringUpWeapon(player: &mut Player, world: &mut World) {
     player.pendingweapon = wp_nochange;
     player.psprites[ps_weapon as usize].sy = WEAPONBOTTOM;
     P_SetPsprite(player, ps_weapon, newstate);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FireWeapon` (`p_pspr.c`) translated -- an ordinary `Player`-
+    /// shaped self-struct function, needing exactly one new piece:
+    /// `P_CheckAmmo` (this same file's own sibling, its real declared C
+    /// return type confirmed `boolean` by direct read) joins the by-name
+    /// `is_bool_returning_call` allowlist (`P_ThingHeightClip`'s own
+    /// precedent) so `if (!P_CheckAmmo(player)) return;` needs no
+    /// `!= 0`/`== 0` truthiness cast, bare or negated. Everything else
+    /// reuses wholly pre-existing machinery: `P_SetMobjState(player->mo,
+    /// S_PLAY_ATK1)` reuses the already-proven "registered `Handle
+    /// <Thinker>` self field read as a plain opaque value" case
+    /// (`A_FireShotgun2`'s own entry, `player.mo` passed by value with no
+    /// further dereference); `weaponinfo[player->readyweapon].atkstate`
+    /// reuses `P_DropWeapon`'s own already-established `weaponinfo[..]
+    /// .field` access unchanged; `P_NoiseAlert(player->mo, player->mo)`
+    /// is itself already a real translated function (`P_RecursiveSound`'s
+    /// own entry), called here as an ordinary forward reference with two
+    /// plain `Handle<Thinker>` values, needing nothing new. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Player`/`World`/`Handle` stand-in and a
+    /// stub `P_CheckAmmo`/`P_SetMobjState`/`P_SetPsprite`/`P_NoiseAlert`/
+    /// `weaponinfo` -- zero errors. `test_p_fire_weapon_renders_exactly`.
+    #[test]
+    fn test_p_fire_weapon_renders_exactly() {
+        let field_types = field_types(&[("readyweapon", "i32"), ("mo", "Handle<Thinker>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_FireWeapon",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FireWeapon(player: &mut Player, world: &mut World) {
+    let mut newstate;
+    if !P_CheckAmmo(player) {
+        return;
+    }
+    P_SetMobjState(player.mo, S_PLAY_ATK1);
+    newstate = weaponinfo[player.readyweapon as usize].atkstate;
+    P_SetPsprite(player, ps_weapon, newstate);
+    P_NoiseAlert(player.mo, player.mo);
 }";
         assert_eq!(rendered, expected);
     }
