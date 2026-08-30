@@ -753,6 +753,18 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "numsectors" {
                 return Ok(("world.sectors.len() as i32".to_string(), false));
             }
+            // `crushchange`/`nofit` (`p_map.c`'s own file-scope `boolean
+            // crushchange; boolean nofit;`, `PIT_ChangeSector`'s idiom) --
+            // the same "genuine mutable game state a callback and its
+            // caller communicate through" category `corpsehit`/`vileobj`
+            // already established, just plain `bool` instead of
+            // `Option<Handle<Thinker>>`/`FixedT`.
+            if name == "crushchange" {
+                return Ok(("world.crushchange".to_string(), false));
+            }
+            if name == "nofit" {
+                return Ok(("world.nofit".to_string(), false));
+            }
             if name == "viletryx" {
                 return Ok(("world.viletryx".to_string(), false));
             }
@@ -1823,7 +1835,7 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move" || n == "P_ThingHeightClip"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
@@ -13951,6 +13963,98 @@ pub fn getNextSector(line: &Line, sec: SectorId) -> Option<SectorId> {
         return line.backsector;
     }
     return Some(line.frontsector);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `PIT_ChangeSector` (`p_map.c`) -- a `boolean`-returning
+    /// `P_BlockThingsIterator` callback, `PIT_ChangeSector`/`PIT_StompThing`'s
+    /// own family, needing two new by-name global registrations
+    /// (`crushchange`/`nofit`, `world.rs`'s own doc comment) and otherwise
+    /// reusing wholly pre-existing machinery: `P_ThingHeightClip(thing)`
+    /// is already a real translated `boolean`-returning `render_world_fn`
+    /// sibling, called here the same "forward-reference by name" way
+    /// every other cross-function call in this corpus already is;
+    /// `thing->flags &= ~MF_SOLID;` needs nothing new (`UnaryOp::BitNot`
+    /// already renders as Rust's own bitwise `!`, and compound-assign
+    /// through a self field is wholly proven); `thing->height = 0;`/
+    /// `.radius = 0;` reuse the already-shipped `Expr::IntLiteral`-into-
+    /// self-`FixedT`-field wrap (`P_ExplodeMissile`'s own `momz = 0;`
+    /// idiom); `P_DamageMobj(thing,NULL,NULL,10)` needs nothing new either
+    /// -- the existing generic `Expr::Ident("NULL") -> None` arm already
+    /// covers a bare `NULL` argument wherever it appears, not just the
+    /// `specialdata`-assignment shape it was first built for. `mo =
+    /// P_SpawnMobj(..)` / `mo->momx = (P_Random()-P_Random())<<12;`
+    /// reuses `A_BrainExplode`'s own precedent exactly: `momx`/`momy` are
+    /// registered `"FixedT"` in `self_field_types` (Mobj's own field-type
+    /// map, shared between a `self` write and a spawned-local write of
+    /// the same struct shape), so the plain-`i32`-shift-expression RHS
+    /// (no `FixedT` source in it at all) gets wrapped in `FixedT(..)` by
+    /// the same `is_fixed_t_field && !expr_is_fixed_t_valued(rhs, ..)`
+    /// check, needing no renderer changes. `P_RemoveMobj(thing)` is
+    /// confirmed, not assumed, to be genuine self-removal (the first
+    /// draft's own expected string here guessed wrong, treating it as a
+    /// plain opaque call, and the mismatch is what caught it): `thing`
+    /// *is* this callback's own receiver, so `is_self_removal_call`'s
+    /// existing `P_RemoveMobj(mo)` arm (`A_SpawnFly`'s own precedent,
+    /// already proven `P_RemoveMobj` internally calls `P_RemoveThinker`
+    /// on the same object) applies exactly, gaining the function its own
+    /// `handle: Handle<Thinker>` parameter and rendering `thinkers.
+    /// remove(handle)`. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against hand-written `Mobj`/`World`/
+    /// `Handle`/`Arena` stand-ins and stub `P_ThingHeightClip`/
+    /// `P_SetMobjState`/`P_DamageMobj`/`P_SpawnMobj`/`P_Random` matching
+    /// this real call site's own argument shapes -- zero errors.
+    /// `test_pit_change_sector_renders_exactly`.
+    #[test]
+    fn test_pit_change_sector_renders_exactly() {
+        let field_types = field_types(&[
+            ("health", "i32"),
+            ("flags", "i32"),
+            ("radius", "FixedT"),
+            ("height", "FixedT"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "PIT_ChangeSector",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn PIT_ChangeSector(thing: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) -> bool {
+    let mut mo;
+    if P_ThingHeightClip(thing) {
+        return true;
+    }
+    if thing.health <= 0 {
+        P_SetMobjState(thing, S_GIBS);
+        thing.flags &= !MF_SOLID;
+        thing.height = FixedT(0);
+        thing.radius = FixedT(0);
+        return true;
+    }
+    if (thing.flags & MF_DROPPED) != 0 {
+        thinkers.remove(handle);
+        return true;
+    }
+    if thing.flags & MF_SHOOTABLE == 0 {
+        return true;
+    }
+    world.nofit = true;
+    if world.crushchange && leveltime & 3 == 0 {
+        P_DamageMobj(thing, None, None, 10);
+        mo = P_SpawnMobj(thing.x, thing.y, thing.z + thing.height / 2, MT_BLOOD);
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momx = FixedT(P_Random() - P_Random() << 12); };
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momy = FixedT(P_Random() - P_Random() << 12); };
+    }
+    return true;
 }";
         assert_eq!(rendered, expected);
     }

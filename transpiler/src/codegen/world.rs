@@ -72,6 +72,13 @@
 //! (`corpsehit`/`vileobj`, `Option<Handle<Thinker>>`) and a pair of
 //! coordinates (`viletryx`/`viletryy`, `FixedT`) instead of one value or
 //! an array.
+//! `crushchange`/`nofit` joined once `PIT_ChangeSector` (`p_map.c`)
+//! needed somewhere to hold `P_ChangeSector`'s own file-scope `boolean
+//! crushchange; boolean nofit;` -- the same "genuine mutable game state a
+//! callback and its caller communicate through" category `corpsehit`/
+//! `vileobj` already established, just plain `bool` (the corpus's own
+//! `boolean` typedef, not `Option<Handle<Thinker>>` or `FixedT`) since
+//! neither is ever null or fixed-point.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -98,6 +105,8 @@ pub struct World {
     pub vileobj: Option<Handle<Thinker>>,
     pub viletryx: FixedT,
     pub viletryy: FixedT,
+    pub crushchange: bool,
+    pub nofit: bool,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -175,6 +184,8 @@ mod tests {
         assert!(rendered.contains("pub vileobj: Option<Handle<Thinker>>,"));
         assert!(rendered.contains("pub viletryx: FixedT,"));
         assert!(rendered.contains("pub viletryy: FixedT,"));
+        assert!(rendered.contains("pub crushchange: bool,"));
+        assert!(rendered.contains("pub nofit: bool,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
