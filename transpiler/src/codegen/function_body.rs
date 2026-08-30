@@ -1714,9 +1714,14 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // in that same loop's own header, so it must stay `i32`
             // throughout and the index needs its own explicit cast here
             // instead.
+            // `player->cards[card]` (`P_GiveCard`) is the same shape once
+            // more: `card`'s own declared type is a fixed function
+            // *parameter* (`card_t`, an `i32` under this project's own
+            // locally-typedef'd-enum mapping), not a local Rust could
+            // freely infer as `usize` here.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
                 || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "lines")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "lines" || field == "cards")
             {
                 format!("{index_text} as usize")
             } else {
@@ -2240,6 +2245,18 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // truthiness to a real `Option`.
         Expr::Index { .. } if is_option_valued(cond, ctx) => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
+        }
+        // `if (player->cards[card]) return;` (`P_GiveCard`) -- a bare,
+        // non-negated index into a genuine Rust `bool` array (`cards`,
+        // `struct_fields.rs`'s own mapping), the un-negated sibling of
+        // `!player->cards[idx]`'s own already-correct plain-`!` fallback
+        // (`render_expr`'s own `Unary::Not` arm, whose doc comment
+        // explains why no cast is needed there either) -- already a real
+        // `bool`, so no truthiness cast at all, unlike the generic
+        // `Expr::Index` fallback just below (which assumes a plain `int`
+        // array).
+        Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards") => {
+            Ok(render_expr(cond, ctx)?.0)
         }
         Expr::Index { .. } => Ok(format!("{} != 0", render_expr(cond, ctx)?.0)),
         // `if (actor->info->painsound)` (`A_Pain`) -- a bare struct-field
@@ -4300,6 +4317,17 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let rhs_is_abs_call = matches!(rhs.as_ref(), Expr::Call { callee, .. }
             if matches!(callee.as_ref(), Expr::Ident(n) if n == "abs"));
         let rhs_is_int_literal = matches!(rhs.as_ref(), Expr::IntLiteral(_));
+        // `player->cards[card] = 1;` (`P_GiveCard`) -- a plain `int`
+        // literal written into a genuine Rust `bool` array element
+        // (`cards`, `struct_fields.rs`'s own mapping) -- C's own `int`-
+        // as-`boolean` idiom needs an explicit `true`/`false` here, the
+        // same "one value, two different real types" gap `FixedT`'s own
+        // literal-into-field wrap already closes for `fixed_t`, just for
+        // `bool` instead. No real corpus call site writes anything but a
+        // literal `1` here, so only that value is recognized -- anything
+        // else fails loudly rather than guessing.
+        let lhs_is_cards_index = matches!(lhs.as_ref(), Expr::Index { base, .. }
+            if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards"));
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
@@ -4539,6 +4567,16 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 || lhs_is_fixed_t_typed_ident && rhs_is_abs_call)
         {
             format!("FixedT({rhs_text})")
+        } else if *op == AssignOp::Assign && lhs_is_cards_index && rhs_is_int_literal {
+            match rhs.as_ref() {
+                Expr::IntLiteral(s) if s == "1" => "true".to_string(),
+                Expr::IntLiteral(s) if s == "0" => "false".to_string(),
+                _ => {
+                    return Err(format!(
+                        "unsupported int literal `{rhs_text}` assigned into a bool `cards` element"
+                    ));
+                }
+            }
         } else {
             rhs_text
         };
@@ -5144,6 +5182,32 @@ pub fn render_bool_fn(
     )
 }
 
+/// `render_bool_fn`/`render_fn_with_scalar_param`'s own combination --
+/// `boolean P_GiveBody(player_t* player, int num)` (`p_inter.c`) is both
+/// `boolean`-returning *and* takes a second plain-scalar parameter, a
+/// shape neither existing thin wrapper covers alone. A third small
+/// wrapper over the same shared `render_fn_impl`, matching this module's
+/// established "add the wrapper once a real corpus function needs the
+/// combination, not speculatively" style.
+pub fn render_bool_fn_with_scalar_param(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    scalar_param_type: &str,
+) -> Result<String, String> {
+    render_fn_impl(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        Some("bool"),
+        Some(scalar_param_type),
+    )
+}
+
 fn render_fn_impl(
     corpus_dir: &Path,
     file: &str,
@@ -5286,6 +5350,21 @@ fn render_fn_impl(
         self_field_types,
         &extra_cross_ref_idents,
     );
+    // `player->mo->health = player->health;` (`P_GiveBody`) -- a *bare*
+    // (not `Option`-wrapped) `Handle<Thinker>` self-struct field
+    // (`is_self_bare_handle_field`'s own shape, `player.mo`), the first
+    // real non-`Mobj` self-struct needing it: every earlier `render_fn`/
+    // `render_bool_fn` caller has been `Mobj`-shaped, whose own bare-
+    // handle fields (`target`/`tracer`) are `Option`-wrapped and already
+    // covered by `needs_target_deref`/`needs_target_write` above --
+    // `render_weapon_fn` already built `body_has_self_handle_field_deref`/
+    // `body_has_self_handle_write` for this exact shape (`player.mo`
+    // there too), fully generic over `self_param`/`self_field_types`
+    // already, so reused verbatim rather than duplicated.
+    let needs_self_handle_field_deref =
+        body_has_self_handle_field_deref(&f.body.items, &param_name, self_field_types);
+    let needs_self_handle_field_write =
+        body_has_self_handle_write(&f.body.items, &param_name, self_field_types);
     // A body that assigns a local from `P_SpawnMobj(...)` and then
     // writes one of its fields (`A_Tracer`'s own `th->momz = ...;`)
     // needs real *mutable* `Arena` access -- unlike `needs_target_deref`
@@ -5392,12 +5471,17 @@ fn render_fn_impl(
     };
     let thinkers_part = if needs_self_removal && !composed_self_removal {
         ""
-    } else if needs_spawn_mut || composed_self_removal || needs_target_write {
+    } else if needs_spawn_mut
+        || composed_self_removal
+        || needs_target_write
+        || needs_self_handle_field_write
+    {
         ", thinkers: &mut Arena<Thinker>"
     } else if needs_target_deref
         || needs_linetarget
         || needs_thinker_scan_for
         || needs_bare_handle_global
+        || needs_self_handle_field_deref
     {
         ", thinkers: &Arena<Thinker>"
     } else {
@@ -9823,6 +9907,25 @@ pub fn EV_DoPlat(line: LineId, r#type: i32, amount: i32, world: &mut World, thin
     /// own `!` already. Verified compiling the complete function with
     /// `rustc` directly (hand-written `World`/`Player`/`Mobj`/`Thinker`/
     /// `Arena`/`Handle` stand-ins), zero errors.
+    ///
+    /// **A real, latent bug in this test's own expected string, found and
+    /// fixed while adding `P_GiveCard`'s `cards` handling (a later
+    /// round)**: `cards[it_bluecard]` (and its five siblings here/in
+    /// `EV_VerticalDoor`) was missing the `as usize` cast every other
+    /// enum-constant array index already gets (`powers[pw_strength as
+    /// usize]`, `A_Punch`) -- `it_bluecard` is a real `i32` constant
+    /// (`enum_values.rs`'s own uniform mapping), so `cards[it_bluecard]`
+    /// never actually compiles (confirmed by direct `rustc` reproduction:
+    /// `E0277`, "the type `[bool]` cannot be indexed by `i32`"). This
+    /// test's own original "verified compiling for real" claim must have
+    /// used a non-canonical stand-in (`it_bluecard` itself declared
+    /// `usize`) rather than the real, uniform `i32` every enum constant
+    /// actually gets -- caught only once `cards` joined the by-name `as
+    /// usize` index-cast list for a different function, at which point
+    /// the *full* test suite (not just the new test) surfaced this
+    /// mismatch. Fixed by adding the cast here (and in `EV_VerticalDoor`
+    /// below) to match the corrected, more broadly-applicable rendering,
+    /// not by narrowing the new code to dodge it.
     #[test]
     fn test_ev_do_locked_door_renders_exactly() {
         let params: HashMap<String, String> = [
@@ -9857,7 +9960,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
             if p.is_none() {
                 return 0;
             }
-            if !world[p.unwrap()].cards[it_bluecard] && !world[p.unwrap()].cards[it_blueskull] {
+            if !world[p.unwrap()].cards[it_bluecard as usize] && !world[p.unwrap()].cards[it_blueskull as usize] {
                 world[p.unwrap()].message = PD_BLUEO;
                 S_StartSound(None, sfx_oof);
                 return 0;
@@ -9867,7 +9970,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
             if p.is_none() {
                 return 0;
             }
-            if !world[p.unwrap()].cards[it_redcard] && !world[p.unwrap()].cards[it_redskull] {
+            if !world[p.unwrap()].cards[it_redcard as usize] && !world[p.unwrap()].cards[it_redskull as usize] {
                 world[p.unwrap()].message = PD_REDO;
                 S_StartSound(None, sfx_oof);
                 return 0;
@@ -9877,7 +9980,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
             if p.is_none() {
                 return 0;
             }
-            if !world[p.unwrap()].cards[it_yellowcard] && !world[p.unwrap()].cards[it_yellowskull] {
+            if !world[p.unwrap()].cards[it_yellowcard as usize] && !world[p.unwrap()].cards[it_yellowskull as usize] {
                 world[p.unwrap()].message = PD_YELLOWO;
                 S_StartSound(None, sfx_oof);
                 return 0;
@@ -9980,7 +10083,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             if player.is_none() {
                 return;
             }
-            if !world[player.unwrap()].cards[it_bluecard] && !world[player.unwrap()].cards[it_blueskull] {
+            if !world[player.unwrap()].cards[it_bluecard as usize] && !world[player.unwrap()].cards[it_blueskull as usize] {
                 world[player.unwrap()].message = PD_BLUEK;
                 S_StartSound(None, sfx_oof);
                 return;
@@ -9990,7 +10093,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             if player.is_none() {
                 return;
             }
-            if !world[player.unwrap()].cards[it_yellowcard] && !world[player.unwrap()].cards[it_yellowskull] {
+            if !world[player.unwrap()].cards[it_yellowcard as usize] && !world[player.unwrap()].cards[it_yellowskull as usize] {
                 world[player.unwrap()].message = PD_YELLOWK;
                 S_StartSound(None, sfx_oof);
                 return;
@@ -10000,7 +10103,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             if player.is_none() {
                 return;
             }
-            if !world[player.unwrap()].cards[it_redcard] && !world[player.unwrap()].cards[it_redskull] {
+            if !world[player.unwrap()].cards[it_redcard as usize] && !world[player.unwrap()].cards[it_redskull as usize] {
                 world[player.unwrap()].message = PD_REDK;
                 S_StartSound(None, sfx_oof);
                 return;
@@ -15494,6 +15597,211 @@ pub fn EV_CeilingCrushStop(line: &Line, world: &mut World, thinkers: &mut Arena<
         i += 1;
     }
     return rtn;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GiveBody` (`p_inter.c`) -- opens a fresh function family this
+    /// round's own task brief flagged as promising: `player_t*`-shaped
+    /// pickup/give helpers, `render_fn`/`render_bool_fn`'s existing
+    /// single-self-struct-receiver shape, just with `Player` as the
+    /// self-struct instead of every earlier caller's `Mobj` (`player_t`
+    /// still isn't struct-mapped in `struct_fields.rs`, so `self_field_
+    /// types` is hand-supplied directly, the same as `render_weapon_fn`'s
+    /// own `player_field_types`). `boolean`-returning *and* a second
+    /// plain-scalar parameter (`num`) at once needed a new, third thin
+    /// `render_fn_impl` wrapper (`render_bool_fn_with_scalar_param`),
+    /// neither `render_bool_fn` nor `render_fn_with_scalar_param` alone
+    /// covering the combination. **The real new capability**:
+    /// `player->mo->health = player->health;` writes *through* `player`'s
+    /// own bare (non-`Option`) `Handle<Thinker>` field (`mo`,
+    /// `is_self_bare_handle_field`'s own shape) -- every earlier `render_
+    /// fn`/`render_bool_fn` caller has been `Mobj`-shaped, whose own bare-
+    /// handle fields (`target`/`tracer`) are `Option`-wrapped and already
+    /// covered by `needs_target_deref`/`needs_target_write`, so `render_
+    /// fn_impl` itself never computed the plain-bare-field version at all
+    /// (only `render_weapon_fn` had, for this exact `player.mo` shape).
+    /// Two new flags (`needs_self_handle_field_deref`/`_write`) reuse
+    /// `render_weapon_fn`'s own already-generic `body_has_self_handle_
+    /// field_deref`/`body_has_self_handle_write` helpers verbatim (both
+    /// already parameterized over `self_param`/`self_field_types`, no
+    /// player-specific assumption in either), folded into the same
+    /// `thinkers_part` decision `needs_target_deref`/`_write` already
+    /// drive. Confirmed necessary, not just anticipated, by hand-tracing:
+    /// without it, the generated signature would omit `thinkers` entirely
+    /// even though the body calls straight through it. Verified compiling
+    /// for real (`rustc --edition 2021 --crate-type lib`) against a hand-
+    /// written `Player`/`Mobj`/`World`/`Handle`/`Arena`/`Thinker` stand-in
+    /// -- zero errors. `test_p_give_body_renders_exactly`.
+    #[test]
+    fn test_p_give_body_renders_exactly() {
+        let field_types = field_types(&[("health", "i32"), ("mo", "Handle<Thinker>")]);
+        let rendered = render_bool_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveBody",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveBody(player: &mut Player, num: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> bool {
+    if player.health >= MAXHEALTH {
+        return false;
+    }
+    player.health += num;
+    if player.health > MAXHEALTH {
+        player.health = MAXHEALTH;
+    }
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.health = player.health; };
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GiveArmor` (`p_inter.c`) -- `P_GiveBody`'s own plainer sibling,
+    /// touching no `Handle<Thinker>` at all (`armorpoints`/`armortype`
+    /// are both plain `i32` fields), so `thinkers` is correctly omitted
+    /// from the generated signature entirely -- confirming `needs_self_
+    /// handle_field_deref`/`_write` (just added for `P_GiveBody`) stay
+    /// `false` here rather than over-triggering. `hits` (a plain local,
+    /// unrelated to `armortype` the *field*) needed nothing new.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Player`/`World` stand-in -- zero
+    /// errors. `test_p_give_armor_renders_exactly`.
+    #[test]
+    fn test_p_give_armor_renders_exactly() {
+        let field_types = field_types(&[("armorpoints", "i32"), ("armortype", "i32")]);
+        let rendered = render_bool_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveArmor",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveArmor(player: &mut Player, armortype: i32, world: &mut World) -> bool {
+    let mut hits;
+    hits = armortype * 100;
+    if player.armorpoints >= hits {
+        return false;
+    }
+    player.armortype = armortype;
+    player.armorpoints = hits;
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GiveCard` (`p_inter.c`) -- two new small pieces, both around
+    /// `cards`, a genuine Rust `bool` array (`struct_fields.rs`'s own
+    /// mapping): (1) `if (player->cards[card]) return;` is a bare, non-
+    /// negated index into it used for truthiness -- the un-negated
+    /// sibling of `!player->cards[idx]`'s own already-correct plain-`!`
+    /// fallback (already proven via `EV_DoLockedDoor`/`EV_VerticalDoor`),
+    /// never needed bare until this first real corpus example; a new
+    /// `render_bool_expr` arm (checked before the generic `Expr::Index`
+    /// `!= 0` fallback, which would otherwise wrongly apply plain-`int`
+    /// truthiness to an already-`bool` value) renders it with no cast at
+    /// all. (2) `player->cards[card] = 1;` writes a plain `int` literal
+    /// into that same `bool` array element -- C's own `int`-as-`boolean`
+    /// idiom, the same "one value, two different real types" gap
+    /// `FixedT`'s own literal-into-field wrap already closes for
+    /// `fixed_t`, just mapping a literal `1`/`0` to `true`/`false`
+    /// instead (any other literal fails loudly, no real corpus site needs
+    /// it). `cards` also joined the by-name `as usize` index-cast list
+    /// (`powers`/`lines`'s own sibling): `card`'s own declared type is a
+    /// fixed function *parameter* (`card_t`, `i32`), not a local Rust
+    /// could freely infer as `usize` here the way `sidenum[side^1]`'s
+    /// fresh local is. `BONUSADD` (a `#define`d macro) needed nothing new,
+    /// same opaque-passthrough precedent as `MISSILERANGE`. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Player`/`World` stand-in -- zero errors.
+    /// `test_p_give_card_renders_exactly`.
+    #[test]
+    fn test_p_give_card_renders_exactly() {
+        let field_types = field_types(&[("cards", "[bool; NUMCARDS]"), ("bonuscount", "i32")]);
+        let rendered = render_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveCard",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveCard(player: &mut Player, card: i32, world: &mut World) {
+    if player.cards[card as usize] {
+        return;
+    }
+    player.bonuscount = BONUSADD;
+    player.cards[card as usize] = true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GivePower` (`p_inter.c`) -- a longer, flatter chain of `if`
+    /// blocks, each returning early, needing no new mechanism at all
+    /// beyond what `P_GiveBody`/`P_GivePower`'s own siblings already
+    /// established: `player->powers[power] = ..;` (the plain-`i32`
+    /// sibling of `cards`, already `as usize`-cast by name), `player->
+    /// mo->flags |= MF_SHADOW;` (a *compound*-assign write through the
+    /// same bare-`Handle<Thinker>` `mo` field `P_GiveBody`'s own write
+    /// arm already renders, `render_assign_op` already general over any
+    /// operator), and `P_GiveBody (player, 100);` -- a forward-referenced
+    /// call using `P_GiveBody`'s *original* two-argument C signature, the
+    /// same already-documented cross-function-wiring gap every other such
+    /// call in this module has (its real translated signature has grown
+    /// two more parameters). Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written `Player`/
+    /// `Mobj`/`World`/`Handle`/`Arena`/`Thinker` stand-in and a stub
+    /// `P_GiveBody` matching this call site's own original argument shape
+    /// -- zero errors. `test_p_give_power_renders_exactly`.
+    #[test]
+    fn test_p_give_power_renders_exactly() {
+        let field_types = field_types(&[("powers", "[i32; NUMPOWERS]"), ("mo", "Handle<Thinker>")]);
+        let rendered = render_bool_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GivePower",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GivePower(player: &mut Player, power: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> bool {
+    if power == pw_invulnerability {
+        player.powers[power as usize] = INVULNTICS;
+        return true;
+    }
+    if power == pw_invisibility {
+        player.powers[power as usize] = INVISTICS;
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.flags |= MF_SHADOW; };
+        return true;
+    }
+    if power == pw_infrared {
+        player.powers[power as usize] = INFRATICS;
+        return true;
+    }
+    if power == pw_ironfeet {
+        player.powers[power as usize] = IRONTICS;
+        return true;
+    }
+    if power == pw_strength {
+        P_GiveBody(player, 100);
+        player.powers[power as usize] = 1;
+        return true;
+    }
+    if player.powers[power as usize] != 0 {
+        return false;
+    }
+    player.powers[power as usize] = 1;
+    return true;
 }";
         assert_eq!(rendered, expected);
     }
