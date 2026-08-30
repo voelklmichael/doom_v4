@@ -149,6 +149,19 @@ impl Mul<i32> for FixedT {
     }
 }
 
+/// `z += ((P_Random()-P_Random())<<10);` (`P_SpawnPuff`/`P_SpawnBlood`,
+/// `p_mobj.c`) -- a `fixed_t`-declared parameter compound-assigned from a
+/// plain raw `int` expression (no `FixedT` source anywhere in it), the
+/// compound-assign sibling of `Add<i32> for FixedT` above: C's `fixed_t`
+/// is a bare `typedef int`, so this never goes through `FixedAdd`/any
+/// rescaling at all, just raw representation arithmetic, matching every
+/// other operator in this file.
+impl AddAssign<i32> for FixedT {
+    fn add_assign(&mut self, rhs: i32) {
+        self.0 = self.0.wrapping_add(rhs);
+    }
+}
+
 /// `dist / actor->info->speed`-style division by a plain scalar `int`
 /// (not another `fixed_t`) -- raw `i32` division of the representation,
 /// matching what C's `int/int` really computes. The rescaling `fixed_div`/
@@ -377,6 +390,16 @@ mod tests {
         assert_eq!(height, FixedT(original.0 << 2));
         height >>= 2;
         assert_eq!(height, original);
+    }
+
+    #[test]
+    fn test_add_assign_i32_matches_add_i32() {
+        // `z += ((P_Random()-P_Random())<<10);` (`P_SpawnPuff`) -- the
+        // compound-assign sibling of `Add<i32>`, staying consistent with
+        // it.
+        let mut z = FixedT(100);
+        z += 5;
+        assert_eq!(z, FixedT(100) + 5);
     }
 
     #[test]

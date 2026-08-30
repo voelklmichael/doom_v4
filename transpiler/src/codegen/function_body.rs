@@ -845,6 +845,13 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "soundtarget" {
                 return Ok(("world.soundtarget".to_string(), false));
             }
+            // `attackrange` (`p_mobj.c`'s own file-scope `extern fixed_t
+            // attackrange;`, `P_SpawnPuff`'s own "don't make punches
+            // spark on the wall" check) -- the same category `viletryx`
+            // already established.
+            if name == "attackrange" {
+                return Ok(("world.attackrange".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -15957,6 +15964,127 @@ pub fn P_Thrust(player: &mut Player, mut angle: u32, r#move: FixedT, world: &mut
     angle >>= ANGLETOFINESHIFT;
     if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momx += FixedMul(r#move, finecosine[angle as usize]); };
     if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momy += FixedMul(r#move, finesine[angle as usize]); };
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_SpawnPuff` (`p_mobj.c`) -- a plain, self-struct-free `fixed_t`-
+    /// parameter helper (`render_trigger_fn`'s existing shape), the first
+    /// one spawning its own `mobj_t*` local (`th`) without any embedded
+    /// constructor at all: `render_trigger_fn` doesn't auto-detect a
+    /// `P_SpawnMobj` local the way `render_fn_impl`'s own `collect_spawn_
+    /// mobj_locals` does, but its own `local_var_types` parameter (already
+    /// used for `EV_DoLockedDoor`'s own `p: Option<PlayerId>`) registers
+    /// `th: Handle<Thinker>` directly, letting every already-generic
+    /// `extra_cross_ref_idents`-keyed read/write arm (`A_Tracer`'s own
+    /// `th->field`, a fresh `thinkers.get`/`get_mut` call at each point of
+    /// use) apply unchanged. **The one real new gap**: `z +=
+    /// ((P_Random()-P_Random())<<10);` compound-assigns a plain raw `int`
+    /// expression into a `fixed_t`-declared *parameter* -- the existing
+    /// literal-into-field wrap only ever fires for a bare `=`, not a
+    /// compound op, and no `AddAssign<i32> for FixedT` existed yet (only
+    /// `Add<i32>`, its non-assigning sibling) -- added to `runtime/
+    /// fixed.rs`, the same "thin wrapping-arithmetic pass-through"
+    /// pattern every other operator there already follows. `attackrange`
+    /// (`p_mobj.c`'s own file-scope `extern fixed_t attackrange;`) joins
+    /// the by-name `World` global list (`viletryx`'s own category). The
+    /// original C source's own `((P_Random()-P_Random())<<10)` parens are
+    /// redundant in both languages (`-` already binds tighter than `<<`
+    /// in C and Rust alike), so the precedence-aware renderer correctly
+    /// drops them rather than preserving them verbatim.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Mobj`/`World`/`Handle`/`Arena`/
+    /// `Thinker`/`FixedT` stand-in and stub `P_Random`/`P_SpawnMobj`/
+    /// `P_SetMobjState` -- zero errors. `test_p_spawn_puff_renders_exactly`.
+    #[test]
+    fn test_p_spawn_puff_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("x".to_string(), "FixedT".to_string()),
+            ("y".to_string(), "FixedT".to_string()),
+            ("z".to_string(), "FixedT".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("th".to_string(), "Handle<Thinker>".to_string())]
+            .into_iter()
+            .collect();
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_SpawnPuff",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnPuff(x: FixedT, y: FixedT, mut z: FixedT, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut th;
+    z += P_Random() - P_Random() << 10;
+    th = P_SpawnMobj(x, y, z, MT_PUFF);
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FRACUNIT; };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 3; };
+    if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };
+    }
+    if world.attackrange == MELEERANGE {
+        P_SetMobjState(th, S_PUFF3);
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_SpawnBlood` (`p_mobj.c`) -- `P_SpawnPuff`'s own close sibling
+    /// (same `z +=`/`th = P_SpawnMobj(..)`/`tics` idioms, reusing every
+    /// piece unchanged), needing nothing new: `th->momz = FRACUNIT*2;`
+    /// (already `FixedT`-valued, `Mul<i32> for FixedT`'s existing
+    /// precedent) and a plain-`i32` `damage` parameter driving an `if`/
+    /// `else if` two-way branch (rendered as nested `else { if .. }`, this
+    /// module's own established convention, never collapsed `else if`
+    /// syntax). Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against the same stand-in as `P_SpawnPuff` --
+    /// zero errors. `test_p_spawn_blood_renders_exactly`.
+    #[test]
+    fn test_p_spawn_blood_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("x".to_string(), "FixedT".to_string()),
+            ("y".to_string(), "FixedT".to_string()),
+            ("z".to_string(), "FixedT".to_string()),
+            ("damage".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("th".to_string(), "Handle<Thinker>".to_string())]
+            .into_iter()
+            .collect();
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_SpawnBlood",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnBlood(x: FixedT, y: FixedT, mut z: FixedT, damage: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut th;
+    z += P_Random() - P_Random() << 10;
+    th = P_SpawnMobj(x, y, z, MT_BLOOD);
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FRACUNIT * 2; };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 3; };
+    if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };
+    }
+    if damage <= 12 && damage >= 9 {
+        P_SetMobjState(th, S_BLOOD2);
+    } else {
+        if damage < 9 {
+            P_SetMobjState(th, S_BLOOD3);
+        }
+    }
 }";
         assert_eq!(rendered, expected);
     }
