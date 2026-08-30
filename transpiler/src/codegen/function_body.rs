@@ -53,7 +53,8 @@
 use crate::codegen::struct_fields::rust_field_name;
 use crate::parser::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, DirectDeclarator, Expr, ExternalDecl, ForInit,
-    FunctionDef, IncDecOp, Initializer, ParamDeclarator, SizeofArg, Stmt, TypeSpecifier, UnaryOp,
+    FunctionDef, IncDecOp, Initializer, ParamDeclarator, SizeofArg, Stmt, StorageClass,
+    TypeSpecifier, UnaryOp,
 };
 use crate::parser::grammar::declarator_name;
 use crate::parser::parse_full;
@@ -183,6 +184,23 @@ struct FnBodyContext<'a> {
     /// local rather than a field. Empty for every context that isn't a
     /// plain tick/weapon-action function's own top-level locals.
     angle_t_locals: &'a HashSet<String>,
+    /// This function's own `static`-storage top-level locals
+    /// (`collect_static_locals`), mapping each declared name to the
+    /// `World` field it's homed on (`"easy"` -> `"a_brain_spit_easy"`,
+    /// `A_BrainSpit`'s own idiom -- see `world.rs`'s own doc comment for
+    /// why a C function-local `static` needs a `World` field at all, the
+    /// same "persists across calls" reasoning `linetarget`/`braintargeton`
+    /// already established, just scoped to one function's own textual
+    /// visibility). `render_decl` drops the original declaration entirely
+    /// once its name is registered here (a real Rust `let` would silently
+    /// reset it every call); `render_expr`'s own `Expr::Ident` arm
+    /// resolves a bare reference to the mapped `world.{field}` field
+    /// access, the same way `linetarget` resolves to a fixed `world.
+    /// linetarget` just above it, just per-function-computed rather than
+    /// a single hardcoded name. Empty for every context that isn't a
+    /// plain tick/action function's own top-level locals (no corpus
+    /// example anywhere else needs a `static` local yet).
+    static_locals: &'a HashMap<String, String>,
     /// Set only while rendering the RHS of a write to one field of a
     /// `Handle<Thinker>`-typed local (the `P_SpawnMobj`-local write arm
     /// in `render_expr_stmt`) -- the name of that same local, if any
@@ -458,6 +476,18 @@ fn is_target_tracer_typed(
         {
             true
         }
+        // `braintargets[braintargeton]` (`A_BrainSpit`) -- a fourth real
+        // corpus source of an `Option<Handle<Thinker>>` value: `World::
+        // braintargets`'s own element type (`world.rs`'s own doc
+        // comment), reached by indexing rather than a `Member` chain.
+        // Hand-matched by the base identifier's own C name (`braintargets`
+        // itself is registered nowhere queryable at this point -- there's
+        // no general array-element-type registry, the same reasoning
+        // `sides[i]`'s own hand-matched special case already established),
+        // not by the index expression's own shape.
+        Expr::Index { base, .. } => {
+            matches!(base.as_ref(), Expr::Ident(n) if n == "braintargets")
+        }
         Expr::Ident(name) => {
             aliases.get(name.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>")
         }
@@ -573,6 +603,37 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // this table is really called in the generated crate.
             if name == "mobjinfo" {
                 return Ok(("MOBJINFO".to_string(), false));
+            }
+            // `braintargets`/`numbraintargets`/`braintargeton`
+            // (`p_enemy.c`'s own file-scope `mobj_t* braintargets[32];
+            // int numbraintargets; int braintargeton;`, `A_BrainSpit`'s
+            // idiom) -- the same "genuine mutable game state" category
+            // `linetarget` already established, just three names instead
+            // of one (see `world.rs`'s own doc comment). Checked by name
+            // exactly like `linetarget`, not through `extra_cross_ref_
+            // idents`: this arm only decides the identifier's own *text*,
+            // not whether indexing/dereferencing through it needs Arena
+            // awareness (`braintargets[i]`'s own element type is handled
+            // separately, by registering a local assigned from it as an
+            // `is_target_tracer_typed` alias).
+            if name == "braintargets" {
+                return Ok(("world.braintargets".to_string(), false));
+            }
+            if name == "numbraintargets" {
+                return Ok(("world.numbraintargets".to_string(), false));
+            }
+            if name == "braintargeton" {
+                return Ok(("world.braintargeton".to_string(), false));
+            }
+            // A function's own `static` local (`A_BrainSpit`'s own
+            // `static int easy = 0;`) -- persists across calls, so it
+            // lives on `World` instead of a real Rust `let` (`FnBodyContext
+            // ::static_locals`'s own doc comment); a bare reference here
+            // resolves to that field the same way `linetarget` resolves
+            // to `world.linetarget` just above, just per-function-scoped
+            // rather than a fixed name.
+            if let Some(field) = ctx.static_locals.get(name.as_str()) {
+                return Ok((format!("world.{field}"), false));
             }
             let is_crossref = ctx
                 .extra_cross_ref_idents
@@ -1096,7 +1157,7 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // rendered *text* to `MOBJINFO` separately -- this guard
             // runs against the un-renamed AST node, so it still matches).
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets")
                 || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")
             {
                 format!("{index_text} as usize")
@@ -1323,10 +1384,23 @@ fn render_binary_operand(
     // falling through to the plain identifier text below -- an `Option`
     // isn't itself a valid `&&` operand in Rust, a real type error, not
     // just a wrong-but-compiling translation.
+    // `gameskill <= sk_easy && (!easy)` (`A_BrainSpit`) -- a `Unary::Not`
+    // operand this module's own docs (just above) had left deliberately
+    // unrouted, since nothing here could tell a genuinely-`int` negation
+    // from a genuinely-`bool` one inside a chain -- but `easy` is a
+    // `static` local (`FnBodyContext::static_locals`), definitely `int`-
+    // typed by its own C declaration, not guessed at. Narrowly scoped to
+    // exactly the two registries that carry a real, checked `int` type
+    // (`plain_int_locals`/`static_locals`), not every bare `Unary::Not`
+    // operand -- the un-typed general case (`!world[p.unwrap()].cards
+    // [idx]`, a genuine `bool` array) still falls through unchanged.
+    let not_of_known_int_local = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
+        if matches!(expr.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()) || ctx.static_locals.contains_key(n.as_str())));
     if matches!(parent_op, BinaryOp::LogAnd | BinaryOp::LogOr)
         && (matches!(operand, Expr::Member { .. })
             || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op))
-            || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx)))
+            || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx))
+            || not_of_known_int_local)
     {
         return render_bool_expr(operand, ctx);
     }
@@ -1646,6 +1720,19 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         if let Some(spec) = ctx.embedded_ctor
             && name == spec.ctor_var
         {
+            continue;
+        }
+        // `static int easy = 0;` (`A_BrainSpit`) -- a function-local
+        // `static` persists across calls, so it's not a real Rust local
+        // at all: it lives on `World` instead (`FnBodyContext::
+        // static_locals`'s own doc comment, populated by `collect_static_
+        // locals`), and every reference to it (including this decl's own
+        // initializer, already computed above into the now-discarded
+        // `init_text`) resolves to that field via `render_expr`'s own
+        // `Expr::Ident` arm. Emitting `let mut easy = 0;` here would
+        // silently reset it to `0` on every call, exactly the bug this
+        // whole mechanism exists to avoid.
+        if ctx.static_locals.contains_key(&name) {
             continue;
         }
         // `mobjtype_t type;` (`A_SpawnFly`'s own monster-selection local)
@@ -2097,6 +2184,7 @@ fn render_while(
     // body anyway).
     let body_ctx = FnBodyContext {
         active_for_continue_step: None,
+        static_locals: &HashMap::new(),
         ..*ctx
     };
     let mut lines = vec![format!("{}loop {{", indent(depth))];
@@ -2309,6 +2397,7 @@ fn render_thinker_list_scan(
         thinker_scan_alias: Some((var, "m")),
         active_goto_label: None,
         active_for_continue_step: None,
+        static_locals: &HashMap::new(),
         ..*ctx
     };
     let (cond_text, _) = render_expr(real_cond, &inner_ctx)?;
@@ -2608,6 +2697,33 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             // `m` rather than a second, independent `thinkers.get(mo)`
             // call (a real borrow conflict with the `get_mut` below --
             // see `FnBodyContext::same_handle_write`'s own doc comment).
+            // `newmobj->reactiontime = (targ->y - mo->y)/..;` (`A_BrainSpit`)
+            // -- the RHS dereferences through `targ`, a *different*
+            // `Option<Handle<Thinker>>`-typed value (aliased from
+            // `braintargets[..]`) than the `Handle<Thinker>`-typed
+            // `newmobj` this write's own `get_mut` holds mutably -- a real
+            // second, conflicting borrow of `thinkers` (confirmed a real
+            // `rustc` E0502 by compiling the naive version first), the
+            // identical hazard `A_Punch`'s own `player->mo->angle = ..
+            // linetarget->x..` write arm already solves just below, by the
+            // identical fix: hoist the whole RHS into its own `let __rhs`
+            // *before* the mutable borrow starts (every read in it, same-
+            // handle included, gets an ordinary fresh `thinkers.get(..)`
+            // there, sound since nothing is borrowed yet), then the write
+            // body itself just assigns that.
+            if expr_has_other_target_deref(
+                rhs,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+                None,
+            ) {
+                let rhs_text = render_expr(rhs, ctx)?.0;
+                return Ok(format!(
+                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({name}) {{ m.{field} {} __rhs; }}",
+                    render_assign_op(*op)
+                ));
+            }
             let rhs_ctx = FnBodyContext {
                 same_handle_write: Some(name.as_str()),
                 ..*ctx
@@ -3197,6 +3313,56 @@ fn collect_angle_t_locals(items: &[BlockItem]) -> HashSet<String> {
     names
 }
 
+/// Lowercases `fn_name` and inserts `_` before each interior uppercase
+/// letter not already preceded by one (`"A_BrainSpit"` -> `"a_brain_
+/// spit"`) -- a minimal, single-purpose snake-case fold, not a general
+/// case-conversion utility, since `collect_static_locals` (its only
+/// caller) has exactly one real use for it so far: folding a `static`
+/// local's owning function name into its own `World` field name, so two
+/// unrelated functions' own same-named `static` local (`static int easy`
+/// in two different places, say) can't collide once both land as flat
+/// fields on the same struct.
+fn fn_name_to_snake_case(fn_name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in fn_name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i != 0 && !out.ends_with('_') {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// This function's own `static`-storage top-level locals (`static int
+/// easy = 0;`, `A_BrainSpit`'s own idiom -- `FnBodyContext::static_locals`
+/// own doc comment covers why these need a `World` field at all).
+/// Deliberately shallow (top-level declarations only), the same scope
+/// `collect_plain_int_locals`/`collect_angle_t_locals` already use --  no
+/// real corpus example declares a `static` anywhere but a function's own
+/// top level.
+fn collect_static_locals(items: &[BlockItem], fn_name: &str) -> HashMap<String, String> {
+    let mut locals = HashMap::new();
+    for item in items {
+        let BlockItem::Decl(d) = item else { continue };
+        if d.specifiers.storage != Some(StorageClass::Static) {
+            continue;
+        }
+        for decl in &d.declarators {
+            if let DirectDeclarator::Ident(_) = decl.declarator.direct
+                && let Some(name) = declarator_name(&decl.declarator)
+            {
+                let field = format!("{}_{name}", fn_name_to_snake_case(fn_name));
+                locals.insert(name, field);
+            }
+        }
+    }
+    locals
+}
+
 /// Renders `fn_name` (found in `corpus_dir.join(file)`) as a real Rust
 /// `pub fn`, given `self_rust_type` (the already-translated struct name
 /// for its first parameter) and `self_field_types` (that struct's
@@ -3344,6 +3510,7 @@ fn render_fn_impl(
     }
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
+    let static_locals = collect_static_locals(&f.body.items, fn_name);
     // Only a tick function that actually removes itself somewhere in its
     // body (`is_self_removal_call`, possibly nested arbitrarily deep in
     // `switch`/`if` -- `T_VerticalDoor` buries several inside two levels
@@ -3435,6 +3602,7 @@ fn render_fn_impl(
         same_target_write: None,
         plain_int_locals: &plain_int_locals,
         angle_t_locals: &angle_t_locals,
+        static_locals: &static_locals,
         self_removal_ident,
         thinker_scan_alias: None,
         active_goto_label: None,
@@ -3539,6 +3707,7 @@ pub fn render_weapon_fn(
         thinker_scan_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        static_locals: &HashMap::new(),
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let needs_self_handle_deref =
@@ -4865,6 +5034,7 @@ pub fn render_spawn_fn(
         thinker_scan_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        static_locals: &HashMap::new(),
     };
     let no_field_defaults = HashMap::new();
     let spec = CtorSpec {
@@ -5224,6 +5394,7 @@ pub fn render_trigger_fn(
         thinker_scan_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        static_locals: &HashMap::new(),
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -5944,6 +6115,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let (hoisted, cond_text) = render_condition(cond, &ctx, 2).expect("should render cleanly");
         assert_eq!(hoisted, vec!["        door.topcountdown -= 1;".to_string()]);
@@ -6036,6 +6208,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "world[door.sector].specialdata = None");
@@ -6088,6 +6261,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "arena.remove(handle)");
@@ -6161,6 +6335,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let (rendered, _) = render_expr(first_arg, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -6321,6 +6496,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_stmt(&synthetic_switch, &ctx, 1).expect("should render cleanly");
         assert_eq!(
@@ -7476,6 +7652,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_expr_stmt(e, &ctx).expect("should render cleanly");
         assert_eq!(
@@ -7544,6 +7721,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7638,6 +7816,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_stmt(&synthetic, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7712,6 +7891,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -7787,6 +7967,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let mut rendered = render_stmt(&floorpic_stmt, &ctx, 0).expect("should render cleanly");
         rendered.extend(render_stmt(&special_stmt, &ctx, 0).expect("should render cleanly"));
@@ -7867,6 +8048,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_stmt(stmt, &ctx, 0).expect("should render cleanly");
         assert_eq!(
@@ -9322,6 +9504,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let (rendered, _) = render_expr(call_expr, &ctx).expect("should render cleanly");
         assert_eq!(rendered, "P_GunShot(player.mo, player.refire == 0)");
@@ -10076,6 +10259,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             thinker_scan_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            static_locals: &HashMap::new(),
         };
         let rendered = render_compound_items(&f.body.items[9..11], &ctx, 1)
             .expect("should render cleanly")
@@ -10561,6 +10745,94 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              P_DamageMobj(world.linetarget, mo.target, mo.target, damage);\n        \
              i += 1;\n    \
              }\n\
+             }"
+        );
+    }
+
+    /// `A_BrainSpit` (`p_enemy.c`) -- closes out a `static` function-local,
+    /// the last genuinely new *kind* of state this module hadn't
+    /// represented yet. `static int easy = 0;` persists across every
+    /// call, unlike an ordinary local (a fresh Rust `let` resets it every
+    /// time this function's own body runs) -- the same "outlives one
+    /// call" character `linetarget`/`braintargeton` already have, just
+    /// scoped to one function's own textual visibility rather than file-
+    /// wide, so it gets the identical treatment: a new `World` field
+    /// (`FnBodyContext::static_locals`/`collect_static_locals`, `a_brain_
+    /// spit_easy`, the function's own name folded in so an unrelated
+    /// future function's own same-named `static` can't collide), with the
+    /// original declaration dropped entirely (a real `let` would silently
+    /// re-zero it every call) and every bare reference resolved to that
+    /// field. `easy ^= 1; if (gameskill <= sk_easy && (!easy)) return;`
+    /// surfaced a second, independent gap while wiring the first: `!easy`
+    /// is a `&&`-chain operand, and this module's own docs on `render_
+    /// binary_operand` had explicitly left a bare `Unary::Not` operand
+    /// there unrouted through `render_bool_expr`'s int-truthiness `== 0`
+    /// cast, since nothing tracked enough of a local's real C type to
+    /// tell a genuinely-`int` negation from a genuinely-`bool` one inside
+    /// a chain (`!cards[idx]`, a real Rust `bool` array, needs the
+    /// opposite treatment) -- but `easy` *is* one of the two registries
+    /// that do carry a checked type (`plain_int_locals`/`static_locals`,
+    /// both definitely `int`), so `render_binary_operand` gains one more
+    /// narrowly-scoped condition recognizing exactly that pair, closing
+    /// the ambiguity for this identifiable subset without touching the
+    /// genuinely-unknown general case. `braintargets`/`numbraintargets`/
+    /// `braintargeton` (`world.rs`'s own new fields, alongside `a_brain_
+    /// spit_easy`) needed three small additions: a bare-name rewrite for
+    /// all three (the same `linetarget` idiom), `braintargets` added to
+    /// the by-name `as usize` index-cast list (`finecosine`/`finesine`/
+    /// `mobjinfo`'s own precedent), and a fourth recognized source in
+    /// `is_target_tracer_typed` (`braintargets[i]`'s own element type is
+    /// `Option<Handle<Thinker>>`, the same as `self.target`/`.tracer`/
+    /// `actor->subsector->sector->soundtarget`) so `targ = braintargets
+    /// [braintargeton];` registers as an ordinary target/tracer-style
+    /// alias with zero new dereferencing machinery needed for `targ->y`
+    /// later. **The one genuinely new hazard**: `newmobj->reactiontime =
+    /// (targ->y - mo->y)/newmobj->momy/newmobj->state->tics;` dereferences
+    /// through `targ` -- a *different* `Option<Handle<Thinker>>`-typed
+    /// value than the `Handle<Thinker>`-typed `newmobj` this write's own
+    /// `get_mut` already holds mutably -- a real second, conflicting
+    /// borrow of `thinkers` (confirmed a real `rustc` E0502 by compiling
+    /// the naive single-statement version first). Fixed by reusing `A_
+    /// Punch`'s own `player->mo->angle = .. linetarget->x ..` fix
+    /// verbatim: `expr_has_other_target_deref` already detects exactly
+    /// this shape, so the spawned-mobj-write arm now hoists its whole RHS
+    /// into a `let __rhs` *before* the mutable borrow starts whenever that
+    /// check fires, the identical treatment its sibling arm already had,
+    /// just extended to the one write arm that didn't have it yet.
+    /// `newmobj->state->tics` (a real Rust reference field, `.state:
+    /// &'static State`, dereferenced a second level to `.tics`) needed no
+    /// changes at all -- an ordinary Rust field chain once `state` itself
+    /// resolves, nothing this renderer has to mediate through `Arena` for.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written `Arena`/`Handle`/`Mobj`/`World`/
+    /// `Thinker`/`State` stand-ins and stub forward-referenced functions
+    /// -- zero errors. 394/394 tests passing.
+    #[test]
+    fn test_a_brainspit_renders_exactly() {
+        let field_types = field_types(&[("y", "FixedT")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "A_BrainSpit",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn A_BrainSpit(mo: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut targ;\n    \
+             let mut newmobj;\n    \
+             world.a_brain_spit_easy ^= 1;\n    \
+             if gameskill <= sk_easy && world.a_brain_spit_easy == 0 {\n        \
+             return;\n    \
+             }\n    \
+             targ = world.braintargets[world.braintargeton as usize];\n    \
+             world.braintargeton = (world.braintargeton + 1) % world.numbraintargets;\n    \
+             newmobj = P_SpawnMissile(mo, targ, MT_SPAWNSHOT);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(newmobj) { m.target = targ; };\n    \
+             let __rhs = (match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - mo.y) / match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() } / match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }.tics; if let Some(Thinker::Mobj(m)) = thinkers.get_mut(newmobj) { m.reactiontime = __rhs; };\n    \
+             S_StartSound(None, sfx_bospit);\n\
              }"
         );
     }

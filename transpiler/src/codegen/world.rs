@@ -37,6 +37,32 @@
 //! (`SubsectorId`) into, the same per-level `Vec`-backed shape as
 //! `sectors`/`sides` (`r_defs.h`'s `subsector_t` is bulk-allocated once
 //! per level, same as every other geometry struct).
+//! `braintargets`/`numbraintargets`/`braintargeton` joined once
+//! `A_BrainSpit` (`p_enemy.c`) needed somewhere to hold its own file-
+//! scope `mobj_t* braintargets[32]; int numbraintargets; int
+//! braintargeton;` -- the same "genuine mutable game state, not a per-
+//! level table or a fixed-size player array" category `linetarget`
+//! already established, just a fixed-size array of targets (`A_BrainAwake`
+//! populates it; `A_BrainSpit` only ever reads/advances it) instead of a
+//! single value.
+//! `a_brain_spit_easy` joined once `A_BrainSpit`'s own `static int easy =
+//! 0;` needed somewhere to live: a C function-local `static` persists
+//! across every call, unlike an ordinary local (which a Rust `let`
+//! re-initializes fresh each time this function's own body runs) --
+//! genuinely the same *kind* of state `linetarget`/`braintargeton` are
+//! (mutable, outliving any one call), just scoped to one function's own
+//! textual visibility in the original C rather than visible file-wide, so
+//! it gets the same treatment (a `World` field) with the function's own
+//! name folded into the field name to keep it from colliding with some
+//! future unrelated function's own same-named `static` local (`docs/
+//! 03_TRANSPILER.md`'s `render_fn`/`FnBodyContext::static_locals`, in
+//! `function_body.rs`, computes this exact name and skips ever rendering
+//! the original declaration's own `let`). Its `= 0` initializer isn't
+//! wired up here -- nothing in this codebase constructs a real `World`
+//! value yet (disk emission/level loading don't exist), so there's
+//! nothing to initialize *to* yet; whichever future piece builds that
+//! constructor is responsible for seeding this at `0`, matching the C
+//! initializer's own "runs once, at program start" semantics.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -55,6 +81,10 @@ pub struct World {
     pub subsectors: Vec<Subsector>,
     pub players: [Player; MAXPLAYERS],
     pub linetarget: Option<Handle<Thinker>>,
+    pub braintargets: [Option<Handle<Thinker>>; 32],
+    pub numbraintargets: i32,
+    pub braintargeton: i32,
+    pub a_brain_spit_easy: i32,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -124,6 +154,10 @@ mod tests {
         assert!(rendered.contains("pub subsectors: Vec<Subsector>,"));
         assert!(rendered.contains("pub players: [Player; MAXPLAYERS],"));
         assert!(rendered.contains("pub linetarget: Option<Handle<Thinker>>,"));
+        assert!(rendered.contains("pub braintargets: [Option<Handle<Thinker>>; 32],"));
+        assert!(rendered.contains("pub numbraintargets: i32,"));
+        assert!(rendered.contains("pub braintargeton: i32,"));
+        assert!(rendered.contains("pub a_brain_spit_easy: i32,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
