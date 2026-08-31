@@ -1971,9 +1971,33 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // `Expr::Ident` in this one shape -- so the cast is scoped to
             // exactly that (`sidenum` base *and* a bare-`Ident` index),
             // leaving every other `sidenum[..]` shape untouched.
+            // `player->ammo[ammo]` (`P_CheckAmmo`) is a genuinely new
+            // variant of the same trap: unlike `powers`/`cards`/
+            // `psprites` above, the index here (`ammo`) isn't a fixed
+            // enum-constant identifier or a struct field -- it's a
+            // *fresh* local (`ammotype_t ammo;`), the one case
+            // `sidenum[side^1]`'s own comment above says can normally be
+            // left uncast, freely inferred as `usize`. But this same
+            // local is *also* compared against a bare enum constant
+            // elsewhere in this same function (`ammo == am_noammo`),
+            // which fixes its real type at `i32` (every enum constant in
+            // this codebase renders `i32`, `enum_values.rs`) -- so it
+            // can't be inferred `usize` here too without a genuine
+            // `rustc` type conflict between the two uses. `ammo` joins
+            // the by-name list for the same reason `powers`/`cards`/
+            // `psprites` did, even though the *shape* of its index
+            // (fresh local, not enum constant) looks like `sidenum`'s
+            // safe case -- confirmed the real corpus tiebreaker, not
+            // assumed from the shape alone. `player->ammo[am_cell]`/
+            // `[am_shell]`/`[am_clip]`/`[am_misl]` (enum-constant
+            // indices, same function) need the identical cast for the
+            // same `powers`/`cards`/`psprites` reason as before.
+            // `player->weaponowned[wp_plasma]` and its siblings (same
+            // function) are the same enum-constant-index shape once
+            // more, just for a different (`boolean`-typed) array.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
                 || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites" || field == "ammo" || field == "weaponowned")
                 || (matches!(base.as_ref(), Expr::Member { field, .. } if field == "sidenum")
                     && matches!(index.as_ref(), Expr::Ident(_)))
             {
@@ -2314,16 +2338,25 @@ fn render_binary_operand(
         if matches!(expr.as_ref(), Expr::Binary { op, .. } if !is_comparison_or_logical(*op)));
     // `activeplats[i] && (activeplats[i])->tag == tag && ...`
     // (`P_ActivateInStasis`) -- a bare `Option<Handle<Thinker>>`-valued
-    // global-array element as one `&&` operand, the `Expr::Index` sibling
-    // of the bare-`Ident` `Option`-valued arm just below (`is_option_valued`
-    // already recognizes this shape).
-    let is_option_valued_index =
-        matches!(operand, Expr::Index { .. }) && is_option_valued(operand, ctx);
+    // global-array element as one `&&` operand; `player->ammo[am_cell]
+    // && ...`/`player->weaponowned[wp_plasma] && ...` (`P_CheckAmmo`) are
+    // two more real, plain-`int`/plain-`bool` instances of the identical
+    // "bare `Expr::Index` operand needs its own real truthiness handling,
+    // not raw passthrough" problem -- so, unlike the narrower `not_of_
+    // powers_index` (negated, by-name) arm above, a bare (non-negated)
+    // `Expr::Index` operand is now routed through `render_bool_expr`
+    // *unconditionally*, the same way a bare `Expr::Member` operand
+    // already is just above (that arm needs no by-name scoping either:
+    // `render_bool_expr`'s own match already tells option-valued/`cards`-
+    // shaped-real-`bool`/plain-`int` apart correctly for *any* index
+    // expression). `weaponowned` joins `cards` in `render_bool_expr`'s own
+    // "already real `bool`, no cast" arm for the same reason `cards`
+    // needed it.
     if matches!(parent_op, BinaryOp::LogAnd | BinaryOp::LogOr)
         && (matches!(operand, Expr::Member { .. })
+            || matches!(operand, Expr::Index { .. })
             || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op))
             || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx))
-            || is_option_valued_index
             || not_of_known_int_local
             || not_of_non_comparison_binary
             || not_of_powers_index)
@@ -2553,8 +2586,13 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // explains why no cast is needed there either) -- already a real
         // `bool`, so no truthiness cast at all, unlike the generic
         // `Expr::Index` fallback just below (which assumes a plain `int`
-        // array).
-        Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards") => {
+        // array). `player->weaponowned[wp_plasma] && ...` (`P_CheckAmmo`)
+        // is the same shape once more, for `Player.weaponowned: [bool;
+        // NUMWEAPONS]` -- reached here now that `render_binary_operand`
+        // routes every bare `&&`/`||`-chain `Expr::Index` operand through
+        // this function unconditionally (see its own doc comment), not
+        // just `cards`'s own already-covered call sites.
+        Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards" || field == "weaponowned") => {
             Ok(render_expr(cond, ctx)?.0)
         }
         Expr::Index { .. } => Ok(format!("{} != 0", render_expr(cond, ctx)?.0)),
@@ -3152,6 +3190,21 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         Stmt::Compound(c) => render_compound_items(&c.items, ctx, depth),
         Stmt::Switch { cond, body } => render_switch(cond, body, ctx, depth),
         Stmt::While { cond, body } => render_while(cond, body, ctx, depth),
+        // `do { .. } while (player->pendingweapon == wp_nochange);`
+        // (`P_CheckAmmo`) -- the first real corpus `do`/`while`, and the
+        // first `render_stmt` arm of any kind for `Stmt::DoWhile` (every
+        // earlier use of that variant across the codebase was a `body_
+        // has_*`-style predicate scanning *into* the loop body, never
+        // actually rendering the loop itself). Unlike `render_while`
+        // (scoped to just the one `(x = f()) CMP y` condition idiom its
+        // own real corpus callers all share), a `do`/`while`'s condition
+        // here is a plain comparison with no embedded assignment, so
+        // `render_do_while` reuses `render_condition` directly (the same
+        // generic entry point `Stmt::If` already uses) rather than
+        // `render_while`'s own narrower hand-rolled test. `loop { body;
+        // if !(cond) { break; } }` matches C's own "test at the bottom,
+        // always run at least once" semantics exactly.
+        Stmt::DoWhile { body, cond } => render_do_while(body, cond, ctx, depth),
         Stmt::For {
             init,
             cond,
@@ -3433,6 +3486,50 @@ fn render_while(
     lines.push(format!("{}break;", indent(depth + 2)));
     lines.push(format!("{}}}", indent(depth + 1)));
     lines.extend(render_block(body, &body_ctx, depth + 1)?);
+    lines.push(format!("{}}}", indent(depth)));
+    Ok(lines)
+}
+
+/// `do { body } while (cond);` -- unlike `render_while`'s own narrow
+/// `(x = f()) CMP y` idiom, a real `do`/`while`'s own condition here is
+/// just a plain comparison (`player->pendingweapon == wp_nochange`,
+/// `P_CheckAmmo`'s own real body), so this reuses `render_condition`
+/// (the same generic entry point `Stmt::If` already goes through)
+/// instead. The condition is evaluated fresh *inside* the loop, right
+/// after the body, matching C's own "test at the bottom" semantics --
+/// any statements `render_condition` needs hoisted ahead of the test
+/// (none for a plain comparison, but kept general the same way `Stmt::
+/// If` already is) are placed there too, so they re-run every
+/// iteration. Same `continue`-target reset as `render_while`: a
+/// `continue` reached in this loop's own body targets this loop's own
+/// `loop {}`, not some enclosing `for`'s step.
+///
+/// Not handled (no real corpus example yet): a `continue` inside the
+/// body would jump straight back to the top of the Rust `loop {}` here,
+/// skipping the condition check entirely (an infinite-loop bug) --
+/// correct for `while`, wrong for `do`/`while`, where C's own `continue`
+/// jumps to the bottom-of-loop condition test instead. `P_CheckAmmo`'s
+/// own body has no `continue`, so this doesn't matter yet; a future
+/// `do`/`while` body that does would need its own fix here.
+fn render_do_while(
+    body: &Stmt,
+    cond: &Expr,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let body_ctx = FnBodyContext {
+        active_for_continue_step: None,
+        static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
+        ..*ctx
+    };
+    let mut lines = vec![format!("{}loop {{", indent(depth))];
+    lines.extend(render_block(body, &body_ctx, depth + 1)?);
+    let (hoisted, cond_text) = render_condition(cond, ctx, depth + 1)?;
+    lines.extend(hoisted);
+    lines.push(format!("{}if !({cond_text}) {{", indent(depth + 1)));
+    lines.push(format!("{}break;", indent(depth + 2)));
+    lines.push(format!("{}}}", indent(depth + 1)));
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
 }
@@ -17969,6 +18066,117 @@ pub fn P_GunShot(mo: &mut Mobj, accurate: bool, world: &mut World) {
         angle += (P_Random() - P_Random() << 18) as u32;
     }
     P_LineAttack(mo, angle, MISSILERANGE, world.bulletslope, damage);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_CheckAmmo` (`p_pspr.c`) -- the two open blockers this round's
+    /// task brief flagged both close here: (1) `do { .. } while
+    /// (player->pendingweapon == wp_nochange);` is this codebase's first
+    /// real `Stmt::DoWhile`, needing a brand-new `render_stmt` arm
+    /// (`render_do_while`, `render_while`'s own twin, just reusing the
+    /// generic `render_condition` instead of `render_while`'s narrower
+    /// `(x = f()) CMP y`-only test); (2) `ammo` (an `ammotype_t` local)
+    /// is used both as an array index (`player->ammo[ammo]`) and compared
+    /// against a bare enum constant (`ammo == am_noammo`) -- the by-name
+    /// `as usize` index-cast list (`powers`/`cards`/`psprites`) gains
+    /// `ammo` for exactly this reason, even though `ammo`'s own index
+    /// shape (a fresh local) looks like `sidenum`'s already-safe
+    /// uncast case; without the cast, Rust would infer `ammo: usize`
+    /// straight from the indexing site, then reject `usize == i32`
+    /// against `am_noammo` (confirmed a real `rustc` E0308 by trying the
+    /// uncast version first). Two more pieces, neither previously
+    /// exercised: `player->ammo[am_cell]`/`[am_shell]`/`[am_clip]`/
+    /// `[am_misl]` (enum-constant indices into `ammo`) and
+    /// `player->weaponowned[wp_plasma]` and its siblings (enum-constant
+    /// indices into a new self-array field, `weaponowned`) both need the
+    /// same by-name cast, so `weaponowned` joins the list too. And a bare
+    /// (non-negated) bool/int-array-element `Expr::Index` used as one
+    /// operand of a `&&` chain (`player->weaponowned[wp_plasma] && ...`,
+    /// `player->ammo[am_cell] && ...`) previously fell through `render_
+    /// binary_operand`'s default path with no truthiness handling at all
+    /// (only the *negated* `powers` case, and an *`Option`-valued* index,
+    /// were routed to `render_bool_expr` before) -- confirmed a real
+    /// `rustc` rejection (`i32` used directly as a `&&` operand) by
+    /// trying the unrouted version first. Fixed generically rather than
+    /// by another narrow by-name check: a bare `Expr::Index` operand is
+    /// now routed to `render_bool_expr` unconditionally, the same way a
+    /// bare `Expr::Member` operand already was -- `render_bool_expr`'s
+    /// own match already tells `Option`-valued/real-`bool`-array
+    /// (`cards`, now joined by `weaponowned`)/plain-`int`-array apart
+    /// correctly for any index expression, so no new by-name scoping was
+    /// needed at this second site. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written `Player`/
+    /// `WeaponInfo`/`World` stand-in (with real weapon/ammo enum
+    /// constants and a stub `P_SetPsprite`) -- zero errors.
+    #[test]
+    fn test_p_check_ammo_renders_exactly() {
+        let field_types = field_types(&[("readyweapon", "i32"), ("pendingweapon", "i32")]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_CheckAmmo",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_CheckAmmo(player: &mut Player, world: &mut World) -> bool {
+    let mut ammo;
+    let mut count;
+    ammo = weaponinfo[player.readyweapon as usize].ammo;
+    if player.readyweapon == wp_bfg {
+        count = BFGCELLS;
+    } else {
+        if player.readyweapon == wp_supershotgun {
+            count = 2;
+        } else {
+            count = 1;
+        }
+    }
+    if ammo == am_noammo || player.ammo[ammo as usize] >= count {
+        return true;
+    }
+    loop {
+        if player.weaponowned[wp_plasma as usize] && player.ammo[am_cell as usize] != 0 && gamemode != shareware {
+            player.pendingweapon = wp_plasma;
+        } else {
+            if player.weaponowned[wp_supershotgun as usize] && player.ammo[am_shell as usize] > 2 && gamemode == commercial {
+                player.pendingweapon = wp_supershotgun;
+            } else {
+                if player.weaponowned[wp_chaingun as usize] && player.ammo[am_clip as usize] != 0 {
+                    player.pendingweapon = wp_chaingun;
+                } else {
+                    if player.weaponowned[wp_shotgun as usize] && player.ammo[am_shell as usize] != 0 {
+                        player.pendingweapon = wp_shotgun;
+                    } else {
+                        if player.ammo[am_clip as usize] != 0 {
+                            player.pendingweapon = wp_pistol;
+                        } else {
+                            if player.weaponowned[wp_chainsaw as usize] {
+                                player.pendingweapon = wp_chainsaw;
+                            } else {
+                                if player.weaponowned[wp_missile as usize] && player.ammo[am_misl as usize] != 0 {
+                                    player.pendingweapon = wp_missile;
+                                } else {
+                                    if player.weaponowned[wp_bfg as usize] && player.ammo[am_cell as usize] > 40 && gamemode != shareware {
+                                        player.pendingweapon = wp_bfg;
+                                    } else {
+                                        player.pendingweapon = wp_fist;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !(player.pendingweapon == wp_nochange) {
+            break;
+        }
+    }
+    P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate);
+    return false;
 }";
         assert_eq!(rendered, expected);
     }
