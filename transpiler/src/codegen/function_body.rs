@@ -6018,7 +6018,22 @@ fn render_fn_impl_with_two_scalar_params(
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
     let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
     let static_locals = collect_static_locals(&f.body.items, fn_name);
-    let bool_locals = collect_bool_locals(&f.body.items);
+    let mut bool_locals = collect_bool_locals(&f.body.items);
+    // `!accurate` (`P_GunShot`'s own `boolean accurate` second parameter)
+    // -- a scalar parameter declared `bool` in Rust needs the exact same
+    // `bool_locals` truthiness treatment a `boolean`-declared *local*
+    // already gets (`collect_bool_locals`'s own doc comment): its Rust
+    // type is already genuinely `bool` (fixed by the signature the
+    // caller supplied, `scalar_param_type`/`scalar_param2_type`), so a
+    // bare negation needs plain Rust `!`, not the generic `== 0` int-
+    // truthiness fallback every other (`int`) scalar parameter correctly
+    // gets -- confirmed a real `rustc` rejection (`bool` compared to
+    // `{integer}`) without this, not just extra caution.
+    for (name, ty) in scalar_param.iter().chain(scalar_param2.iter()) {
+        if *ty == "bool" {
+            bool_locals.insert(name.clone());
+        }
+    }
     // Only a tick function that actually removes itself somewhere in its
     // body (`is_self_removal_call`, possibly nested arbitrarily deep in
     // `switch`/`if` -- `T_VerticalDoor` buries several inside two levels
@@ -17889,6 +17904,71 @@ pub fn P_PlayerInSpecialSector(player: &mut Player, world: &mut World, thinkers:
             I_Error(\"P_PlayerInSpecialSector: unknown special %i\", world[sector].special);
         }
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GunShot` (`p_pspr.c`, `A_FirePistol`'s own forward-referenced
+    /// callee) translated -- needed nothing new at all, every piece
+    /// composing from wholly pre-existing, already-proven machinery:
+    /// `render_fn_with_scalar_param` (`A_PainShootSkull`'s own precedent,
+    /// a `Mobj`-shaped self receiver plus one plain scalar parameter,
+    /// `accurate: bool` here instead of `angle: u32`) already threads
+    /// `world: &mut World` unconditionally into its signature, so
+    /// `bulletslope` (`world.bulletslope`, `P_BulletSlope`'s own by-name
+    /// global registration) just works with no `needs_world`-style flag
+    /// at all -- unlike `render_weapon_fn`'s own conditional version of
+    /// that field, never needed here since this render path always
+    /// includes `world`. The local `angle` (`angle_t angle;`, assigned
+    /// from `mo->angle`) is registered by `collect_angle_t_locals`
+    /// (already called in this same code path) the same way `A_Chase`'s
+    /// own local `angle` is, so `angle += (P_Random()-P_Random())<<18;`
+    /// reuses `A_FaceTarget`'s exact `u32`-local compound-assign-with-
+    /// `i32`-arithmetic-RHS cast verbatim (`lhs_is_angle_t_local`,
+    /// different shift amount, identical shape). `!accurate` needs no
+    /// truthiness cast at all: unlike a self-struct field or local this
+    /// module has no per-identifier `bool`-vs-`int` registry for, a
+    /// scalar *parameter*'s own Rust type is fixed by its own declared
+    /// signature (the same "a parameter's type can't be freely re-
+    /// inferred" reasoning already established for `card`/`ps_weapon`/
+    /// `side`), so a plain Rust `!` is already correct. `P_LineAttack
+    /// (mo, angle, MISSILERANGE, bulletslope, damage);` -- an opaque
+    /// forward-referenced call (`P_LineAttack` itself not yet
+    /// translated, matching this project's own established convention
+    /// for every other not-yet-translated callee) -- renders every
+    /// argument through wholly generic paths: `mo` (the bare self
+    /// receiver, `&mut Mobj`, passed straight through by name, the same
+    /// already-working "opaque pass-through" shape a bare self reference
+    /// gets everywhere else this project has needed it), `angle`/
+    /// `damage` (plain locals), `MISSILERANGE` (a bare macro-constant
+    /// identifier, passed through unchanged, `A_PainShootSkull`'s own
+    /// `P_AimLineAttack(actor, angle, MISSILERANGE)` precedent), and
+    /// `bulletslope` (`world.bulletslope`, just discussed). Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Mobj`/`World` stand-in and a stub
+    /// `P_LineAttack` -- zero errors. `test_p_gun_shot_renders_exactly`.
+    #[test]
+    fn test_p_gun_shot_renders_exactly() {
+        let field_types = field_types(&[("angle", "u32")]);
+        let rendered = render_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_GunShot",
+            "Mobj",
+            &field_types,
+            "bool",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GunShot(mo: &mut Mobj, accurate: bool, world: &mut World) {
+    let mut angle;
+    let mut damage;
+    damage = 5 * (P_Random() % 3 + 1);
+    angle = mo.angle;
+    if !accurate {
+        angle += (P_Random() - P_Random() << 18) as u32;
+    }
+    P_LineAttack(mo, angle, MISSILERANGE, world.bulletslope, damage);
 }";
         assert_eq!(rendered, expected);
     }
