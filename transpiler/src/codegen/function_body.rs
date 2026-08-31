@@ -359,6 +359,22 @@ struct FnBodyContext<'a> {
     /// already established, just resolved once per reference instead of
     /// via arithmetic. `None` everywhere else.
     sector_walk_alias: Option<(&'a str, &'a str)>,
+    /// Set only while rendering the body of a `psp = &player->psprites[0];
+    /// for (i=0;i<NUMPSPRITES;i++,psp++) { .. }`-shaped loop
+    /// (`is_psprite_walk_for`'s own doc comment, `P_MovePsprites`,
+    /// `p_pspr.c`) -- `sector_walk_alias`'s own idiom, but for a *self-
+    /// owned, embedded-by-value* array field (`player.psprites`) rather
+    /// than a `World`-indexed global array of index newtypes: there's no
+    /// cross-reference lookup to resolve the pointer-local into (no
+    /// `SectorId`-style newtype exists for a `pspdef_t*`), so a bare
+    /// reference to the pointer-local (`psp`) resolves directly to the
+    /// full indexed self-field expression (`{self_param}.psprites
+    /// [{counter} as usize]`, *not* crossref-flagged -- unlike
+    /// `sector_walk_alias`, nothing further needs a `world[..]` wrap),
+    /// which the generic `Expr::Member` fallback then appends `.field`
+    /// onto unchanged. Maps the pointer-local's own name (`psp`) to the
+    /// loop counter's name (`i`). `None` everywhere else.
+    psprite_walk_alias: Option<(&'a str, &'a str)>,
     /// Set only while rendering the statements a forward `goto` jumps
     /// *over* (the block `render_compound_items`'s own goto-to-common-
     /// label transform wraps in a Rust labeled block) -- the label name
@@ -916,6 +932,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             {
                 return Ok((format!("SectorId({counter} as u32)"), true));
             }
+            // `psp` (`P_MovePsprites`'s own `psp = &player->psprites[0];
+            // for (i=0;i<NUMPSPRITES;i++,psp++) { .. psp->tics .. }`) --
+            // `sector_walk_alias`'s own sibling arm just above, but for a
+            // self-owned array field with no index-newtype/`World`
+            // indirection at all (`FnBodyContext::psprite_walk_alias`'s own
+            // doc comment): a bare reference to the pointer-local resolves
+            // directly to the full indexed self-field expression, not
+            // crossref-flagged, so the generic `Expr::Member` fallback
+            // appends `.field` straight onto it with no `world[..]` wrap.
+            if let Some((var, counter)) = ctx.psprite_walk_alias
+                && name == var
+            {
+                return Ok((
+                    format!("{}.psprites[{counter} as usize]", ctx.self_param),
+                    false,
+                ));
+            }
             let is_crossref = ctx
                 .extra_cross_ref_idents
                 .get(name.as_str())
@@ -1272,6 +1305,38 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                     "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::{variant}({var})) => {var}.{}, _ => unreachable!() }}",
                     rust_field_name(field)?
                 ),
+                false,
+            ))
+        }
+        // `psp->state->nextstate` (`P_MovePsprites`) -- a field read
+        // chained straight through the `psprite_walk_alias`-resolved
+        // `psp->state` (`Option<&'static State>`, `is_option_valued`'s own
+        // arm for it), rather than through a real self-struct field the
+        // way `specialdata`/`target` reach an `Arena` lookup: `state_t*`
+        // maps to a plain `Option<&'static State>` (`states_data.rs`'s
+        // own `state_index` precedent for the non-`Option` case), so
+        // getting at a field of the pointed-to `State` needs an explicit
+        // `.unwrap()` first -- always genuinely `Some` here, the real
+        // corpus call site already guards the whole block behind `if
+        // ((state = psp->state))`, the same "provably non-null by the
+        // time it's reached" reasoning `active_array_variant`'s own
+        // `.unwrap()` arm above already established for a different base
+        // shape. Scoped narrowly to exactly this `psp->state->field`
+        // shape (not the general `is_option_valued(base, ctx)` predicate,
+        // which also matches several *other* already-handled shapes --
+        // `mo->player->field`, `actor->target->field`, ... -- each with
+        // its own real, non-`.unwrap()`-shaped `Arena`/`World`-indexed
+        // rendering just above; those all still take precedence over this
+        // arm by match order regardless, but keeping the guard itself
+        // narrow avoids relying on that ordering to stay correct).
+        Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                if bf == "state"
+                    && matches!(ctx.psprite_walk_alias, Some((var, _)) if matches!(bb.as_ref(), Expr::Ident(n) if n == var))) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!("{base_text}.unwrap().{}", rust_field_name(field)?),
                 false,
             ))
         }
@@ -2297,6 +2362,18 @@ fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
         {
             true
         }
+        // `psp->state` (`P_MovePsprites`'s own `if ((state = psp->state))`)
+        // -- `pspdef_t.state`'s own real C nullability (`p_pspr.h`'s own
+        // "a NULL state means not active" comment), read through the
+        // `psprite_walk_alias` pointer-local specifically (the one shape
+        // this project's corpus has actually needed so far), not a general
+        // "any field named `state`" rule.
+        Expr::Member { base, field, .. }
+            if field == "state"
+                && matches!(ctx.psprite_walk_alias, Some((var, _)) if matches!(base.as_ref(), Expr::Ident(n) if n == var)) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -2507,6 +2584,29 @@ fn render_condition(
     depth: usize,
 ) -> Result<(Vec<String>, String), String> {
     match cond {
+        // `if ((state = psp->state))` (`P_MovePsprites`) -- C evaluates the
+        // assignment, then tests the *assigned value's* own truthiness; no
+        // earlier `if` condition in this corpus has been a bare assignment
+        // itself. Hoisted as its own statement immediately before the `if`
+        // (the same "evaluate the side effect first, patch the condition"
+        // strategy `hoist_pre_inc_dec` already uses), then the now-plain
+        // local is tested directly -- `is_option_valued(rhs, ctx)` (not the
+        // LHS, which is only a bare `Expr::Ident` `render_bool_expr` can't
+        // yet see is `Option`-typed on its own) confirms the RHS is a known
+        // nullable field read (`psprite_walk_alias`'s own `state` arm)
+        // before committing to `.is_some()` rather than `!= 0`. Scoped to
+        // `ident = <nullable field>` specifically, not a fully general
+        // "any assignment can be an if-condition" transform.
+        Expr::Assign {
+            op: AssignOp::Assign,
+            lhs,
+            rhs,
+        } if matches!(lhs.as_ref(), Expr::Ident(_)) && is_option_valued(rhs, ctx) => {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            let hoisted = vec![format!("{}{lhs_text} = {rhs_text};", indent(depth))];
+            Ok((hoisted, format!("{lhs_text}.is_some()")))
+        }
         Expr::PreIncDec { expr, op } => {
             let (hoisted, target_text) = hoist_pre_inc_dec(expr, *op, ctx, depth)?;
             Ok((hoisted, format!("{target_text} != 0")))
@@ -3542,6 +3642,157 @@ fn render_sector_walk_for(
         op: BinaryOp::Lt,
         lhs: Box::new(Expr::Ident(counter.to_string())),
         rhs: Box::new(Expr::Ident("numsectors".to_string())),
+    });
+    let step = Some(Expr::PostIncDec {
+        expr: Box::new(Expr::Ident(counter.to_string())),
+        op: IncDecOp::Inc,
+    });
+    render_for(&init, &cond, &step, body, &inner_ctx, depth)
+}
+
+/// `psp = &player->psprites[0];` -- the priming statement immediately
+/// before `is_psprite_walk_for`'s own loop header (`P_MovePsprites`,
+/// `p_pspr.c`), `is_sector_walk_priming`'s own sibling idiom for a self-
+/// owned, embedded-by-value array field: a `pspdef_t*` local assigned the
+/// address of the array's own first element (`&player->psprites[0]`, not
+/// a bare array-name decay the way `sector = sectors;` is -- `psprites`
+/// is a real fixed-size array *field*, not a top-level array global, so
+/// C needs an explicit `&`/`[0]` here), then advanced one element per
+/// loop iteration via its own `psp++` step. `self_param` is threaded
+/// through explicitly (unlike `is_sector_walk_priming`, which keys off
+/// the fixed global name `sectors`) since `psprites` is only ever reached
+/// through a real self-struct parameter, whose own name isn't fixed.
+fn is_psprite_walk_priming<'a>(stmt: &'a Stmt, self_param: &str) -> Option<&'a str> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = stmt
+    else {
+        return None;
+    };
+    let Expr::Ident(var) = lhs.as_ref() else {
+        return None;
+    };
+    let Expr::Unary {
+        op: UnaryOp::AddrOf,
+        expr,
+    } = rhs.as_ref()
+    else {
+        return None;
+    };
+    let Expr::Index { base, index } = expr.as_ref() else {
+        return None;
+    };
+    if !matches!(index.as_ref(), Expr::IntLiteral(s) if s == "0") {
+        return None;
+    }
+    let Expr::Member {
+        base: mbase,
+        field,
+        arrow: true,
+    } = base.as_ref()
+    else {
+        return None;
+    };
+    if field != "psprites" {
+        return None;
+    }
+    if !matches!(mbase.as_ref(), Expr::Ident(n) if n == self_param) {
+        return None;
+    }
+    Some(var.as_str())
+}
+
+/// `for (i=0;i<NUMPSPRITES;i++,psp++) { .. }` -- the loop header pairing
+/// with `is_psprite_walk_priming`'s own initializer, `is_sector_walk_for`'s
+/// own sibling: the same genuine two-part comma step (`i++, psp++`), just
+/// bounded by the fixed `NUMPSPRITES` enum constant (`p_pspr.h`) rather
+/// than the runtime `numsectors` global, since `psprites` is a fixed-size
+/// array field, not a level-sized one. The pointer-local's own `psp++`
+/// half is dropped the same way `sector++`'s is, since `psprite_walk_
+/// alias` already resolves every reference to it directly.
+fn is_psprite_walk_for<'a>(stmt: &'a Stmt, var: &str) -> Option<(&'a str, &'a Stmt)> {
+    let Stmt::For {
+        init: Some(ForInit::Expr(init_expr)),
+        cond: Some(cond),
+        step: Some(step),
+        body,
+    } = stmt
+    else {
+        return None;
+    };
+    let Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: init_lhs,
+        rhs: init_rhs,
+    } = init_expr
+    else {
+        return None;
+    };
+    let Expr::Ident(counter) = init_lhs.as_ref() else {
+        return None;
+    };
+    if !matches!(init_rhs.as_ref(), Expr::IntLiteral(s) if s == "0") {
+        return None;
+    }
+    let Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: cond_lhs,
+        rhs: cond_rhs,
+    } = cond
+    else {
+        return None;
+    };
+    if !matches!(cond_lhs.as_ref(), Expr::Ident(n) if n == counter) {
+        return None;
+    }
+    if !matches!(cond_rhs.as_ref(), Expr::Ident(n) if n == "NUMPSPRITES") {
+        return None;
+    }
+    let Expr::Comma(step1, step2) = step else {
+        return None;
+    };
+    let step1_ok = matches!(step1.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == counter));
+    if !step1_ok {
+        return None;
+    }
+    let step2_ok = matches!(step2.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == var));
+    if !step2_ok {
+        return None;
+    }
+    Some((counter, body))
+}
+
+/// Renders the whole `psp = &player->psprites[0]; for (i=0;i<NUMPSPRITES;
+/// i++,psp++) { .. }` pair as one ordinary Rust counted loop bounded by
+/// `NUMPSPRITES`, `render_sector_walk_for`'s own sibling: reuses `render_
+/// for`'s existing machinery via the same synthetic single-part step
+/// construction, just setting `psprite_walk_alias` instead of `sector_
+/// walk_alias` in the inner context and bounding by `NUMPSPRITES` instead
+/// of `numsectors`.
+fn render_psprite_walk_for(
+    var: &str,
+    counter: &str,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let inner_ctx = FnBodyContext {
+        psprite_walk_alias: Some((var, counter)),
+        ..*ctx
+    };
+    let init = Some(ForInit::Expr(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::IntLiteral("0".to_string())),
+    }));
+    let cond = Some(Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::Ident("NUMPSPRITES".to_string())),
     });
     let step = Some(Expr::PostIncDec {
         expr: Box::new(Expr::Ident(counter.to_string())),
@@ -5003,7 +5254,7 @@ fn render_compound_items(
     // is about to be swallowed by the scan lookahead, the same "drop a
     // provably-dead local" treatment `render_decl` already gives an
     // `embedded_ctor` variable.
-    let scan_vars = thinker_scan_var_names(items);
+    let scan_vars = thinker_scan_var_names(items, ctx.self_param);
     let mut out = Vec::new();
     let mut i = 0;
     while i < items.len() {
@@ -5059,6 +5310,20 @@ fn render_compound_items(
             i += 2;
             continue;
         }
+        // `psp = &player->psprites[0]; for (i=0;i<NUMPSPRITES;i++,psp++)
+        // { .. }` (`is_psprite_walk_priming`/`is_psprite_walk_for`'s own
+        // doc comments, `P_MovePsprites`) -- `sector_walk_alias`'s own
+        // sibling two-statement idiom, for a self-owned array field
+        // instead of a `World`-indexed global one.
+        if let BlockItem::Stmt(priming_stmt) = &items[i]
+            && let Some(var) = is_psprite_walk_priming(priming_stmt, ctx.self_param)
+            && let Some(BlockItem::Stmt(for_stmt)) = items.get(i + 1)
+            && let Some((counter, body)) = is_psprite_walk_for(for_stmt, var)
+        {
+            out.extend(render_psprite_walk_for(var, counter, body, ctx, depth)?);
+            i += 2;
+            continue;
+        }
         if let BlockItem::Decl(d) = &items[i]
             && d.declarators.len() == 1
             && declarator_name(&d.declarators[0].declarator).is_some_and(|n| scan_vars.contains(&n))
@@ -5079,7 +5344,7 @@ fn render_compound_items(
 /// swallow anywhere in `items` -- see the doc comment at its own call
 /// site for why a matching bare declaration needs to be dropped, not
 /// rendered.
-fn thinker_scan_var_names(items: &[BlockItem]) -> HashSet<String> {
+fn thinker_scan_var_names(items: &[BlockItem], self_param: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     for pair in items.windows(2) {
         if let BlockItem::Stmt(init_stmt) = &pair[0]
@@ -5099,6 +5364,17 @@ fn thinker_scan_var_names(items: &[BlockItem]) -> HashSet<String> {
             && let Some(var) = is_sector_walk_priming(priming_stmt)
             && let BlockItem::Stmt(for_stmt) = &pair[1]
             && is_sector_walk_for(for_stmt, var).is_some()
+        {
+            names.insert(var.to_string());
+        }
+        // `psp = &player->psprites[0];`'s own declaration (`pspdef_t*
+        // psp;`) becomes dead the same way `sector`'s own does just
+        // above: `psprite_walk_alias` resolves every reference to it
+        // without ever really binding it in Rust.
+        if let BlockItem::Stmt(priming_stmt) = &pair[0]
+            && let Some(var) = is_psprite_walk_priming(priming_stmt, self_param)
+            && let BlockItem::Stmt(for_stmt) = &pair[1]
+            && is_psprite_walk_for(for_stmt, var).is_some()
         {
             names.insert(var.to_string());
         }
@@ -5841,6 +6117,7 @@ fn render_fn_impl_with_two_scalar_params(
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -5992,6 +6269,7 @@ pub fn render_weapon_fn(
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -7900,6 +8178,7 @@ pub fn render_spawn_fn(
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -8265,6 +8544,7 @@ pub fn render_trigger_fn(
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type: None,
@@ -8328,6 +8608,7 @@ pub fn render_pure_fn(
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type,
@@ -8435,6 +8716,7 @@ pub fn render_world_fn(
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         return_type,
@@ -9166,6 +9448,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -9264,6 +9547,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -9322,6 +9606,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -9401,6 +9686,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -9567,6 +9853,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -10747,6 +11034,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -10821,6 +11109,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -10921,6 +11210,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -11001,6 +11291,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -11082,6 +11373,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -11168,6 +11460,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -12632,6 +12925,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -13405,6 +13699,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             return_type: None,
@@ -17317,6 +17612,87 @@ pub fn P_SetupPsprites(player: &mut Player, world: &mut World) {
     }
     player.pendingweapon = player.readyweapon;
     P_BringUpWeapon(player);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_MovePsprites` (`p_pspr.c`, `P_SetupPsprites`'s own sibling)
+    /// translated -- the two genuinely new mechanisms this doc had been
+    /// deferring since round 6. (1) `psp = &player->psprites[0]; for
+    /// (i=0;i<NUMPSPRITES;i++,psp++) { .. }` -- `sector_walk_alias`'s own
+    /// idiom (`is_sector_walk_priming`/`is_sector_walk_for`), but for a
+    /// self-owned, embedded-by-value array field rather than a `World`-
+    /// indexed global one: `is_psprite_walk_priming`/`is_psprite_walk_for`/
+    /// `FnBodyContext::psprite_walk_alias` resolve a bare `psp` reference
+    /// directly to `player.psprites[i as usize]` (not crossref-flagged, so
+    /// the generic `Expr::Member` fallback appends `.field` with no
+    /// `world[..]` wrap), the loop itself bounded by the fixed
+    /// `NUMPSPRITES` enum constant instead of the runtime `numsectors`
+    /// global. (2) `if ((state = psp->state))` -- C evaluates the
+    /// assignment then tests its own result, needing a new `render_
+    /// condition` arm (`Expr::Assign` as a whole condition) that hoists
+    /// the assignment as its own statement immediately before the `if`
+    /// (`state = player.psprites[i as usize].state;`) and tests the now-
+    /// plain local for `Option`-ness directly, guarded by `is_option_
+    /// valued(rhs, ctx)` recognizing `psp->state` as nullable (`pspdef_t.
+    /// state`'s own real "a NULL state means not active" comment,
+    /// `p_pspr.h`) via a new narrow `is_option_valued` arm keyed off
+    /// `psprite_walk_alias` specifically. A third, smaller gap surfaced
+    /// only once the whole body was read: `psp->state->nextstate` chains
+    /// a field read straight through that same `Option<&'static State>`
+    /// value (unlike `state_index`'s own non-`Option` `&'static State`
+    /// precedent, `A_FireCGun`'s idiom) -- a new, narrowly-scoped `Expr::
+    /// Member` arm (guarded on exactly the `psp->state->field` shape, not
+    /// the broader `is_option_valued(base, ctx)` predicate several other
+    /// already-handled shapes -- `mo->player->field`, `actor->target->
+    /// field`, ... -- also match, each with its own real, differently-
+    /// shaped rendering already ordered ahead of it regardless) inserts
+    /// the `.unwrap()` `state_t*`'s own dereference needs, always
+    /// genuinely `Some` here since the real corpus call site already
+    /// guards the whole block with the `if ((state = psp->state))` just
+    /// discussed. `player->psprites[ps_flash].sx = player->psprites
+    /// [ps_weapon].sx;` (and its `.sy` sibling) need nothing new: the
+    /// `psprites`-by-name index-cast rule (`P_BringUpWeapon`'s own
+    /// precedent) already covers a bare enum-constant index into
+    /// `psprites` regardless of which specific constant. `psp->tics--;`/
+    /// `psp->tics != -1`/`!psp->tics` all reuse wholly generic, already-
+    /// proven machinery (a plain self-array-field `Member` read/write, C
+    /// truthiness on a plain `int` field) once `psp` itself resolves
+    /// through the new alias -- no new mechanism needed for any of the
+    /// three. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Player`/
+    /// `PlayerSpriteState`/`State`/`STATES` stand-in and a stub
+    /// `P_SetPsprite` -- zero errors. `test_p_move_psprites_renders_exactly`.
+    #[test]
+    fn test_p_move_psprites_renders_exactly() {
+        let field_types = field_types(&[("psprites", "[PlayerSpriteState; NUMPSPRITES]")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_MovePsprites",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_MovePsprites(player: &mut Player, world: &mut World) {
+    let mut i;
+    let mut state;
+    i = 0;
+    while i < NUMPSPRITES {
+        state = player.psprites[i as usize].state;
+        if state.is_some() {
+            if player.psprites[i as usize].tics != -1 {
+                player.psprites[i as usize].tics -= 1;
+                if player.psprites[i as usize].tics == 0 {
+                    P_SetPsprite(player, i, player.psprites[i as usize].state.unwrap().nextstate);
+                }
+            }
+        }
+        i += 1;
+    }
+    player.psprites[ps_flash as usize].sx = player.psprites[ps_weapon as usize].sx;
+    player.psprites[ps_flash as usize].sy = player.psprites[ps_weapon as usize].sy;
 }";
         assert_eq!(rendered, expected);
     }
