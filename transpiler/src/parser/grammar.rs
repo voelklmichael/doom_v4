@@ -1497,9 +1497,27 @@ impl Parser {
             Some(TokenKind::FloatConstant) => Ok(Expr::FloatLiteral(self.advance().unwrap().text)),
             Some(TokenKind::CharLiteral) => Ok(Expr::CharLiteral(self.advance().unwrap().text)),
             Some(TokenKind::StringLiteral) => {
+                // C's own adjacent-string-literal concatenation
+                // (`I_Error ("P_PlayerInSpecialSector: "\n"unknown special
+                // %i", ..)`, a message split across source lines) --
+                // each token's own `text` already includes its
+                // surrounding quotes verbatim (the lexer's own choice,
+                // confirmed by `lexer.rs`'s own test asserting `text ==
+                // "\"hello\""`), so a second literal can't just be
+                // appended after the first's closing quote (that would
+                // produce `"a""b"`, two adjacent Rust string literals --
+                // not valid Rust syntax at all, confirmed by a real
+                // `rustc` rejection when this was tried) -- the closing
+                // quote of each literal but the last, and the opening
+                // quote of each but the first, are dropped instead, so
+                // the merged result is one real quoted string whose
+                // content is the concatenation of both, matching what C
+                // itself does semantically.
                 let mut s = self.advance().unwrap().text;
                 while matches!(self.peek().map(|t| t.kind), Some(TokenKind::StringLiteral)) {
-                    s.push_str(&self.advance().unwrap().text);
+                    let next = self.advance().unwrap().text;
+                    s.pop();
+                    s.push_str(next.strip_prefix('"').unwrap_or(&next));
                 }
                 Ok(Expr::StringLiteral(s))
             }
@@ -1716,6 +1734,18 @@ done:
 
     #[test]
     fn test_adjacent_string_literal_concatenation() {
+        // `I_Error ("P_PlayerInSpecialSector: "\n"unknown special %i",
+        // ..)` (`p_spec.c`) is the real corpus source this was built
+        // against: two adjacent string-literal tokens must merge into one
+        // *real* quoted string whose content is their concatenation
+        // (`"hello world"`), not the raw juxtaposition of both tokens'
+        // own already-quoted text (`"hello ""world"`, not valid Rust
+        // syntax at all -- confirmed by a real `rustc` rejection when
+        // `function_body.rs`'s `Expr::StringLiteral` render passed that
+        // through unchanged for `P_PlayerInSpecialSector`'s own `I_Error`
+        // call). Previously asserted the wrong (juxtaposed) value here,
+        // undetected until a real corpus function actually needed a
+        // multi-line message.
         let unit = parse(r#"char *s = "hello " "world";"#);
         let ExternalDecl::Declaration(d) = &unit.items[0] else {
             panic!()
@@ -1723,7 +1753,7 @@ done:
         assert_eq!(
             d.declarators[0].initializer,
             Some(Initializer::Expr(Expr::StringLiteral(
-                "\"hello \"\"world\"".into()
+                "\"hello world\"".into()
             )))
         );
     }

@@ -1146,6 +1146,27 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].sector"), true))
         }
+        // `player->mo->subsector->sector` (`P_PlayerInSpecialSector`'s own
+        // idiom) -- a *third* base shape for the same `.subsector->
+        // sector` chain just above: `bb` here isn't a bare `Ident` at all
+        // (neither `self_param` directly nor a bare `Handle<Thinker>`
+        // parameter), it's itself `player->mo` (`is_self_bare_handle_
+        // field`'s own shape, the same `Arena`-lookup-needing base that
+        // arm's own sibling read arm already resolves through `thinkers.
+        // get(player.mo)`). Rendering `base` (`player->mo->subsector`)
+        // recurses back into that existing arm unchanged -- only this
+        // guard needed widening, matching the exact "rendering already
+        // correct, only the guard was too narrow" shape the `emmiter`
+        // widening above already established.
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                    if bf == "subsector"
+                        && is_self_bare_handle_field(bb, ctx.self_param, ctx.self_field_types)) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].sector"), true))
+        }
         // `mo->player->viewheight` (`P_ZMovement`'s own idiom) -- reading
         // through a self-struct field itself `Option<PlayerId>`-typed,
         // the same "one more level of chaining through a self field"
@@ -2256,6 +2277,22 @@ fn render_binary_operand(
     let not_of_known_int_local = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
         if matches!(expr.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()) || ctx.static_locals.contains_key(n.as_str())))
         || not_of_known_int_field;
+    // `!player->powers[pw_ironfeet] || (P_Random()<5)` (`P_PlayerInSpecialSector`)
+    // -- the `Expr::Index` sibling of `not_of_known_int_field` just above:
+    // `!x` where `x` is `player.powers[..]`, a genuine `int` array element
+    // (`Player.powers: [i32; NUMPOWERS]`), confirmed a real `rustc`
+    // rejection (`expected bool, found i32`) without this, not just extra
+    // caution -- unlike `cards`'s own identically-shaped array negation
+    // (`!player->cards[idx]`, `EV_DoLockedDoor`/`EV_VerticalDoor`), which
+    // is genuinely `bool`-valued and already renders correctly as plain
+    // Rust `!` through the generic `Expr::Unary` fallback. Scoped to
+    // exactly `powers` by name, the same "hand-match the one real field"
+    // discipline the by-name array-index-cast rule (`powers`/`cards`/
+    // `psprites`) already established, rather than introspecting
+    // `self_field_types`'s own stored element type.
+    let not_of_powers_index = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
+        if matches!(expr.as_ref(), Expr::Index { base, .. }
+            if matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")));
     // `!actor->target || !(actor->target->flags&MF_SHOOTABLE)` (`A_Chase`)
     // -- unlike a negated `Member`/`Ident` (genuinely ambiguous: it might
     // be a real Rust `bool` this codebase has no per-field type registry
@@ -2288,7 +2325,8 @@ fn render_binary_operand(
             || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx))
             || is_option_valued_index
             || not_of_known_int_local
-            || not_of_non_comparison_binary)
+            || not_of_non_comparison_binary
+            || not_of_powers_index)
     {
         return render_bool_expr(operand, ctx);
     }
@@ -3152,6 +3190,14 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             "render_stmt: unsupported goto shape (target {label:?} not a recognized \
              forward-jump-to-common-tail)"
         )),
+        // A bare `;` (`P_PlayerInSpecialSector`'s own stray `};` right
+        // after its `switch`'s closing brace, confirmed a real empty
+        // statement in the parsed AST, not a parser quirk) -- C's grammar
+        // allows an empty statement anywhere a statement is expected, and
+        // it's a genuine no-op, so this renders as literally nothing
+        // (`Vec::new()`) rather than an empty Rust block or a stray `;`
+        // `cargo clippy` would flag.
+        Stmt::Expr(None) => Ok(Vec::new()),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
 }
@@ -5905,6 +5951,15 @@ fn render_fn_impl_with_two_scalar_params(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone())),
     );
+    // `sector = player->mo->subsector->sector;`
+    // (`P_PlayerInSpecialSector`) -- the first `render_fn`/`render_fn_
+    // impl` caller needing a plain local aliased from a cross-reference
+    // chain rather than through `target`/`tracer`/a freshly-spawned
+    // mobj: `render_world_fn`'s own equivalent extension (`P_LineOpening`'s
+    // own `front`/`back`) already merges this the identical way, just
+    // never previously threaded through this renderer's own self-struct-
+    // shaped sibling since no earlier caller needed it.
+    extra_cross_ref_idents.extend(collect_line_sector_aliases(&f.body.items));
     // `linetarget` (`p_local.h`'s own `extern mobj_t* linetarget;`) --
     // `render_weapon_fn`'s own idiom (`A_Punch`/`A_Saw`), needed here too
     // now that a plain `mobj_t*`-self action function references it
@@ -6778,6 +6833,26 @@ fn line_sector_field_alias_type(e: &Expr) -> Option<&'static str> {
         Expr::Member { base, field, .. }
             if field == "sector"
                 && matches!(base.as_ref(), Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides")) =>
+        {
+            Some("SectorId")
+        }
+        // `sector = player->mo->subsector->sector;`
+        // (`P_PlayerInSpecialSector`) -- the same `.subsector->sector`
+        // shape `render_expr`'s own dedicated `Expr::Member` arm already
+        // renders (see its own widened guard, `is_self_bare_handle_
+        // field(bb, ..)`), recognized here too so the local it's assigned
+        // into (`sector`) itself gets registered `"SectorId"`, not just
+        // the standalone expression rendering correctly in place. Matched
+        // structurally by field name alone (`.mo.subsector.sector`), the
+        // same "no general struct-field-type registry" convention every
+        // other alias source in this function already follows, rather
+        // than requiring `self_param`/`self_field_types` context this
+        // free function (deliberately) doesn't take.
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                    if bf == "subsector"
+                        && matches!(bb.as_ref(), Expr::Member { field: bbf, .. } if bbf == "mo")) =>
         {
             Some("SectorId")
         }
@@ -17693,6 +17768,127 @@ pub fn P_MovePsprites(player: &mut Player, world: &mut World) {
     }
     player.psprites[ps_flash as usize].sx = player.psprites[ps_weapon as usize].sx;
     player.psprites[ps_flash as usize].sy = player.psprites[ps_weapon as usize].sy;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_PlayerInSpecialSector` (`p_spec.c`) translated, closing out the
+    /// one precisely-scoped candidate the previous round's own
+    /// investigation left open. `sector = player->mo->subsector->
+    /// sector;` needed two small, separate additions, exactly as
+    /// scoped: (1) the existing `.subsector->sector` `Expr::Member` arm
+    /// (`A_Look`'s `actor->subsector->sector`, already widened once for
+    /// `P_NoiseAlert`'s bare-`Handle<Thinker>`-parameter case) gains a
+    /// *third* base shape, `is_self_bare_handle_field(bb, ..)` -- `bb`
+    /// here is `player->mo` itself, not a bare `Ident`, so the two
+    /// existing guards (`self_param` directly, or a bare `Handle<
+    /// Thinker>` parameter) both missed it; rendering `base` recurses
+    /// straight back into the already-proven `is_self_bare_handle_field`
+    /// read arm, so only the guard needed widening, not the rendering
+    /// itself. (2) `line_sector_field_alias_type` (the pre-scan behind
+    /// `collect_line_sector_aliases`, used to register a local's real
+    /// cross-reference type from its own assignment's RHS shape) gains a
+    /// matching `.mo.subsector.sector` arm -> `"SectorId"`, so the local
+    /// `sector` itself is registered, not just the standalone expression
+    /// rendering correctly in isolation -- and `collect_line_sector_
+    /// aliases` itself needed threading into `render_fn_impl_with_two_
+    /// scalar_params` for the first time (every earlier `render_fn`
+    /// caller only ever needed `target`/`tracer`/spawned-mobj aliases,
+    /// never a sector-chain one), mirroring `render_world_fn`'s own
+    /// already-established merge of the same collector.
+    ///
+    /// Everything else in the body turned out to need *nothing* new,
+    /// each already-proven generic mechanism composing for free:
+    /// `player->mo->z != sector->floorheight` (both genuinely `FixedT`,
+    /// comparing directly); `world[sector].special` read/write through
+    /// the newly-registered alias (the write, `sector->special = 0;`,
+    /// falls straight through the generic `Expr::Assign` fallback with
+    /// no dedicated arm at all, since nothing about a plain `i16` field
+    /// write needs a cast); `render_switch`'s already-general fallthrough
+    /// (`case 16: case 4: ...`) and `default:` handling; a two-argument
+    /// `I_Error("...%i", sector->special)` call (the existing `Expr::
+    /// Call` arm already renders an arbitrary argument list generically,
+    /// `Expr::StringLiteral` already passes a format string through
+    /// verbatim -- multiple arguments needed no new plumbing at all, only
+    /// a *single* string argument had a real corpus precedent before
+    /// now); `player->powers[pw_ironfeet]` (the existing `powers`/`cards`/
+    /// `psprites` by-name index-cast rule); `!player->powers[..]`/
+    /// `!(leveltime&0x1f)` (both already-general C-truthiness negation,
+    /// the latter the exact `leveltime & N == 0` idiom `T_MoveFloor`
+    /// already established, just a different mask); `player->cheats &=
+    /// ~CF_GODMODE;` (`UnaryOp::BitNot` already renders as Rust's own
+    /// bitwise `!`, `thing->flags &= ~MF_SOLID;`'s own precedent, just
+    /// through a plain self field instead of a `Handle<Thinker>` one);
+    /// `player->secretcount++;` (the fully generic standalone `PostIncDec`
+    /// arm); `player->health <= 10`/`G_ExitLevel()` (a plain self-field
+    /// comparison and a zero-argument opaque forward-referenced call).
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Player`/`World`/`Sector`/`Mobj`/
+    /// `Thinker`/`Arena`/`Handle` stand-in and stub `P_DamageMobj`/
+    /// `G_ExitLevel` -- zero errors. `test_p_player_in_special_sector_renders_exactly`.
+    #[test]
+    fn test_p_player_in_special_sector_renders_exactly() {
+        let field_types = field_types(&[
+            ("mo", "Handle<Thinker>"),
+            ("powers", "[i32; NUMPOWERS]"),
+            ("cheats", "i32"),
+            ("secretcount", "i32"),
+            ("health", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_PlayerInSpecialSector",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_PlayerInSpecialSector(player: &mut Player, world: &mut World, thinkers: &Arena<Thinker>) {
+    let mut sector;
+    sector = world[match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector;
+    if match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } != world[sector].floorheight {
+        return;
+    }
+    match world[sector].special {
+        5 => {
+            if player.powers[pw_ironfeet as usize] == 0 {
+                if leveltime & 0x1f == 0 {
+                    P_DamageMobj(player.mo, None, None, 10);
+                }
+            }
+        }
+        7 => {
+            if player.powers[pw_ironfeet as usize] == 0 {
+                if leveltime & 0x1f == 0 {
+                    P_DamageMobj(player.mo, None, None, 5);
+                }
+            }
+        }
+        16 | 4 => {
+            if player.powers[pw_ironfeet as usize] == 0 || P_Random() < 5 {
+                if leveltime & 0x1f == 0 {
+                    P_DamageMobj(player.mo, None, None, 20);
+                }
+            }
+        }
+        9 => {
+            player.secretcount += 1;
+            world[sector].special = 0;
+        }
+        11 => {
+            player.cheats &= !CF_GODMODE;
+            if leveltime & 0x1f == 0 {
+                P_DamageMobj(player.mo, None, None, 20);
+            }
+            if player.health <= 10 {
+                G_ExitLevel();
+            }
+        }
+        _ => {
+            I_Error(\"P_PlayerInSpecialSector: unknown special %i\", world[sector].special);
+        }
+    }
 }";
         assert_eq!(rendered, expected);
     }

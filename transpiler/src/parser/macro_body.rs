@@ -401,10 +401,14 @@ mod tests {
         );
         match body {
             MacroBody::Object(Expr::StringLiteral(s)) => {
-                // Raw token text concatenation (quotes and all), matching
-                // grammar.rs's existing adjacent-string-literal handling --
-                // not decoded/re-quoted.
-                assert_eq!(s, "\"you can't end a netgame!\\n\\n\"\"press a key.\"");
+                // Real content concatenation (`grammar.rs`'s own
+                // adjacent-string-literal handling now merges the two
+                // tokens' *content*, dropping the closing/opening quote
+                // pair at the seam, rather than naively juxtaposing both
+                // already-quoted texts -- see that fix's own doc comment,
+                // built against `P_PlayerInSpecialSector`'s real `I_Error`
+                // call needing a genuine merged Rust string literal).
+                assert_eq!(s, "\"you can't end a netgame!\\n\\npress a key.\"");
             }
             other => panic!("expected a merged string literal, got {other:?}"),
         }
