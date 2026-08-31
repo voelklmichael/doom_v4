@@ -501,6 +501,27 @@ fn is_comparison_or_logical(op: BinaryOp) -> bool {
     matches!(op, Lt | Le | Gt | Ge | Eq | Ne | LogAnd | LogOr)
 }
 
+/// Whether a `Stmt::Return`'s own expression renders narrower than the
+/// `i32` an `int`-declared (not `boolean`-declared) C function's return
+/// type demands -- see `Stmt::Return`'s own call site for the two real
+/// corpus shapes this covers: a comparison (renders as a genuine Rust
+/// `bool`, e.g. `P_PointOnLineSide`'s own `return line->dy > 0;`) or a
+/// bitwise-AND read straight off a known-`i16` field (`twoSided`'s own
+/// `return (...)->flags & ML_TWOSIDED;`, `Line.flags: i16`). Deliberately
+/// narrow -- an arbitrary `Binary` could be any width, but only these two
+/// real shapes have turned up so far.
+fn return_expr_needs_i32_cast(e: &Expr) -> bool {
+    match e {
+        Expr::Binary { op, .. } if is_comparison_or_logical(*op) => true,
+        Expr::Binary {
+            op: BinaryOp::BitAnd,
+            lhs,
+            ..
+        } => matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "flags"),
+        _ => false,
+    }
+}
+
 fn render_assign_op(op: AssignOp) -> &'static str {
     use AssignOp::*;
     match op {
@@ -1048,6 +1069,21 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].frontsector"), true))
         }
+        // `line->v1`/`line->v2` (`P_PointOnLineSide`, `p_maputl.c`) -- the
+        // exact same `frontsector` gap just above, for `Line.v1`/`.v2:
+        // VertexId` instead: confirmed a real `rustc` rejection (`no field
+        // x on type VertexId`) without this, not assumed -- `world[line].
+        // v1.x` doesn't compile at all (`VertexId` has no `.x` field, only
+        // `Vertex` does, reached by indexing `World` a second time), the
+        // same "one more level of cross-reference chaining the generic
+        // fallback can't resolve on its own" reasoning.
+        Expr::Member { base, field, .. }
+            if (field == "v1" || field == "v2")
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("LineId")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].{field}"), true))
+        }
         // `actor->subsector->sector` (`A_Look`'s own `actor->subsector->
         // sector->soundtarget`) -- a second level of self-struct
         // chaining the generic fallback below can't resolve on its own:
@@ -1594,15 +1630,15 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                     | BinaryOp::Ge
                     | BinaryOp::Eq
                     | BinaryOp::Ne
-            ) && (is_self_fixed_t_field(lhs, ctx)
+            ) && ((is_self_fixed_t_field(lhs, ctx) || is_line_dx_dy_field(lhs, ctx))
                 && matches!(rhs.as_ref(), Expr::IntLiteral(_))
-                || is_self_fixed_t_field(rhs, ctx)
+                || (is_self_fixed_t_field(rhs, ctx) || is_line_dx_dy_field(rhs, ctx))
                     && matches!(lhs.as_ref(), Expr::IntLiteral(_))) =>
         {
             let prec = binary_prec(*op);
             let mut lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
             let mut rhs_text = render_binary_operand(rhs, *op, prec, true, ctx)?;
-            if is_self_fixed_t_field(lhs, ctx) {
+            if is_self_fixed_t_field(lhs, ctx) || is_line_dx_dy_field(lhs, ctx) {
                 rhs_text = format!("FixedT({rhs_text})");
             } else {
                 lhs_text = format!("FixedT({lhs_text})");
@@ -1636,6 +1672,34 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (rhs_text, _) = render_expr(rhs, ctx)?;
             Ok((format!("{lhs_text} == {rhs_text} as i32"), false))
         }
+        // `check->lightlevel < min` (`P_FindMinSurroundingLight`)/`temp->
+        // lightlevel > bright` (`EV_LightTurnOn`, `p_lights.c`) -- another
+        // genuine `i16`-vs-`i32` mismatch, the same category as the `tag`
+        // arm just above, but for `Sector.lightlevel: i16`
+        // (`struct_fields.rs`) against a plain `i32`-valued identifier
+        // (`ident_is_plain_i32`, covering both a local and a parameter)
+        // rather than another self-struct field. Widens the `i16` side
+        // with `as i32`, matching C's own implicit int promotion --
+        // parenthesized (`(.. as i32)`), unlike the `tag` arm's own
+        // trailing `as i32` above: a bare `x as i32 < y` doesn't even
+        // parse the way it looks (confirmed a real `rustc` rejection,
+        // "`<` is interpreted as a start of generic arguments", not
+        // assumed) -- Rust reads a type immediately followed by `<` as
+        // the start of a turbofish, not a comparison.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+            ) && matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "lightlevel")
+                && matches!(rhs.as_ref(), Expr::Ident(n) if ident_is_plain_i32(n, ctx)) =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            Ok((
+                format!("({lhs_text} as i32) {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
             let lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
@@ -1665,6 +1729,30 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SectorId({index_text} as u32)"), false))
         }
+        // `&sides[(sectors[currentSector].lines[line])->sidenum[side]]`
+        // (`getSide`, `p_spec.c`) -- the exact same `&sectors[i]` idiom
+        // just above, just for `sides`/`SideId` instead of `sectors`/
+        // `SectorId` (this function's own return type is `side_t*` ->
+        // `SideId`, under the existing memory-model decision). The index
+        // expression itself can be arbitrarily complex (here, the inline
+        // `sectors[..].lines[..]->sidenum[..]` chain the new `is_crossref`-
+        // aware `Expr::Index` arm above resolves) -- `render_expr` handles
+        // that uniformly, so this arm only needs to strip the `&` and
+        // `SideId`-wrap the result, not care about its shape.
+        Expr::Unary {
+            op: UnaryOp::AddrOf,
+            expr,
+        } if matches!(
+            expr.as_ref(),
+            Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides")
+        ) =>
+        {
+            let Expr::Index { index, .. } = expr.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("SideId({index_text} as u32)"), false))
+        }
         // `sides[i]` (bare, no `&` -- unlike `&sectors[i]` above, the
         // corpus reads this one as a plain value, immediately chaining a
         // further `.field` off it: `sides[line->sidenum[0]].sector`,
@@ -1691,6 +1779,34 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "sectors") => {
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SectorId({index_text} as u32)"), true))
+        }
+        // `sectors[currentSector].lines[line]` (`twoSided`/`getSide`/
+        // `getSector`, `p_spec.c`) -- these three functions' own bodies
+        // chain an inline `(sectors[param].lines[param])->field` with *no*
+        // intermediate local variable, unlike `getNextSector`/
+        // `P_RecursiveSound`'s own `check = sec->lines[i]; ... check->
+        // field` idiom (which `collect_line_sector_aliases` keys on
+        // instead). `Sector.lines: Vec<LineId>` (`struct_fields.rs`), so
+        // indexing it yields a cross-reference-typed `LineId` -- unlike the
+        // generic array-field fallback just below (which assumes the
+        // element itself is a plain value, correct for every other array
+        // field seen so far), this needs `is_crossref: true` so an
+        // immediately-following `->field` chain resolves through
+        // `world[...]` instead of treating the `LineId` as if it were
+        // already a real `Line`. Scoped to the `"lines"` field by name,
+        // the same "hand-match the one real corpus array" style as
+        // `sides`/`sectors`/`textureheight` above -- confirmed by tracing
+        // the real AST shape, not assumed.
+        Expr::Index { base, index } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "lines") =>
+        {
+            let (base_text, base_is_crossref) = render_expr(base, ctx)?;
+            let base_text = if base_is_crossref {
+                format!("world[{base_text}]")
+            } else {
+                base_text
+            };
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("{base_text}[{index_text} as usize]"), true))
         }
         // A plain fixed-size array *field* (`line->sidenum[0]`, `sidenum:
         // [i16; 2]` -- struct_fields.rs's own single-dimension array
@@ -1733,14 +1849,14 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // here (`render_expr`'s own `Expr::Ident` arm renames the
             // rendered *text* to `MOBJINFO` separately -- this guard
             // runs against the un-renamed AST node, so it still matches).
-            // `sec->lines[i]` (`P_RecursiveSound`, `p_enemy.c`) is the
-            // same shape once more, but for `Sector.lines: Vec<LineId>`:
-            // `i` is a fresh `for`-loop counter Rust *could* freely infer
-            // as `usize` from this one use alone, except it's *also*
-            // compared against `sec->linecount` (a genuine `i32` field)
-            // in that same loop's own header, so it must stay `i32`
-            // throughout and the index needs its own explicit cast here
-            // instead.
+            // `sec->lines[i]` (`P_RecursiveSound`, `p_enemy.c`) used to be
+            // the same shape once more, but for `Sector.lines: Vec<LineId>`
+            // -- moved into its own dedicated `is_crossref: true` arm just
+            // above once `twoSided`/`getSide`/`getSector`'s own no-
+            // intermediate-local inline chain needed the element's own
+            // cross-reference-ness tracked too (see that arm's doc
+            // comment); `field == "lines"` is intentionally no longer
+            // matched here, since it's unreachable for that field now.
             // `player->cards[card]` (`P_GiveCard`) is the same shape once
             // more: `card`'s own declared type is a fixed function
             // *parameter* (`card_t`, an `i32` under this project's own
@@ -1750,11 +1866,30 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // same shape once more: `ps_weapon` is a bare `psprnum_t`
             // enum-constant identifier, fixed `i32` elsewhere in the
             // generated crate, not a fresh local Rust could freely infer
-            // as `usize` here -- `psprites` joins `powers`/`lines`/`cards`
-            // in the by-name self-array-field list for the same reason.
+            // as `usize` here -- `psprites` joins `powers`/`cards` in the
+            // by-name self-array-field list for the same reason.
+            // `sidenum[side]` (`getSide`/`getSector`, `p_spec.c`) is the
+            // same shape once more, for `Line.sidenum: [i16; 2]` -- but
+            // narrower than `powers`/`cards`/`psprites` above: `sidenum`'s
+            // *other* real corpus use, `sidenum[side ^ 1]`/`sidenum[0]`
+            // (`EV_VerticalDoor`/`P_LineOpening`), already renders
+            // correctly with *no* cast (a fresh deferred-`let` local or a
+            // bare integer literal, both freely inferred as `usize`) --
+            // adding `sidenum` to the blanket list above would add a
+            // harmless-but-unwanted cast there too, breaking those already-
+            // shipped exact-text tests for no real gain. `side` here is
+            // different: a genuine function *parameter* (`int side`, fixed
+            // `i32` by its own declared signature, the same "a parameter's
+            // type can't be freely re-inferred" reasoning `card`/
+            // `ps_weapon` above already established), only ever a bare
+            // `Expr::Ident` in this one shape -- so the cast is scoped to
+            // exactly that (`sidenum` base *and* a bare-`Ident` index),
+            // leaving every other `sidenum[..]` shape untouched.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
                 || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "lines" || field == "cards" || field == "psprites")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites")
+                || (matches!(base.as_ref(), Expr::Member { field, .. } if field == "sidenum")
+                    && matches!(index.as_ref(), Expr::Ident(_)))
             {
                 format!("{index_text} as usize")
             } else {
@@ -2216,6 +2351,22 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             expr,
         } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.bool_locals.contains(n.as_str())) => {
             Ok(format!("!{}", render_expr(expr, ctx)?.0))
+        }
+        // `if (!line->dx)` (`P_PointOnLineSide`, `p_maputl.c`) -- a self-
+        // struct field's own truthiness check, but `Line.dx: FixedT`
+        // (`struct_fields.rs`), not a plain `int`: the generic `== 0`
+        // fallback just below doesn't compile against it (`FixedT` derives
+        // `PartialEq` against itself only, not `i32` -- confirmed by
+        // attempting the naive translation first), needing `FixedT(0)` on
+        // the literal side instead, the same "know the real C type, wrap
+        // the literal side" idiom `is_self_fixed_t_field`'s own comparison-
+        // widening arm in `render_expr` already established for a
+        // non-negated comparison.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if is_self_fixed_t_field(expr, ctx) || is_line_dx_dy_field(expr, ctx) => {
+            Ok(format!("{} == FixedT(0)", render_expr(expr, ctx)?.0))
         }
         Expr::Unary {
             op: UnaryOp::Not,
@@ -2804,6 +2955,20 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
                 && matches!(e, Expr::Member { field, .. } if field == "frontsector")
             {
                 format!("Some({text})")
+            } else if ctx.return_type == Some("i32") && return_expr_needs_i32_cast(e) {
+                // `return line->dy > 0;` (`P_PointOnLineSide`)/`return
+                // (sectors[sector].lines[line])->flags & ML_TWOSIDED;`
+                // (`twoSided`) -- both real, declared `int`-returning
+                // (not `boolean`-returning) functions whose own `return`
+                // expression renders as something narrower than `i32`: a
+                // comparison (`FixedT`/`i32`/... `>`/`<`/etc., a real Rust
+                // `bool`) or a bitwise-AND read straight off a `Line.flags:
+                // i16` field (`struct_fields.rs`), needing an explicit
+                // `as i32` wrap here rather than at `render_binary_operand`
+                // (that machinery only ever wraps an arithmetic *operand*,
+                // not a whole comparison/bitand result handed straight to
+                // `return`).
+                format!("({text}) as i32")
             } else {
                 text
             };
@@ -3803,6 +3968,42 @@ fn is_self_fixed_t_field(e: &Expr, ctx: &FnBodyContext) -> bool {
         || matches!(e, Expr::Ident(n) if is_world_fixed_t_global(n))
 }
 
+/// `line->dx`/`line->dy` (`P_PointOnLineSide`, `p_maputl.c`) -- the same
+/// "direct field known `FixedT`, compare/negate against a bare `0`
+/// literal" shape `is_self_fixed_t_field` already covers, but for a
+/// `render_world_fn`-style function (no real `self_param`/
+/// `self_field_types` at all -- `line` is tracked only in
+/// `extra_cross_ref_idents`, the same "no general struct-field-type
+/// registry for a plain parameter" gap `frontsector`/`backsector`'s own
+/// hand-matched `Member` arms already worked around). `Line.dx`/`.dy` are
+/// both `FixedT` (`struct_fields.rs`), confirmed directly, so this is
+/// narrowly scoped to exactly those two field names on a `LineId`-typed
+/// base -- not a general "any field of a cross-reference-typed parameter"
+/// check, which would need a real per-struct field-type registry this
+/// module doesn't have yet.
+fn is_line_dx_dy_field(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Member { base, field, .. }
+        if (field == "dx" || field == "dy")
+            && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("LineId")))
+}
+
+/// Whether a bare identifier is genuinely `i32`-valued in a way this
+/// module can already prove: registered `"i32"` in `extra_cross_ref_idents`
+/// -- either a genuine function *parameter* declared that way directly
+/// (e.g. `EV_LightTurnOn`'s own `bright`, a `render_trigger_fn`/
+/// `render_world_fn` parameter -- a parameter's Rust type is fixed by its
+/// own declared signature, never freely re-inferable) or a local
+/// `collect_i32_widened_locals` has confirmed is *also* assigned from one
+/// somewhere in the body (e.g. `P_FindMinSurroundingLight`'s own `min`,
+/// `min = max;` -- see that function's own doc comment for why a bare
+/// "declared plain `int`" local check isn't safe here). Used by the
+/// `Sector.lightlevel: i16`-vs-`i32` widening/narrowing arms below --
+/// `struct_fields.rs`'s own mapping confirms `lightlevel` is genuinely
+/// `i16`, a real mismatch against either shape this catches.
+fn ident_is_plain_i32(name: &str, ctx: &FnBodyContext) -> bool {
+    ctx.extra_cross_ref_idents.get(name).map(String::as_str) == Some("i32")
+}
+
 fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
     match e {
         // `P_AproxDistance`'s own bare `dx`/`dy` -- a plain function
@@ -4413,6 +4614,30 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
+        // `min = check->lightlevel;` (`P_FindMinSurroundingLight`)/`bright
+        // = temp->lightlevel;` (`EV_LightTurnOn`) -- the assignment-site
+        // sibling of `render_expr`'s own new `lightlevel`-vs-`i32`
+        // comparison-widening arm: `Sector.lightlevel: i16` written
+        // straight into an already-`i32`-typed identifier
+        // (`ident_is_plain_i32`) needs the same explicit `as i32` widening
+        // `rhs_is_u32_self_field` above already gets for `angle_t`, just
+        // for this field/direction instead.
+        let rhs_is_lightlevel_field =
+            matches!(rhs.as_ref(), Expr::Member { field, .. } if field == "lightlevel");
+        let lhs_is_plain_i32_ident =
+            matches!(lhs.as_ref(), Expr::Ident(n) if ident_is_plain_i32(n, ctx));
+        // `sector->lightlevel = bright;` (`EV_LightTurnOn`) -- the reverse
+        // direction: a plain `i32`-valued identifier written into
+        // `Sector.lightlevel: i16` (through `FnBodyContext::
+        // sector_walk_alias`'s own pointer-walk aliasing, not a real
+        // `self_param`), needing an explicit narrowing `as i16` instead --
+        // sound here specifically because `bright` only ever holds a value
+        // that itself came from an `i16` `lightlevel` field or a small
+        // literal, never genuinely out of `i16` range in this function.
+        let lhs_is_lightlevel_field =
+            matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "lightlevel");
+        let rhs_is_plain_i32_ident =
+            matches!(rhs.as_ref(), Expr::Ident(n) if ident_is_plain_i32(n, ctx));
         // `dist = P_AproxDistance (dest->x - actor->x, dest->y - actor->y);`
         // (`A_SkullAttack`) -- the same "C silently reinterprets the bits"
         // idiom as `rhs_is_u32_self_field` just above, but for `FixedT`:
@@ -4563,8 +4788,20 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             // this function already gets, just for this one more LHS/RHS
             // pairing.
             format!("Some({rhs_text})")
-        } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
+        } else if lhs_is_plain_int_local && rhs_is_u32_self_field
+            || lhs_is_plain_i32_ident && *op == AssignOp::Assign && rhs_is_lightlevel_field
+        {
+            // Both `angle = actor->angle;` (`u32` widened into a plain
+            // `int` local) and `min = check->lightlevel;` (`i16` widened
+            // into an already-`i32` local/parameter, see
+            // `ident_is_plain_i32`'s own doc comment) need the identical
+            // `as i32` widening -- merged into one arm (rather than two
+            // separate ones with the same body) since `clippy::if_same_
+            // then_else` correctly flags duplicated bodies as a real
+            // maintenance hazard, not just a style nit.
             format!("{rhs_text} as i32")
+        } else if lhs_is_lightlevel_field && *op == AssignOp::Assign && rhs_is_plain_i32_ident {
+            format!("{rhs_text} as i16")
         } else if lhs_is_known_non_bool_self_field
             && *op == AssignOp::Assign
             && rhs_is_true_or_false_literal
@@ -6331,6 +6568,84 @@ fn collect_line_sector_aliases_stmt(s: &Stmt, aliases: &mut HashMap<String, Stri
     }
 }
 
+/// `min = max;` (`P_FindMinSurroundingLight`, `p_spec.c`) -- registers a
+/// local later compared/assigned against `Sector.lightlevel: i16` as
+/// genuinely `"i32"`-typed in `extra_cross_ref_idents` (reusing
+/// `ident_is_plain_i32`'s existing parameter check, rather than adding a
+/// separate `FnBodyContext` field), but *only* when it's assigned
+/// somewhere from another identifier already known `"i32"` in `params`
+/// (a real function parameter, e.g. `max`) -- a bare "declared plain
+/// `int`" local check (`FnBodyContext::plain_int_locals`) isn't enough:
+/// `EV_TurnTagLightsOff`'s own identically-shaped `min` (`p_lights.c`) is
+/// assigned *only* from a `lightlevel` field itself (`min = sector->
+/// lightlevel;`), never from anything independently `i32`-typed, so
+/// Rust's ordinary deferred-`let` inference already settles it as `i16`
+/// for free -- confirmed a real regression against that function's own
+/// already-shipped exact-text test when this was first tried as a bare
+/// `plain_int_locals` check, not just extra caution. Mirrors
+/// `collect_line_sector_aliases`'s own "scan once, extend
+/// `extra_cross_ref_idents`" shape and recursion structure exactly, just
+/// keyed on a different RHS predicate.
+fn collect_i32_widened_locals(
+    items: &[BlockItem],
+    params: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut widened = HashMap::new();
+    collect_i32_widened_locals_in(items, params, &mut widened);
+    widened
+}
+
+fn collect_i32_widened_locals_in(
+    items: &[BlockItem],
+    params: &HashMap<String, String>,
+    widened: &mut HashMap<String, String>,
+) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_i32_widened_locals_stmt(s, params, widened);
+        }
+    }
+}
+
+fn collect_i32_widened_locals_stmt(
+    s: &Stmt,
+    params: &HashMap<String, String>,
+    widened: &mut HashMap<String, String>,
+) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(lname) = lhs.as_ref()
+        && let Expr::Ident(rname) = rhs.as_ref()
+        && params.get(rname.as_str()).map(String::as_str) == Some("i32")
+    {
+        widened.insert(lname.clone(), "i32".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_i32_widened_locals_in(&c.items, params, widened),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_i32_widened_locals_stmt(then_branch, params, widened);
+            if let Some(eb) = else_branch {
+                collect_i32_widened_locals_stmt(eb, params, widened);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_i32_widened_locals_stmt(body, params, widened),
+        Stmt::Case { stmt, .. } => collect_i32_widened_locals_stmt(stmt, params, widened),
+        Stmt::Default(stmt) => collect_i32_widened_locals_stmt(stmt, params, widened),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_i32_widened_locals_stmt(body, params, widened)
+        }
+        Stmt::For { body, .. } => collect_i32_widened_locals_stmt(body, params, widened),
+        _ => {}
+    }
+}
+
 /// Locals directly assigned from a fresh `P_SpawnMobj(...)`/
 /// `P_SpawnMissile(...)` call (`th = P_SpawnMobj(...);`, `A_Tracer`'s/
 /// `A_VileTarget`'s own idiom; `mo = P_SpawnMissile(...);`,
@@ -8075,6 +8390,10 @@ pub fn render_world_fn(
     // afterward, not just read opaquely.
     let mut extra_cross_ref_idents = param_types.clone();
     extra_cross_ref_idents.extend(collect_line_sector_aliases(&f.body.items));
+    // `min = max;` (`P_FindMinSurroundingLight`) -- see
+    // `collect_i32_widened_locals`'s own doc comment for why this needs
+    // its own separate pre-scan, not just `param_types.clone()` above.
+    extra_cross_ref_idents.extend(collect_i32_widened_locals(&f.body.items, param_types));
     // `soundtarget` (`p_enemy.c`'s own file-scope `mobj_t* soundtarget;`,
     // `P_RecursiveSound`'s own `sec->soundtarget = soundtarget;`) --
     // registered the same conditional way `render_fn_impl` registers
@@ -15264,6 +15583,250 @@ pub fn P_FindHighestCeilingSurrounding(sec: SectorId, world: &mut World) -> Fixe
         assert_eq!(rendered, expected);
     }
 
+    /// `P_FindMinSurroundingLight` (`p_spec.c`) -- `getNextSector`'s
+    /// surrounding-sector-query family's last remaining member (round 6
+    /// deferred it, see this file's own dated entry below), needing a
+    /// genuinely new i16-vs-i32 widening mechanism the earlier
+    /// `P_Find*Surrounding` siblings didn't: `min`'s own C declaration is
+    /// plain `int`, and (unlike `EV_TurnTagLightsOff`'s identically-
+    /// shaped `min`, which needs no cast at all -- Rust's deferred-`let`
+    /// inference settles it as `i16` for free since it's assigned *only*
+    /// from `lightlevel` fields) this one is *first* assigned from `max`
+    /// (a genuine `i32` parameter), forcing Rust to infer it `i32` for the
+    /// rest of the function -- so every later `check->lightlevel`
+    /// comparison/assignment against it is a real `i16`-vs-`i32`
+    /// mismatch, on *both* a comparison and an assignment (not just the
+    /// read-only comparison `EV_StopPlat`'s own `tag` fix already covers).
+    /// `collect_i32_widened_locals` (mirroring `collect_line_sector_
+    /// aliases`'s own "scan once, extend `extra_cross_ref_idents`" shape)
+    /// distinguishes the two cases by their one real structural
+    /// difference: whether the local is *ever* assigned from an
+    /// independently-`i32`-typed identifier (a parameter) anywhere in the
+    /// body, not just its own bare "declared plain `int`" status --
+    /// confirmed this narrower check was actually necessary (not just
+    /// extra caution) by first trying the broader `plain_int_locals`
+    /// version and hitting a real regression against `EV_TurnTagLightsOff`
+    /// 's own already-shipped exact-text test. The comparison-widening arm
+    /// also needed its `as i32` parenthesized (`(.. as i32) < min`, not
+    /// `.. as i32 < min`) -- confirmed a real `rustc` parse rejection
+    /// ("`<` is interpreted as a start of generic arguments"), not
+    /// assumed: `Type as i32 < x` doesn't parse as a comparison at all.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written `Sector`/`Line`/`World`/`FixedT`/stub-
+    /// `getNextSector` stand-ins -- zero errors.
+    #[test]
+    fn test_p_find_min_surrounding_light_renders_exactly() {
+        let params = field_types(&[("sector", "SectorId"), ("max", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindMinSurroundingLight",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindMinSurroundingLight(sector: SectorId, max: i32, world: &mut World) -> i32 {
+    let mut i;
+    let mut min;
+    let mut line;
+    let mut check;
+    min = max;
+    i = 0;
+    while i < world[sector].linecount {
+        line = world[sector].lines[i as usize];
+        check = getNextSector(line, sector);
+        if check.is_none() {
+            i += 1;
+            continue;
+        }
+        if (world[check.unwrap()].lightlevel as i32) < min {
+            min = world[check.unwrap()].lightlevel as i32;
+        }
+        i += 1;
+    }
+    return min;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `twoSided`/`getSide`/`getSector` (`p_spec.c`) -- their own bodies,
+    /// re-investigated and closed out this round (round 6 had only
+    /// confirmed their *call sites*, from already-translated callers like
+    /// `EV_DoFloor`, were fine): all three chain an inline
+    /// `(sectors[param].lines[param])->field` expression with *no*
+    /// intermediate local variable, unlike `getNextSector`/
+    /// `P_RecursiveSound`'s own `check = sec->lines[i]; ... check->field`
+    /// idiom (`collect_line_sector_aliases`'s own shape). The generic
+    /// `Expr::Index` fallback always returned `is_crossref: false` for an
+    /// indexed array-*field* read (unlike the special-cased bare
+    /// `sides[i]`/`sectors[i]` globals) -- confirmed by tracing the real
+    /// AST shape, not assumed -- so a new dedicated arm recognizes
+    /// `Sector.lines: Vec<LineId>` indexing specifically and propagates
+    /// `is_crossref: true`, letting the immediately-following `->field`
+    /// chain (`->flags`/`->sidenum`) resolve through a second `world[...]`
+    /// wrap instead of treating the `LineId` result as if it were already
+    /// a real `Line`. `getSide` additionally needed `&sides[complex_expr]`
+    /// (the `&sectors[i]` idiom's own sibling, generalized to `sides`/
+    /// `SideId`) and a narrowly-scoped `sidenum[side]` index cast: unlike
+    /// `sidenum[side^1]`'s own already-correct no-cast rendering elsewhere
+    /// (`side` there a fresh deferred-`let` local, freely inferred
+    /// `usize`), `side` here is a genuine function *parameter* (fixed
+    /// `i32` by its own declared signature), so the cast is scoped to
+    /// exactly "`sidenum` base *and* a bare-`Ident` index" to leave every
+    /// other `sidenum[..]` shape (a literal, or the `^`-expression) byte-
+    /// for-byte unchanged -- confirmed no regression by running the full
+    /// suite before committing, not assumed safe. `twoSided`'s own return
+    /// type is `int`, but `(...)->flags & ML_TWOSIDED` is `i16`-valued
+    /// (`Line.flags: i16`) -- the `Stmt::Return`-site `as i32` wrap this
+    /// doc's own "Not yet done" list had flagged as needed, now
+    /// implemented (`return_expr_needs_i32_cast`, covering both this
+    /// bitwise-AND-on-`flags` shape and a bare comparison result, see
+    /// `P_PointOnLineSide` just below). Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against hand-written
+    /// `Sector`/`Line`/`Side`/`World` stand-ins -- zero errors.
+    #[test]
+    fn test_two_sided_renders_exactly() {
+        let params = field_types(&[("sector", "i32"), ("line", "i32")]);
+        let rendered = render_world_fn(&corpus_dir(), "p_spec.c", "twoSided", &params, Some("i32"))
+            .expect("should render cleanly");
+        let expected = "\
+pub fn twoSided(sector: i32, line: i32, world: &mut World) -> i32 {
+    return (world[world[SectorId(sector as u32)].lines[line as usize]].flags & ML_TWOSIDED) as i32;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `getSide` (`p_spec.c`) -- see `twoSided`'s own doc comment just
+    /// above for the shared inline-chain `is_crossref` propagation and
+    /// `sidenum[side]` cast this needed. Its own return type is `side_t*`
+    /// -> `SideId` (the existing memory-model decision), built from `&
+    /// sides[(sectors[currentSector].lines[line])->sidenum[side]]` -- the
+    /// new `&sides[complex_expr]` arm (mirroring `&sectors[i]`) strips the
+    /// `&` and wraps the whole index expression in `SideId(.. as u32)`,
+    /// needing no awareness of the index's own complexity since
+    /// `render_expr` already resolves it uniformly.
+    #[test]
+    fn test_get_side_renders_exactly() {
+        let params = field_types(&[("currentSector", "i32"), ("line", "i32"), ("side", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "getSide",
+            &params,
+            Some("SideId"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn getSide(currentSector: i32, line: i32, side: i32, world: &mut World) -> SideId {
+    return SideId(world[world[SectorId(currentSector as u32)].lines[line as usize]].sidenum[side as usize] as u32);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `getSector` (`p_spec.c`) -- `getSide`'s own direct sibling, one
+    /// more `.sector` member chained off the identical `sides[..]` base
+    /// (already `is_crossref: true` from the existing bare-`sides[i]`
+    /// arm), needing nothing beyond what `getSide` already proved.
+    #[test]
+    fn test_get_sector_renders_exactly() {
+        let params = field_types(&[("currentSector", "i32"), ("line", "i32"), ("side", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "getSector",
+            &params,
+            Some("SectorId"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn getSector(currentSector: i32, line: i32, side: i32, world: &mut World) -> SectorId {
+    return world[SideId(world[world[SectorId(currentSector as u32)].lines[line as usize]].sidenum[side as usize] as u32)].sector;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_PointOnLineSide` (`p_maputl.c`) -- closed out this round, the
+    /// "not yet read in full" blocker this doc's own list had carried for
+    /// several rounds. Three genuinely new pieces, all narrower than
+    /// feared once actually read: (1) a `Stmt::Return`-site `as i32` wrap
+    /// (`return_expr_needs_i32_cast`) for a bare comparison result handed
+    /// straight to `return` in an `int`-returning (not `boolean`-
+    /// returning) function -- `return line->dy > 0;` renders as a genuine
+    /// Rust `bool` (`FixedT` derives `PartialOrd`), needing the cast at
+    /// the `return` site itself since `render_binary_operand`'s own
+    /// existing wrap machinery only ever handles an arithmetic *operand*,
+    /// not a whole handed-to-`return` comparison. (2) `!line->dx`/`!line->
+    /// dy`'s own truthiness check hits a real gap the generic `== 0`
+    /// fallback doesn't survive: `Line.dx`/`.dy: FixedT` (`struct_fields.
+    /// rs`), and `FixedT` derives `PartialEq` against itself only, not
+    /// `i32` -- confirmed a real `rustc` rejection with the naive
+    /// translation first, not assumed. Fixed with a new `is_line_dx_dy_
+    /// field` predicate (the `is_self_fixed_t_field`-style "direct field
+    /// known `FixedT`" check, but for a `render_world_fn`-style function
+    /// with no real `self_param`/`self_field_types` at all -- `line` is
+    /// tracked only in `extra_cross_ref_idents`, narrowly scoped to
+    /// exactly `dx`/`dy` by name, the same "no general struct-field-type
+    /// registry for a plain parameter" reasoning `frontsector`/
+    /// `backsector`'s own hand-matched arms already established) feeding
+    /// both this negated-truthiness arm and the existing literal-
+    /// comparison-widening arm. (3) `line->v1->x`/`line->v1->y` -- a real,
+    /// previously undiscovered gap, *not* "resolves for free" as first
+    /// assumed: `Line.v1`/`.v2: VertexId` (a cross-reference index, not an
+    /// inline value), so `world[line].v1.x` doesn't compile at all (`no
+    /// field x on type VertexId`, confirmed directly with `rustc`) without
+    /// a second `world[...]` indirection -- a new hand-matched `v1`/`v2`
+    /// arm (mirroring `frontsector`) closes it, the exact "vertex-
+    /// dereference arm not yet modeled" gap this doc's own list had
+    /// flagged. `dx = (x - line->v1->x)`/`FixedMul(line->dy>>FRACBITS,
+    /// dx)` needed nothing further: `FixedT`'s own `Sub`/`Shr<u32>` impls
+    /// and `FixedMul`'s existing opaque-forward-reference-call rendering
+    /// already cover real `FixedT` arithmetic and the `>>FRACBITS`
+    /// idiom (`runtime::FRACBITS`) unchanged. Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against hand-written
+    /// `Line`/`Vertex`/`World`/`FixedT` stand-ins and a stub `FixedMul` --
+    /// zero errors.
+    #[test]
+    fn test_p_point_on_line_side_renders_exactly() {
+        let params = field_types(&[("x", "FixedT"), ("y", "FixedT"), ("line", "LineId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_maputl.c",
+            "P_PointOnLineSide",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_PointOnLineSide(x: FixedT, y: FixedT, line: LineId, world: &mut World) -> i32 {
+    let mut dx;
+    let mut dy;
+    let mut left;
+    let mut right;
+    if world[line].dx == FixedT(0) {
+        if x <= world[world[line].v1].x {
+            return (world[line].dy > FixedT(0)) as i32;
+        }
+        return (world[line].dy < FixedT(0)) as i32;
+    }
+    if world[line].dy == FixedT(0) {
+        if y <= world[world[line].v1].y {
+            return (world[line].dx < FixedT(0)) as i32;
+        }
+        return (world[line].dx > FixedT(0)) as i32;
+    }
+    dx = x - world[world[line].v1].x;
+    dy = y - world[world[line].v1].y;
+    left = FixedMul(world[line].dy >> FRACBITS, dx);
+    right = FixedMul(dy, world[line].dx >> FRACBITS);
+    if right < left {
+        return 0;
+    }
+    return 1;
+}";
+        assert_eq!(rendered, expected);
+    }
+
     /// `PIT_ChangeSector` (`p_map.c`) -- a `boolean`-returning
     /// `P_BlockThingsIterator` callback, `PIT_ChangeSector`/`PIT_StompThing`'s
     /// own family, needing two new by-name global registrations
@@ -15827,6 +16390,69 @@ pub fn EV_TurnTagLightsOff(line: &Line, world: &mut World) {
             world[SectorId(j as u32)].lightlevel = min;
         }
         j += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_LightTurnOn` (`p_lights.c`, `EV_TurnTagLightsOff`'s own direct
+    /// sibling) -- reuses that function's `sector`-walk mechanism
+    /// (`is_sector_walk_priming`/`is_sector_walk_for`/`FnBodyContext::
+    /// sector_walk_alias`) verbatim, closing round 6's own "narrower,
+    /// newly-identified gap" entry with *zero* further renderer changes
+    /// beyond this round's own `lightlevel`-vs-`i32` mechanism: unlike
+    /// `P_FindMinSurroundingLight`'s own local (needing the new
+    /// `collect_i32_widened_locals` pre-scan to distinguish it from
+    /// `EV_TurnTagLightsOff`'s identically-shaped, non-widened `min`),
+    /// `bright` is a genuine function *parameter* -- already registered
+    /// `"i32"` in `extra_cross_ref_idents` directly from `param_types.
+    /// clone()` (`render_world_fn`'s own existing first line), with no
+    /// pre-scan needed at all. All three of its own real mismatch sites
+    /// render correctly on the very first attempt: the read-direction
+    /// comparison/assignment (`if (temp->lightlevel > bright) bright =
+    /// temp->lightlevel;`, the identical shape `P_FindMinSurroundingLight`
+    /// just proved) *and* the reverse-direction narrowing write
+    /// (`sector->lightlevel = bright;`, `lhs_is_lightlevel_field &&
+    /// rhs_is_plain_i32_ident -> as i16`, proven for the first time here --
+    /// sound specifically because `bright` only ever holds a value that
+    /// itself came from an `i16` `lightlevel` field or a small literal).
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against the same hand-written `Sector`/`Line`/`World`/stub-
+    /// `getNextSector` stand-ins as `P_FindMinSurroundingLight` -- zero
+    /// errors.
+    #[test]
+    fn test_ev_light_turn_on_renders_exactly() {
+        let params = field_types(&[("line", "&Line"), ("bright", "i32")]);
+        let rendered =
+            render_world_fn(&corpus_dir(), "p_lights.c", "EV_LightTurnOn", &params, None)
+                .expect("should render cleanly");
+        let expected = "\
+pub fn EV_LightTurnOn(line: &Line, mut bright: i32, world: &mut World) {
+    let mut i;
+    let mut j;
+    let mut temp;
+    let mut templine;
+    i = 0;
+    while i < world.sectors.len() as i32 {
+        if world[SectorId(i as u32)].tag == line.tag {
+            if bright == 0 {
+                j = 0;
+                while j < world[SectorId(i as u32)].linecount {
+                    templine = world[SectorId(i as u32)].lines[j as usize];
+                    temp = getNextSector(templine, SectorId(i as u32));
+                    if temp.is_none() {
+                        j += 1;
+                        continue;
+                    }
+                    if (world[temp.unwrap()].lightlevel as i32) > bright {
+                        bright = world[temp.unwrap()].lightlevel as i32;
+                    }
+                    j += 1;
+                }
+            }
+            world[SectorId(i as u32)].lightlevel = bright as i16;
+        }
+        i += 1;
     }
 }";
         assert_eq!(rendered, expected);
