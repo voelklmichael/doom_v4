@@ -149,15 +149,49 @@ impl Mul<i32> for FixedT {
     }
 }
 
+/// `z += ((P_Random()-P_Random())<<10);` (`P_SpawnPuff`/`P_SpawnBlood`,
+/// `p_mobj.c`) -- a `fixed_t`-declared parameter compound-assigned from a
+/// plain raw `int` expression (no `FixedT` source anywhere in it), the
+/// compound-assign sibling of `Add<i32> for FixedT` above: C's `fixed_t`
+/// is a bare `typedef int`, so this never goes through `FixedAdd`/any
+/// rescaling at all, just raw representation arithmetic, matching every
+/// other operator in this file.
+impl AddAssign<i32> for FixedT {
+    fn add_assign(&mut self, rhs: i32) {
+        self.0 = self.0.wrapping_add(rhs);
+    }
+}
+
 /// `dist / actor->info->speed`-style division by a plain scalar `int`
 /// (not another `fixed_t`) -- raw `i32` division of the representation,
-/// matching what C's `int/int` really computes (the rescaling
-/// `fixed_div`/`FixedDiv` is a distinct, explicitly-named operation for
-/// dividing one `fixed_t` by another).
+/// matching what C's `int/int` really computes. The rescaling `fixed_div`/
+/// `FixedDiv` is the usual explicitly-named operation for dividing one
+/// `fixed_t` by another, but it isn't the *only* one the real corpus
+/// uses -- see the bare `Div` impl just below.
 impl Div<i32> for FixedT {
     type Output = FixedT;
     fn div(self, rhs: i32) -> FixedT {
         FixedT(self.0 / rhs)
+    }
+}
+
+/// `slope = (dest->z+40*FRACUNIT - actor->z) / dist;` (`A_Tracer`,
+/// `p_enemy.c`) -- a bare `/` genuinely dividing one `fixed_t` value
+/// (`dist`, reassigned from `dist / actor->info->speed` a few lines
+/// earlier) by *another* `fixed_t` value, both declared `fixed_t` in the
+/// real corpus, confirmed by direct read -- not routed through `FixedDiv`
+/// at all, just raw `int/int` division of the two representations,
+/// matching every other bare arithmetic operator here (`Add`/`Sub`).
+/// Surfaced once `P_CheckMissileRange` closed the general "genuinely
+/// `fixed_t`-declared local" tracking (`FnBodyContext::fixed_t_locals`)
+/// and `A_Tracer`'s own verification harness stopped dodging `dist`'s
+/// real type with an `i32`-returning `P_AproxDistance` stub -- confirmed
+/// a real `rustc` rejection (no `Div<FixedT> for FixedT` existed before
+/// this), not a hypothetical.
+impl Div for FixedT {
+    type Output = FixedT;
+    fn div(self, rhs: FixedT) -> FixedT {
+        FixedT(self.0 / rhs.0)
     }
 }
 
@@ -199,6 +233,24 @@ impl ShlAssign<i32> for FixedT {
 impl ShrAssign<i32> for FixedT {
     fn shr_assign(&mut self, rhs: i32) {
         self.0 >>= rhs;
+    }
+}
+
+/// `(dist - thing->radius) >> FRACBITS` (`PIT_RadiusAttack`) -- the same
+/// raw-bit-shift idiom as `Shr<i32>` above, just shifted by `FRACBITS`
+/// itself (`runtime::FRACBITS: u32`, not `i32` -- this parser never
+/// macro-expands `#define`s, so the rendered output always references the
+/// real corpus name bare, and needs the shift amount's own real declared
+/// Rust type to type-check). Kept as its own impl rather than widening
+/// `Shr<i32>`'s own signature: both shift-amount types appear in the real
+/// corpus (a literal shift count like `dest->height>>1` is `i32`-inferred,
+/// while `FRACBITS` itself is `u32`), so both need their own impl, the
+/// same "both operand types get impl'd" precedent `Add<i32>`/`Mul<i32>`
+/// already established for other operators.
+impl Shr<u32> for FixedT {
+    type Output = FixedT;
+    fn shr(self, rhs: u32) -> FixedT {
+        FixedT(self.0 >> rhs)
     }
 }
 
@@ -318,6 +370,16 @@ mod tests {
     }
 
     #[test]
+    fn test_fixed_shr_by_fracbits_like_pit_radius_attack() {
+        // `(dist - thing->radius) >> FRACBITS` (`PIT_RadiusAttack`) --
+        // shifting by the real `u32`-typed `FRACBITS` constant, not a
+        // bare `i32` literal shift count.
+        let dist = FixedT(56 * FRACUNIT.0);
+        assert_eq!(dist >> FRACBITS, FixedT(dist.0 >> FRACBITS));
+        assert_eq!(dist >> FRACBITS, FixedT(56));
+    }
+
+    #[test]
     fn test_shl_shr_assign_round_trip_like_pit_vile_check() {
         // `corpsehit->height <<= 2; ... corpsehit->height >>= 2;`
         // (`PIT_VileCheck`) -- inflate then restore, ending back at the
@@ -328,5 +390,28 @@ mod tests {
         assert_eq!(height, FixedT(original.0 << 2));
         height >>= 2;
         assert_eq!(height, original);
+    }
+
+    #[test]
+    fn test_add_assign_i32_matches_add_i32() {
+        // `z += ((P_Random()-P_Random())<<10);` (`P_SpawnPuff`) -- the
+        // compound-assign sibling of `Add<i32>`, staying consistent with
+        // it.
+        let mut z = FixedT(100);
+        z += 5;
+        assert_eq!(z, FixedT(100) + 5);
+    }
+
+    #[test]
+    fn test_bare_div_like_a_tracer_slope() {
+        // `slope = (dest->z+40*FRACUNIT - actor->z) / dist;` (`A_Tracer`)
+        // -- a bare `/` genuinely dividing one `fixed_t` value by
+        // another, both declared `fixed_t` in the real corpus, never
+        // routed through `FixedDiv` at all -- raw `int/int` division of
+        // the two representations, matching every other bare arithmetic
+        // operator here.
+        let numerator = FixedT(100);
+        let divisor = FixedT(4);
+        assert_eq!(numerator / divisor, FixedT(25));
     }
 }

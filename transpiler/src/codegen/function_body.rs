@@ -70,6 +70,20 @@ fn is_cross_ref(rust_type: &str) -> bool {
     CROSS_REF_TYPES.contains(&rust_type)
 }
 
+/// A bare, file-scope `fixed_t` global hand-registered as a `World`
+/// field and hand-matched by name in `render_expr`'s own `Expr::Ident`
+/// arm (`viletryx`/`viletryy`, `PIT_VileCheck`/`A_VileChase`'s idiom;
+/// `opentop`/`openbottom`/`openrange`/`lowfloor`, `P_LineOpening`'s own).
+/// Used by `render_expr_stmt`'s literal-wrap gate so `openrange = 0;`
+/// gets the same `FixedT(0)` wrap a self-struct `FixedT` field already
+/// does, rather than a bare `0` that doesn't build against the newtype.
+fn is_world_fixed_t_global(name: &str) -> bool {
+    matches!(
+        name,
+        "viletryx" | "viletryy" | "opentop" | "openbottom" | "openrange" | "lowfloor"
+    )
+}
+
 /// Like `rust_field_name`, but for a bare identifier appearing as a
 /// *value* (a parameter/local reference, `type != lowerToFloor`), not a
 /// struct field name: `true`/`false` are C's own `boolean.h` literal
@@ -184,6 +198,21 @@ struct FnBodyContext<'a> {
     /// local rather than a field. Empty for every context that isn't a
     /// plain tick/weapon-action function's own top-level locals.
     angle_t_locals: &'a HashSet<String>,
+    /// Names of `self_param`'s own sibling locals declared as a plain
+    /// `fixed_t` at the function's top level (`collect_fixed_t_locals`) --
+    /// `P_CheckMissileRange`'s own `dist` (unlike `A_SkullAttack`'s own
+    /// same-named local, genuinely declared `fixed_t dist;` in the C
+    /// source, not plain `int`). This project's `FixedT` newtype
+    /// deliberately has no `PartialOrd<i32>`/assignment-from-`i32` (the
+    /// whole point of the newtype is catching an accidental mix at compile
+    /// time, per `runtime/fixed.rs`'s own doc comment), so a bare `int`
+    /// literal compared against or assigned into one of these needs
+    /// wrapping in `FixedT(..)` -- the same "know the real C type, wrap
+    /// the literal side" idiom `self_field_types`'s own `FixedT`-field
+    /// write arm already established, just for a plain local instead of a
+    /// self-struct field. Empty for every context that isn't a plain
+    /// tick/action function's own top-level locals.
+    fixed_t_locals: &'a HashSet<String>,
     /// This function's own `static`-storage top-level locals
     /// (`collect_static_locals`), mapping each declared name to the
     /// `World` field it's homed on (`"easy"` -> `"a_brain_spit_easy"`,
@@ -317,6 +346,35 @@ struct FnBodyContext<'a> {
     /// everywhere else, including inside `render_thinker_list_scan`'s own
     /// (separate, `Arena::iter()`-based) while-loop-shaped scan.
     thinker_scan_handle_alias: Option<(&'a str, &'a str)>,
+    /// Set only while rendering the body of a `sector = sectors; for
+    /// (i=0;i<numsectors;i++,sector++) { .. }`-shaped loop
+    /// (`is_sector_walk_for`'s own doc comment, `EV_LightTurnOn`/
+    /// `EV_TurnTagLightsOff`, `p_lights.c`) -- Doom's own "walk the whole
+    /// `sectors[]` array in lockstep with an index" idiom. Maps the
+    /// pointer-local's own name (`sector`) to the loop counter's name
+    /// (`i`): a bare reference to the pointer-local resolves to
+    /// `SectorId({counter} as u32)` directly (`render_expr`'s own
+    /// `Expr::Ident` arm), the same "the pointer already *is* the index"
+    /// reasoning `sec-sectors`'s own pointer-arithmetic special case
+    /// already established, just resolved once per reference instead of
+    /// via arithmetic. `None` everywhere else.
+    sector_walk_alias: Option<(&'a str, &'a str)>,
+    /// Set only while rendering the body of a `psp = &player->psprites[0];
+    /// for (i=0;i<NUMPSPRITES;i++,psp++) { .. }`-shaped loop
+    /// (`is_psprite_walk_for`'s own doc comment, `P_MovePsprites`,
+    /// `p_pspr.c`) -- `sector_walk_alias`'s own idiom, but for a *self-
+    /// owned, embedded-by-value* array field (`player.psprites`) rather
+    /// than a `World`-indexed global array of index newtypes: there's no
+    /// cross-reference lookup to resolve the pointer-local into (no
+    /// `SectorId`-style newtype exists for a `pspdef_t*`), so a bare
+    /// reference to the pointer-local (`psp`) resolves directly to the
+    /// full indexed self-field expression (`{self_param}.psprites
+    /// [{counter} as usize]`, *not* crossref-flagged -- unlike
+    /// `sector_walk_alias`, nothing further needs a `world[..]` wrap),
+    /// which the generic `Expr::Member` fallback then appends `.field`
+    /// onto unchanged. Maps the pointer-local's own name (`psp`) to the
+    /// loop counter's name (`i`). `None` everywhere else.
+    psprite_walk_alias: Option<(&'a str, &'a str)>,
     /// Set only while rendering the statements a forward `goto` jumps
     /// *over* (the block `render_compound_items`'s own goto-to-common-
     /// label transform wraps in a Rust labeled block) -- the label name
@@ -355,6 +413,25 @@ struct FnBodyContext<'a> {
     /// everywhere else, including every isolated-fragment test below that
     /// doesn't exercise a `for` loop at all.
     active_for_continue_step: Option<&'a str>,
+    /// This function's own declared Rust return type (`render_pure_fn`/
+    /// `render_world_fn`'s own `return_type` parameter, threaded through
+    /// verbatim), needed for exactly one purpose so far: `Stmt::Return`
+    /// wrapping a bare cross-reference value (`return line->frontsector;`,
+    /// `getNextSector`'s own idiom, `p_spec.c`) in `Some(..)` when the
+    /// function's own return type is `Option<..>` but the expression
+    /// itself renders as a bare, non-`Option` index type (`render_expr`'s
+    /// own `is_crossref` flag already means exactly that -- a bare cross-
+    /// reference value, never `Option`-wrapped, per every other cross-ref
+    /// arm in this module). A sibling return in the very same function
+    /// (`return line->backsector;`) needs no such wrap, since `backsector`
+    /// is already `Option<SectorId>` -- correctly told apart because *its*
+    /// own render never sets `is_crossref` (nothing chains a further
+    /// `.field` off it here), not by any per-field name list. `None` for
+    /// every context that isn't `render_pure_fn`/`render_world_fn` (a
+    /// `self`-struct tick/action function's own `Stmt::Return` is always
+    /// either bare `void` or a plain `bool`/`i32`, never `Option<..>`, so
+    /// this never applies there).
+    return_type: Option<&'a str>,
 }
 
 /// Everything needed to resolve a reference to an *existing* thinker's
@@ -438,6 +515,27 @@ fn render_binop(op: BinaryOp) -> &'static str {
 fn is_comparison_or_logical(op: BinaryOp) -> bool {
     use BinaryOp::*;
     matches!(op, Lt | Le | Gt | Ge | Eq | Ne | LogAnd | LogOr)
+}
+
+/// Whether a `Stmt::Return`'s own expression renders narrower than the
+/// `i32` an `int`-declared (not `boolean`-declared) C function's return
+/// type demands -- see `Stmt::Return`'s own call site for the two real
+/// corpus shapes this covers: a comparison (renders as a genuine Rust
+/// `bool`, e.g. `P_PointOnLineSide`'s own `return line->dy > 0;`) or a
+/// bitwise-AND read straight off a known-`i16` field (`twoSided`'s own
+/// `return (...)->flags & ML_TWOSIDED;`, `Line.flags: i16`). Deliberately
+/// narrow -- an arbitrary `Binary` could be any width, but only these two
+/// real shapes have turned up so far.
+fn return_expr_needs_i32_cast(e: &Expr) -> bool {
+    match e {
+        Expr::Binary { op, .. } if is_comparison_or_logical(*op) => true,
+        Expr::Binary {
+            op: BinaryOp::BitAnd,
+            lhs,
+            ..
+        } => matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "flags"),
+        _ => false,
+    }
 }
 
 fn render_assign_op(op: AssignOp) -> &'static str {
@@ -587,6 +685,16 @@ fn is_self_bare_handle_field(
 fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> {
     match e {
         Expr::IntLiteral(s) => Ok((s.clone(), false)),
+        // `I_Error ("P_AddActivePlat: no more plats!");` -- the first
+        // corpus function needing a bare C string literal as a call
+        // argument. `Expr::StringLiteral`'s own stored text already
+        // includes its surrounding double quotes verbatim from the
+        // source (`parser::grammar`'s own lexing), and C's and Rust's
+        // string-literal syntax agree closely enough for every real
+        // corpus message (plain ASCII, no exotic escapes) that passing
+        // it through unchanged is correct -- not a general C-to-Rust
+        // string-escape translator, just the one shape actually needed.
+        Expr::StringLiteral(s) => Ok((s.clone(), false)),
         Expr::Ident(name) => {
             // `currentthinker` inside `render_thinker_list_scan`'s own
             // `for thinker in thinkers.iter() { if let Thinker::Mobj(m) =
@@ -665,6 +773,22 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "braintargeton" {
                 return Ok(("world.braintargeton".to_string(), false));
             }
+            // `activeplats` (`p_plats.c`'s own file-scope `plat_t*
+            // activeplats[MAXPLATS];`, `P_AddActivePlat`'s idiom) -- the
+            // same "genuine mutable game state, hand-matched by name"
+            // category as `braintargets` just above, a global array of
+            // `Option<Handle<Thinker>>` (`NULL` marks an empty slot,
+            // confirmed by `P_AddActivePlat`'s own `if (activeplats[i] ==
+            // NULL)` scan).
+            if name == "activeplats" {
+                return Ok(("world.activeplats".to_string(), false));
+            }
+            // `activeceilings` (`p_ceilng.c`'s own file-scope `ceiling_t*
+            // activeceilings[MAXCEILINGS];`, `P_AddActiveCeiling`'s idiom)
+            // -- `activeplats`'s own exact twin, one `Thinker` variant over.
+            if name == "activeceilings" {
+                return Ok(("world.activeceilings".to_string(), false));
+            }
             // `corpsehit`/`vileobj`/`viletryx`/`viletryy` (`p_enemy.c`'s
             // own file-scope `mobj_t* corpsehit; mobj_t* vileobj; fixed_t
             // viletryx; fixed_t viletryy;`, `PIT_VileCheck`/`A_VileChase`'s
@@ -676,11 +800,114 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "vileobj" {
                 return Ok(("world.vileobj".to_string(), false));
             }
+            // `numsectors` (`p_setup.c`'s own file-scope `int
+            // numsectors;`, `P_FindSectorFromLineTag`'s own `for
+            // (i=start+1;i<numsectors;i++)`) -- unlike `linetarget`/
+            // `braintargets` (genuine mutable game state with no single
+            // source of truth elsewhere), this is a read-only derived
+            // quantity that's always exactly `world.sectors.len()` (the
+            // real engine sets both together at level load, from the very
+            // same array); rendering it as a fresh `World` field would
+            // just be a second, redundant place for the same number to
+            // silently drift out of sync, the same "keep the shape but
+            // don't duplicate the source of truth" reasoning already
+            // applied to `mobj_t.info`/`sector_t.linecount` at the struct
+            // level -- just resolved here at the expression-rendering
+            // level, since no struct field actually holds `numsectors`.
+            if name == "numsectors" {
+                return Ok(("world.sectors.len() as i32".to_string(), false));
+            }
+            // `crushchange`/`nofit` (`p_map.c`'s own file-scope `boolean
+            // crushchange; boolean nofit;`, `PIT_ChangeSector`'s idiom) --
+            // the same "genuine mutable game state a callback and its
+            // caller communicate through" category `corpsehit`/`vileobj`
+            // already established, just plain `bool` instead of
+            // `Option<Handle<Thinker>>`/`FixedT`.
+            if name == "crushchange" {
+                return Ok(("world.crushchange".to_string(), false));
+            }
+            if name == "nofit" {
+                return Ok(("world.nofit".to_string(), false));
+            }
+            // `itemrespawnque`/`itemrespawntime`/`iquehead`/`iquetail`
+            // (`p_mobj.c`'s own file-scope respawn-queue state,
+            // `P_RemoveMobj`'s idiom) -- the same category as
+            // `crushchange`/`nofit` just above.
+            if name == "itemrespawnque" {
+                return Ok(("world.itemrespawnque".to_string(), false));
+            }
+            if name == "itemrespawntime" {
+                return Ok(("world.itemrespawntime".to_string(), false));
+            }
+            if name == "iquehead" {
+                return Ok(("world.iquehead".to_string(), false));
+            }
+            if name == "iquetail" {
+                return Ok(("world.iquetail".to_string(), false));
+            }
             if name == "viletryx" {
                 return Ok(("world.viletryx".to_string(), false));
             }
             if name == "viletryy" {
                 return Ok(("world.viletryy".to_string(), false));
+            }
+            // `opentop`/`openbottom`/`openrange`/`lowfloor`
+            // (`p_maputl.c`'s own file-scope `fixed_t opentop; fixed_t
+            // openbottom; fixed_t openrange; fixed_t lowfloor;`,
+            // `P_LineOpening`'s idiom) -- the same "genuine mutable game
+            // state a callback and its caller communicate through"
+            // category `viletryx`/`viletryy` already established, just
+            // the four values `P_LineOpening` itself computes rather than
+            // reads.
+            if name == "opentop" {
+                return Ok(("world.opentop".to_string(), false));
+            }
+            if name == "openbottom" {
+                return Ok(("world.openbottom".to_string(), false));
+            }
+            if name == "openrange" {
+                return Ok(("world.openrange".to_string(), false));
+            }
+            if name == "lowfloor" {
+                return Ok(("world.lowfloor".to_string(), false));
+            }
+            // `validcount`/`soundtarget` (`p_setup.c`'s own file-scope
+            // `int validcount;`, `p_enemy.c`'s own file-scope `mobj_t*
+            // soundtarget;`, `P_RecursiveSound`/`P_NoiseAlert`'s idiom) --
+            // the same category `viletryx`/`linetarget` already
+            // established.
+            if name == "validcount" {
+                return Ok(("world.validcount".to_string(), false));
+            }
+            if name == "soundtarget" {
+                return Ok(("world.soundtarget".to_string(), false));
+            }
+            // `attackrange` (`p_mobj.c`'s own file-scope `extern fixed_t
+            // attackrange;`, `P_SpawnPuff`'s own "don't make punches
+            // spark on the wall" check) -- the same category `viletryx`
+            // already established.
+            if name == "attackrange" {
+                return Ok(("world.attackrange".to_string(), false));
+            }
+            // `swingx`/`swingy` (`p_pspr.c`'s own file-scope `fixed_t
+            // swingx; fixed_t swingy;`, `P_CalcSwing`'s idiom) -- the same
+            // category `viletryx`/`attackrange` already established; a
+            // bare write (`swingx = ..;`) resolves through this same arm
+            // too, since `render_expr_stmt`'s generic assignment fallback
+            // renders its own LHS through `render_expr` with no separate
+            // write-side special case needed.
+            if name == "swingx" {
+                return Ok(("world.swingx".to_string(), false));
+            }
+            if name == "swingy" {
+                return Ok(("world.swingy".to_string(), false));
+            }
+            // `bulletslope` (`p_pspr.c`'s own file-scope `fixed_t
+            // bulletslope;`, `P_BulletSlope`'s idiom) -- the same category
+            // `viletryx`/`attackrange`/`swingx`/`swingy` already
+            // established.
+            if name == "bulletslope" {
+                return Ok(("world.bulletslope".to_string(), false));
             }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
@@ -691,6 +918,36 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // rather than a fixed name.
             if let Some(field) = ctx.static_locals.get(name.as_str()) {
                 return Ok((format!("world.{field}"), false));
+            }
+            // `sector` (`EV_LightTurnOn`'s own `sector = sectors; for
+            // (i=0;i<numsectors;i++,sector++) { .. sector->tag .. }`) --
+            // once inside the loop this idiom's own lookahead recognized
+            // (`FnBodyContext::sector_walk_alias`'s own doc comment), a
+            // bare reference to the pointer-local resolves directly to
+            // `SectorId({counter} as u32)`, the same "the pointer already
+            // *is* the index" reasoning `sec-sectors` already established,
+            // just resolved per-reference instead of via arithmetic.
+            if let Some((var, counter)) = ctx.sector_walk_alias
+                && name == var
+            {
+                return Ok((format!("SectorId({counter} as u32)"), true));
+            }
+            // `psp` (`P_MovePsprites`'s own `psp = &player->psprites[0];
+            // for (i=0;i<NUMPSPRITES;i++,psp++) { .. psp->tics .. }`) --
+            // `sector_walk_alias`'s own sibling arm just above, but for a
+            // self-owned array field with no index-newtype/`World`
+            // indirection at all (`FnBodyContext::psprite_walk_alias`'s own
+            // doc comment): a bare reference to the pointer-local resolves
+            // directly to the full indexed self-field expression, not
+            // crossref-flagged, so the generic `Expr::Member` fallback
+            // appends `.field` straight onto it with no `world[..]` wrap.
+            if let Some((var, counter)) = ctx.psprite_walk_alias
+                && name == var
+            {
+                return Ok((
+                    format!("{}.psprites[{counter} as usize]", ctx.self_param),
+                    false,
+                ));
             }
             let is_crossref = ctx
                 .extra_cross_ref_idents
@@ -810,8 +1067,14 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // binding -- every real caller already guards each dereference
         // with its own `if (!p) return ...;` right next to it, so this
         // stays a close, simple translation of that same defensive style
-        // rather than a fancier one nothing here needs yet.
-        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")) =>
+        // rather than a fancier one nothing here needs yet. Generalized to
+        // `Option<SectorId>` too (`P_LineOpening`'s own `back` local,
+        // assigned from `linedef->backsector` -- `sector_t* back;`, never
+        // null-checked itself since the corpus's own caller,
+        // `PIT_CheckLine`, already guards `if (!ld->backsector) return
+        // false;` before ever calling this) -- identical rendering either
+        // way, since `World` indexes both `PlayerId` and `SectorId`.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("Option<PlayerId>") | Some("Option<SectorId>"))) =>
         {
             let Expr::Ident(name) = base.as_ref() else {
                 unreachable!("guarded above")
@@ -839,6 +1102,21 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].frontsector"), true))
         }
+        // `line->v1`/`line->v2` (`P_PointOnLineSide`, `p_maputl.c`) -- the
+        // exact same `frontsector` gap just above, for `Line.v1`/`.v2:
+        // VertexId` instead: confirmed a real `rustc` rejection (`no field
+        // x on type VertexId`) without this, not assumed -- `world[line].
+        // v1.x` doesn't compile at all (`VertexId` has no `.x` field, only
+        // `Vertex` does, reached by indexing `World` a second time), the
+        // same "one more level of cross-reference chaining the generic
+        // fallback can't resolve on its own" reasoning.
+        Expr::Member { base, field, .. }
+            if (field == "v1" || field == "v2")
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("LineId")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].{field}"), true))
+        }
         // `actor->subsector->sector` (`A_Look`'s own `actor->subsector->
         // sector->soundtarget`) -- a second level of self-struct
         // chaining the generic fallback below can't resolve on its own:
@@ -849,14 +1127,66 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // reference-typed needs its own narrow arm -- the same "no
         // general struct-field-type registry for anything but self/ctor"
         // reasoning `line->frontsector` already established just above,
-        // just one level further removed from `self_param`.
+        // just one level further removed from `self_param`. Widened to
+        // also match `emmiter->subsector->sector` (`P_NoiseAlert`'s own
+        // idiom, `p_enemy.c`) -- a bare `Handle<Thinker>`-registered
+        // *parameter* (not `self_param`) chained the identical way -- the
+        // rendered `base` text already resolves correctly either way
+        // (`self.subsector` via the generic self-field fallback, or
+        // `emmiter->subsector` via the existing bare-`Handle<Thinker>`
+        // `Member` arm above), so only this guard needed widening, not
+        // the rendering itself.
         Expr::Member { base, field, .. }
             if field == "sector"
                 && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
-                    if bf == "subsector" && matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)) =>
+                    if bf == "subsector"
+                        && (matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                            || matches!(bb.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>")))) =>
         {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].sector"), true))
+        }
+        // `player->mo->subsector->sector` (`P_PlayerInSpecialSector`'s own
+        // idiom) -- a *third* base shape for the same `.subsector->
+        // sector` chain just above: `bb` here isn't a bare `Ident` at all
+        // (neither `self_param` directly nor a bare `Handle<Thinker>`
+        // parameter), it's itself `player->mo` (`is_self_bare_handle_
+        // field`'s own shape, the same `Arena`-lookup-needing base that
+        // arm's own sibling read arm already resolves through `thinkers.
+        // get(player.mo)`). Rendering `base` (`player->mo->subsector`)
+        // recurses back into that existing arm unchanged -- only this
+        // guard needed widening, matching the exact "rendering already
+        // correct, only the guard was too narrow" shape the `emmiter`
+        // widening above already established.
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                    if bf == "subsector"
+                        && is_self_bare_handle_field(bb, ctx.self_param, ctx.self_field_types)) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].sector"), true))
+        }
+        // `mo->player->viewheight` (`P_ZMovement`'s own idiom) -- reading
+        // through a self-struct field itself `Option<PlayerId>`-typed,
+        // the same "one more level of chaining through a self field"
+        // shape `line->frontsector`/`actor->subsector->sector` already
+        // established just above, just landing on `PlayerId` (`World`-
+        // indexed directly, no `Arena` lookup needed at all, unlike
+        // `target`/`tracer`'s own `Handle<Thinker>`) instead of another
+        // `SectorId`. `.unwrap()` at the point of use, the same
+        // defensive-redundancy precedent every other `Option<PlayerId>`/
+        // `Option<SectorId>` dereference in this module already follows.
+        Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                if matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    && ctx.self_field_types.get(bf.as_str()).map(String::as_str) == Some("Option<PlayerId>")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!("world[{base_text}.unwrap()].{}", rust_field_name(field)?),
+                false,
+            ))
         }
         // `actor->target->info` read inside the RHS of a write to a
         // *different* field of that same `actor->target` (`A_VileAttack`'s
@@ -960,6 +1290,74 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                     "match thinkers.get({base_text}) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
                     rust_field_name(field)?
                 ),
+                false,
+            ))
+        }
+        // `(activeplats[i])->status = (activeplats[i])->oldstatus;`
+        // (`P_ActivateInStasis`) -- the RHS reads a *different* field of
+        // the exact *same* handle the LHS write's own `get_mut` already
+        // holds mutably; resolving it through a second, independent
+        // `thinkers.get(..)` call would be a real borrow conflict (the
+        // identical hazard `same_handle_write`'s own doc comment already
+        // documents for `A_FatAttack1`'s `mo`), so it reuses the write's
+        // already-bound match variable instead. Checked before the
+        // general array-read arm just below, which would otherwise
+        // (wrongly, unsoundly) spawn a fresh `get(..)` here.
+        Expr::Member { base, field, .. } if matches!(active_array_variant(base), Some((_, var)) if ctx.same_handle_write == Some(var)) =>
+        {
+            let (_, var) = active_array_variant(base).expect("guarded above");
+            Ok((format!("{var}.{}", rust_field_name(field)?), false))
+        }
+        // `(activeplats[i])->field` / `(activeceilings[j])->field` --
+        // reading a field through a `Handle<Thinker>` stored in one of
+        // the two global "active movers" arrays (`P_ActivateInStasis`/
+        // `EV_StopPlat`'s own idiom), the array-index sibling of
+        // `is_self_bare_handle_field`'s own arm just above (same fresh-
+        // per-access `thinkers.get(..)` discipline, just a different
+        // base shape and always `Option`-wrapped so it needs its own
+        // `.unwrap()` -- every real corpus call site already guards the
+        // whole block behind `if (activeplats[i] && ...)`, so this is
+        // always genuinely `Some` by the time it's reached).
+        Expr::Member { base, field, .. } if active_array_variant(base).is_some() => {
+            let (variant, var) = active_array_variant(base).expect("guarded above");
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!(
+                    "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::{variant}({var})) => {var}.{}, _ => unreachable!() }}",
+                    rust_field_name(field)?
+                ),
+                false,
+            ))
+        }
+        // `psp->state->nextstate` (`P_MovePsprites`) -- a field read
+        // chained straight through the `psprite_walk_alias`-resolved
+        // `psp->state` (`Option<&'static State>`, `is_option_valued`'s own
+        // arm for it), rather than through a real self-struct field the
+        // way `specialdata`/`target` reach an `Arena` lookup: `state_t*`
+        // maps to a plain `Option<&'static State>` (`states_data.rs`'s
+        // own `state_index` precedent for the non-`Option` case), so
+        // getting at a field of the pointed-to `State` needs an explicit
+        // `.unwrap()` first -- always genuinely `Some` here, the real
+        // corpus call site already guards the whole block behind `if
+        // ((state = psp->state))`, the same "provably non-null by the
+        // time it's reached" reasoning `active_array_variant`'s own
+        // `.unwrap()` arm above already established for a different base
+        // shape. Scoped narrowly to exactly this `psp->state->field`
+        // shape (not the general `is_option_valued(base, ctx)` predicate,
+        // which also matches several *other* already-handled shapes --
+        // `mo->player->field`, `actor->target->field`, ... -- each with
+        // its own real, non-`.unwrap()`-shaped `Arena`/`World`-indexed
+        // rendering just above; those all still take precedence over this
+        // arm by match order regardless, but keeping the guard itself
+        // narrow avoids relying on that ordering to stay correct).
+        Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                if bf == "state"
+                    && matches!(ctx.psprite_walk_alias, Some((var, _)) if matches!(bb.as_ref(), Expr::Ident(n) if n == var))) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!("{base_text}.unwrap().{}", rust_field_name(field)?),
                 false,
             ))
         }
@@ -1174,6 +1572,220 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (rhs_text, _) = render_expr(state_num, ctx)?;
             Ok((format!("state_index({lhs_text}) == {rhs_text}"), false))
         }
+        // `thing == tmthing` (`PIT_StompThing`'s own "don't clip against
+        // self" check) -- comparing the function's own receiver's
+        // *identity* against a foreign `Handle<Thinker>`-typed cross-
+        // reference (`ctx.self_param` alone renders as `&mut Mobj`, not a
+        // `Handle<Thinker>`, so this doesn't type-check as a bare
+        // passthrough). `render_fn_impl`'s own signature extension
+        // (`body_has_self_identity_comparison`) supplies a real `handle:
+        // Handle<Thinker>` parameter whenever this shape is found, so the
+        // self-side substitutes that fixed name; the other side renders
+        // normally (already a `Handle<Thinker>`-typed value).
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (matches!(lhs.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    || matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param))
+                && (matches!(lhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+                    || matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))) =>
+        {
+            let is_self = |e: &Expr| matches!(e, Expr::Ident(n) if n == ctx.self_param);
+            let lhs_text = if is_self(lhs) {
+                "handle".to_string()
+            } else {
+                render_expr(lhs, ctx)?.0
+            };
+            let rhs_text = if is_self(rhs) {
+                "handle".to_string()
+            } else {
+                render_expr(rhs, ctx)?.0
+            };
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
+        // `dist > 14*64`/`dist < 196`/`P_Random() < dist` (`P_CheckMissile
+        // Range`) -- a comparison between a genuinely `fixed_t`-declared
+        // local (`FnBodyContext::fixed_t_locals`) and a plain `int`-valued
+        // other side (a bare literal, a literal arithmetic expression, or
+        // an ordinary `int`-returning call like `P_Random()`) -- `FixedT`
+        // deliberately has no `PartialOrd<i32>` (the whole point of the
+        // newtype is catching an accidental raw-`int` mix at compile
+        // time), so the plain-`int` side needs wrapping in `FixedT(..)`.
+        // Guarded by `expr_is_fixed_t_valued` on the *other* side so this
+        // never double-wraps an already-`FixedT`-valued comparison operand
+        // (e.g. a self-struct `FixedT` field, or a `FRACUNIT`-scaled
+        // expression) -- only a genuinely bare-`int`-valued other side
+        // gets wrapped.
+        // `bombdamage - dist` (`PIT_RadiusAttack`) -- subtracting a
+        // genuinely `fixed_t`-declared local (`dist`, already reassigned
+        // through `(dist - thing->radius) >> FRACBITS` a few lines
+        // earlier, converting it from a true fixed-point value into a
+        // plain map-unit scalar -- the same "one C variable, two roles"
+        // idiom already documented for `A_Tracer`'s own `dist`/`A_Brain
+        // Explode`'s `x`/`y`/`z`) from a bare plain-`int` value
+        // (`bombdamage`, this function's own file-scope global) used
+        // straight as a call argument whose real callee parameter
+        // (`P_DamageMobj`'s `damage: int`) is plain `int`, not `fixed_t`.
+        // Unlike the comparison-wrap arm just below (which only ever
+        // needs to make *both sides* comparable, so wrapping either one
+        // in `FixedT(..)` is equally correct), a `Sub` here produces a
+        // real *value* that must come out plain `i32` -- so this extracts
+        // the fixed-point local's own raw representation (`.0`) instead
+        // of wrapping the other side, the opposite direction from that
+        // arm. Deliberately narrow (`Sub` only, RHS a bare `fixed_t_locals`
+        // ident, LHS anything *not* already known `FixedT`-valued) --
+        // `Add<FixedT> for i32`'s own existing `Output = FixedT` choice
+        // would be actively wrong reused here, since this expression's
+        // real destination is a plain-`int` parameter, not a `FixedT`
+        // value; no general rule safely covers both destinations, so this
+        // stays its own scoped case rather than widening `Sub`'s trait
+        // impls in `runtime/fixed.rs`.
+        Expr::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } if is_fixed_t_local_ident(rhs, ctx) && !expr_is_fixed_t_valued(lhs, ctx) => {
+            let lhs_text =
+                render_binary_operand(lhs, BinaryOp::Sub, binary_prec(BinaryOp::Sub), false, ctx)?;
+            let rhs_text =
+                render_binary_operand(rhs, BinaryOp::Sub, binary_prec(BinaryOp::Sub), true, ctx)?;
+            Ok((format!("{lhs_text} - {rhs_text}.0"), false))
+        }
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+            ) && (is_fixed_t_local_ident(lhs, ctx) != is_fixed_t_local_ident(rhs, ctx))
+                && !expr_is_fixed_t_valued(
+                    if is_fixed_t_local_ident(lhs, ctx) {
+                        rhs
+                    } else {
+                        lhs
+                    },
+                    ctx,
+                ) =>
+        {
+            let prec = binary_prec(*op);
+            let mut lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
+            let mut rhs_text = render_binary_operand(rhs, *op, prec, true, ctx)?;
+            if is_fixed_t_local_ident(lhs, ctx) {
+                rhs_text = format!("FixedT({rhs_text})");
+            } else {
+                lhs_text = format!("FixedT({lhs_text})");
+            }
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
+        // `mo->momz < 0`/`== 0`/`> 0` (`P_ZMovement`) -- a comparison
+        // between a genuinely `FixedT`-valued *self-struct field* and a
+        // bare integer literal. Deliberately its own narrower arm, not a
+        // blanket widening of the one just above to `expr_is_fixed_t_
+        // valued` on both sides: that was tried first and is a real
+        // regression, not just extra caution -- `T_PlatRaise`'s own
+        // `plat.sector.floorheight == plat.low` compares two genuinely
+        // `FixedT` values, but `expr_is_fixed_t_valued` has no way to
+        // recognize a cross-reference *chain* (`plat.sector.floorheight`,
+        // reached through `Sector`, a different struct than `self_param`'s
+        // own `Plat`) as already-`FixedT` -- only `plat.low` (a *direct*
+        // self field) is recognized, so a blanket `expr_is_fixed_t_valued`
+        // XOR wrongly wraps the *already-correct* other side in a second,
+        // invalid `FixedT(FixedT(..))`. A bare `Expr::IntLiteral`, unlike
+        // an unrecognized `Member`, is never ambiguous -- it can *never*
+        // itself be genuinely `FixedT`-valued -- so requiring the *other*
+        // side to be one specifically (rather than "anything `expr_is_
+        // fixed_t_valued` doesn't recognize") avoids the whole class of
+        // bug the wider check hit, while still closing the one real gap
+        // (a self field has never been wrapped against a plain literal
+        // before, since `is_fixed_t_local_ident` only ever recognizes a
+        // bare local, never a self-struct field).
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+            ) && ((is_self_fixed_t_field(lhs, ctx) || is_line_dx_dy_field(lhs, ctx))
+                && matches!(rhs.as_ref(), Expr::IntLiteral(_))
+                || (is_self_fixed_t_field(rhs, ctx) || is_line_dx_dy_field(rhs, ctx))
+                    && matches!(lhs.as_ref(), Expr::IntLiteral(_))) =>
+        {
+            let prec = binary_prec(*op);
+            let mut lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
+            let mut rhs_text = render_binary_operand(rhs, *op, prec, true, ctx)?;
+            if is_self_fixed_t_field(lhs, ctx) || is_line_dx_dy_field(lhs, ctx) {
+                rhs_text = format!("FixedT({rhs_text})");
+            } else {
+                lhs_text = format!("FixedT({lhs_text})");
+            }
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
+        // `(activeplats[j])->tag == line->tag` (`EV_StopPlat`/
+        // `P_ActivateInStasisCeiling`/`EV_CeilingCrushStop`) -- a genuine
+        // `i16`-vs-`i32` mismatch, the same category `EV_LightTurnOn`'s
+        // own deferred blocker is (see `docs/03_TRANSPILER.md`), but one-
+        // directional and narrowly scoped here: `plat_t.tag`/`ceiling_t.
+        // tag` are plain `int` (`i32`, confirmed by direct read of
+        // `p_spec.h`), while `line_t.tag` is `i16` (`struct_fields.rs`'s
+        // own mapping) -- Rust's `==` needs identical types on both
+        // sides, so `line`'s own `i16` side gets an explicit widening
+        // `as i32` (always lossless, matching C's own implicit int
+        // promotion here), rather than the general `Expr::Binary`
+        // fallback just below, which has no per-field width tracking at
+        // all.
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+        } if matches!(lhs.as_ref(), Expr::Member { base, field, .. } if field == "tag" && active_array_variant(base).is_some())
+            && matches!(rhs.as_ref(), Expr::Member { base, field, .. } if field == "tag" && matches!(base.as_ref(), Expr::Ident(n) if n == "line")) =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            Ok((format!("{lhs_text} == {rhs_text} as i32"), false))
+        }
+        // `check->lightlevel < min` (`P_FindMinSurroundingLight`)/`temp->
+        // lightlevel > bright` (`EV_LightTurnOn`, `p_lights.c`) -- another
+        // genuine `i16`-vs-`i32` mismatch, the same category as the `tag`
+        // arm just above, but for `Sector.lightlevel: i16`
+        // (`struct_fields.rs`) against a plain `i32`-valued identifier
+        // (`ident_is_plain_i32`, covering both a local and a parameter)
+        // rather than another self-struct field. Widens the `i16` side
+        // with `as i32`, matching C's own implicit int promotion --
+        // parenthesized (`(.. as i32)`), unlike the `tag` arm's own
+        // trailing `as i32` above: a bare `x as i32 < y` doesn't even
+        // parse the way it looks (confirmed a real `rustc` rejection,
+        // "`<` is interpreted as a start of generic arguments", not
+        // assumed) -- Rust reads a type immediately followed by `<` as
+        // the start of a turbofish, not a comparison.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+            ) && matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "lightlevel")
+                && matches!(rhs.as_ref(), Expr::Ident(n) if ident_is_plain_i32(n, ctx)) =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            Ok((
+                format!("({lhs_text} as i32) {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
             let lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
@@ -1203,6 +1815,30 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SectorId({index_text} as u32)"), false))
         }
+        // `&sides[(sectors[currentSector].lines[line])->sidenum[side]]`
+        // (`getSide`, `p_spec.c`) -- the exact same `&sectors[i]` idiom
+        // just above, just for `sides`/`SideId` instead of `sectors`/
+        // `SectorId` (this function's own return type is `side_t*` ->
+        // `SideId`, under the existing memory-model decision). The index
+        // expression itself can be arbitrarily complex (here, the inline
+        // `sectors[..].lines[..]->sidenum[..]` chain the new `is_crossref`-
+        // aware `Expr::Index` arm above resolves) -- `render_expr` handles
+        // that uniformly, so this arm only needs to strip the `&` and
+        // `SideId`-wrap the result, not care about its shape.
+        Expr::Unary {
+            op: UnaryOp::AddrOf,
+            expr,
+        } if matches!(
+            expr.as_ref(),
+            Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides")
+        ) =>
+        {
+            let Expr::Index { index, .. } = expr.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("SideId({index_text} as u32)"), false))
+        }
         // `sides[i]` (bare, no `&` -- unlike `&sectors[i]` above, the
         // corpus reads this one as a plain value, immediately chaining a
         // further `.field` off it: `sides[line->sidenum[0]].sector`,
@@ -1218,6 +1854,45 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides") => {
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SideId({index_text} as u32)"), true))
+        }
+        // `sectors[i]` (bare, no `&` -- `P_FindSectorFromLineTag`'s own
+        // `sectors[i].tag`, `p_spec.c`). The exact same idiom as bare
+        // `sides[i]` just above, generalized to its sibling global array
+        // now that a second real caller needs it: `sector_t*` already
+        // maps to `SectorId`, so this needs no real indexing operation
+        // either, just wrapping the index -- `is_crossref: true` so the
+        // chained `.tag` resolves through `world[...]` the same way.
+        Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "sectors") => {
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("SectorId({index_text} as u32)"), true))
+        }
+        // `sectors[currentSector].lines[line]` (`twoSided`/`getSide`/
+        // `getSector`, `p_spec.c`) -- these three functions' own bodies
+        // chain an inline `(sectors[param].lines[param])->field` with *no*
+        // intermediate local variable, unlike `getNextSector`/
+        // `P_RecursiveSound`'s own `check = sec->lines[i]; ... check->
+        // field` idiom (which `collect_line_sector_aliases` keys on
+        // instead). `Sector.lines: Vec<LineId>` (`struct_fields.rs`), so
+        // indexing it yields a cross-reference-typed `LineId` -- unlike the
+        // generic array-field fallback just below (which assumes the
+        // element itself is a plain value, correct for every other array
+        // field seen so far), this needs `is_crossref: true` so an
+        // immediately-following `->field` chain resolves through
+        // `world[...]` instead of treating the `LineId` as if it were
+        // already a real `Line`. Scoped to the `"lines"` field by name,
+        // the same "hand-match the one real corpus array" style as
+        // `sides`/`sectors`/`textureheight` above -- confirmed by tracing
+        // the real AST shape, not assumed.
+        Expr::Index { base, index } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "lines") =>
+        {
+            let (base_text, base_is_crossref) = render_expr(base, ctx)?;
+            let base_text = if base_is_crossref {
+                format!("world[{base_text}]")
+            } else {
+                base_text
+            };
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((format!("{base_text}[{index_text} as usize]"), true))
         }
         // A plain fixed-size array *field* (`line->sidenum[0]`, `sidenum:
         // [i16; 2]` -- struct_fields.rs's own single-dimension array
@@ -1260,9 +1935,47 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // here (`render_expr`'s own `Expr::Ident` arm renames the
             // rendered *text* to `MOBJINFO` separately -- this guard
             // runs against the un-renamed AST node, so it still matches).
+            // `sec->lines[i]` (`P_RecursiveSound`, `p_enemy.c`) used to be
+            // the same shape once more, but for `Sector.lines: Vec<LineId>`
+            // -- moved into its own dedicated `is_crossref: true` arm just
+            // above once `twoSided`/`getSide`/`getSector`'s own no-
+            // intermediate-local inline chain needed the element's own
+            // cross-reference-ness tracked too (see that arm's doc
+            // comment); `field == "lines"` is intentionally no longer
+            // matched here, since it's unreachable for that field now.
+            // `player->cards[card]` (`P_GiveCard`) is the same shape once
+            // more: `card`'s own declared type is a fixed function
+            // *parameter* (`card_t`, an `i32` under this project's own
+            // locally-typedef'd-enum mapping), not a local Rust could
+            // freely infer as `usize` here.
+            // `player->psprites[ps_weapon]` (`P_BringUpWeapon`) is the
+            // same shape once more: `ps_weapon` is a bare `psprnum_t`
+            // enum-constant identifier, fixed `i32` elsewhere in the
+            // generated crate, not a fresh local Rust could freely infer
+            // as `usize` here -- `psprites` joins `powers`/`cards` in the
+            // by-name self-array-field list for the same reason.
+            // `sidenum[side]` (`getSide`/`getSector`, `p_spec.c`) is the
+            // same shape once more, for `Line.sidenum: [i16; 2]` -- but
+            // narrower than `powers`/`cards`/`psprites` above: `sidenum`'s
+            // *other* real corpus use, `sidenum[side ^ 1]`/`sidenum[0]`
+            // (`EV_VerticalDoor`/`P_LineOpening`), already renders
+            // correctly with *no* cast (a fresh deferred-`let` local or a
+            // bare integer literal, both freely inferred as `usize`) --
+            // adding `sidenum` to the blanket list above would add a
+            // harmless-but-unwanted cast there too, breaking those already-
+            // shipped exact-text tests for no real gain. `side` here is
+            // different: a genuine function *parameter* (`int side`, fixed
+            // `i32` by its own declared signature, the same "a parameter's
+            // type can't be freely re-inferred" reasoning `card`/
+            // `ps_weapon` above already established), only ever a bare
+            // `Expr::Ident` in this one shape -- so the cast is scoped to
+            // exactly that (`sidenum` base *and* a bare-`Ident` index),
+            // leaving every other `sidenum[..]` shape untouched.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites")
+                || (matches!(base.as_ref(), Expr::Member { field, .. } if field == "sidenum")
+                    && matches!(index.as_ref(), Expr::Ident(_)))
             {
                 format!("{index_text} as usize")
             } else {
@@ -1434,6 +2147,27 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 is_crossref,
             ))
         }
+        // `dx>dy ? dx : dy` (`PIT_RadiusAttack`'s own idiom, C's ternary
+        // operator) -- the first real corpus function needing it. Rust's
+        // own `if`/`else` is already a real expression (no separate
+        // ternary syntax needed), so this renders directly as one,
+        // `render_bool_expr` for the condition (`>` here, but any real
+        // corpus condition shape) and plain `render_expr` for both
+        // branches (matching every other value-position sub-expression in
+        // this module).
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let cond_text = render_bool_expr(cond, ctx)?;
+            let then_text = render_expr(then_expr, ctx)?.0;
+            let else_text = render_expr(else_expr, ctx)?.0;
+            Ok((
+                format!("if {cond_text} {{ {then_text} }} else {{ {else_text} }}"),
+                false,
+            ))
+        }
         _ => Err(format!("render_expr: unsupported expression shape: {e:?}")),
     }
 }
@@ -1543,6 +2277,22 @@ fn render_binary_operand(
     let not_of_known_int_local = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
         if matches!(expr.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()) || ctx.static_locals.contains_key(n.as_str())))
         || not_of_known_int_field;
+    // `!player->powers[pw_ironfeet] || (P_Random()<5)` (`P_PlayerInSpecialSector`)
+    // -- the `Expr::Index` sibling of `not_of_known_int_field` just above:
+    // `!x` where `x` is `player.powers[..]`, a genuine `int` array element
+    // (`Player.powers: [i32; NUMPOWERS]`), confirmed a real `rustc`
+    // rejection (`expected bool, found i32`) without this, not just extra
+    // caution -- unlike `cards`'s own identically-shaped array negation
+    // (`!player->cards[idx]`, `EV_DoLockedDoor`/`EV_VerticalDoor`), which
+    // is genuinely `bool`-valued and already renders correctly as plain
+    // Rust `!` through the generic `Expr::Unary` fallback. Scoped to
+    // exactly `powers` by name, the same "hand-match the one real field"
+    // discipline the by-name array-index-cast rule (`powers`/`cards`/
+    // `psprites`) already established, rather than introspecting
+    // `self_field_types`'s own stored element type.
+    let not_of_powers_index = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
+        if matches!(expr.as_ref(), Expr::Index { base, .. }
+            if matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers")));
     // `!actor->target || !(actor->target->flags&MF_SHOOTABLE)` (`A_Chase`)
     // -- unlike a negated `Member`/`Ident` (genuinely ambiguous: it might
     // be a real Rust `bool` this codebase has no per-field type registry
@@ -1562,12 +2312,21 @@ fn render_binary_operand(
     // version first).
     let not_of_non_comparison_binary = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
         if matches!(expr.as_ref(), Expr::Binary { op, .. } if !is_comparison_or_logical(*op)));
+    // `activeplats[i] && (activeplats[i])->tag == tag && ...`
+    // (`P_ActivateInStasis`) -- a bare `Option<Handle<Thinker>>`-valued
+    // global-array element as one `&&` operand, the `Expr::Index` sibling
+    // of the bare-`Ident` `Option`-valued arm just below (`is_option_valued`
+    // already recognizes this shape).
+    let is_option_valued_index =
+        matches!(operand, Expr::Index { .. }) && is_option_valued(operand, ctx);
     if matches!(parent_op, BinaryOp::LogAnd | BinaryOp::LogOr)
         && (matches!(operand, Expr::Member { .. })
             || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op))
             || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx))
+            || is_option_valued_index
             || not_of_known_int_local
-            || not_of_non_comparison_binary)
+            || not_of_non_comparison_binary
+            || not_of_powers_index)
     {
         return render_bool_expr(operand, ctx);
     }
@@ -1601,22 +2360,30 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move" || n == "P_ThingHeightClip" || n == "P_CheckAmmo"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
     match expr {
-        // Covers both a trigger function's own `Option<PlayerId>` local
-        // (`p`) and a `Mobj`-shaped action function's own local alias of
-        // `target`/`tracer` (`dest`, `A_SkullAttack`'s idiom) -- both
-        // tracked the same way, via `ctx.extra_cross_ref_idents`.
+        // Covers a trigger function's own `Option<PlayerId>` local (`p`),
+        // a `Mobj`-shaped action function's own local alias of `target`/
+        // `tracer` (`dest`, `A_SkullAttack`'s idiom), and a local assigned
+        // from `getNextSector(..)`'s own real `Option<SectorId>` return
+        // (`tsec`, `EV_LightTurnOn`'s idiom) -- all tracked the same way,
+        // via `ctx.extra_cross_ref_idents`.
         Expr::Ident(n) => matches!(
             ctx.extra_cross_ref_idents
                 .get(n.as_str())
                 .map(String::as_str),
-            Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>")
+            Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>") | Some("Option<SectorId>")
         ),
         Expr::Member { field, .. } if field == "player" => true,
+        // `activeplats[i]`/`activeceilings[j]` (`P_ActivateInStasis`/
+        // `EV_StopPlat`'s own scan) -- the global-array sibling of the
+        // cases just below, `Option<Handle<Thinker>>`-valued the same way
+        // `P_AddActivePlat`'s own `if (activeplats[i] == NULL)` scan
+        // already established.
+        Expr::Index { .. } if active_array_variant(expr).is_some() => true,
         // `!actor->target` (`A_PosAttack` and friends) -- `target`'s
         // registered type (`Mobj.target: Option<Handle<Thinker>>`, per
         // `struct_fields.rs`'s own self-referential-field mapping) is the
@@ -1630,6 +2397,18 @@ fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
                     .self_field_types
                     .get(field.as_str())
                     .is_some_and(|t| t.starts_with("Option<")) =>
+        {
+            true
+        }
+        // `psp->state` (`P_MovePsprites`'s own `if ((state = psp->state))`)
+        // -- `pspdef_t.state`'s own real C nullability (`p_pspr.h`'s own
+        // "a NULL state means not active" comment), read through the
+        // `psprite_walk_alias` pointer-local specifically (the one shape
+        // this project's corpus has actually needed so far), not a general
+        // "any field named `state`" rule.
+        Expr::Member { base, field, .. }
+            if field == "state"
+                && matches!(ctx.psprite_walk_alias, Some((var, _)) if matches!(base.as_ref(), Expr::Ident(n) if n == var)) =>
         {
             true
         }
@@ -1688,6 +2467,22 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.bool_locals.contains(n.as_str())) => {
             Ok(format!("!{}", render_expr(expr, ctx)?.0))
         }
+        // `if (!line->dx)` (`P_PointOnLineSide`, `p_maputl.c`) -- a self-
+        // struct field's own truthiness check, but `Line.dx: FixedT`
+        // (`struct_fields.rs`), not a plain `int`: the generic `== 0`
+        // fallback just below doesn't compile against it (`FixedT` derives
+        // `PartialEq` against itself only, not `i32` -- confirmed by
+        // attempting the naive translation first), needing `FixedT(0)` on
+        // the literal side instead, the same "know the real C type, wrap
+        // the literal side" idiom `is_self_fixed_t_field`'s own comparison-
+        // widening arm in `render_expr` already established for a
+        // non-negated comparison.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if is_self_fixed_t_field(expr, ctx) || is_line_dx_dy_field(expr, ctx) => {
+            Ok(format!("{} == FixedT(0)", render_expr(expr, ctx)?.0))
+        }
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -1700,6 +2495,16 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // `.is_some()`, not the `== 0` truthiness every other (plain
         // `int`) value gets.
         Expr::Member { field, .. } if field == "specialdata" => {
+            Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
+        }
+        // `if (mo->player && ...)` (`P_ZMovement`) -- a bare, non-negated
+        // self-struct field itself `Option<...>`-typed (`is_option_valued`'s
+        // own generic self-field arm, not just the hardcoded `specialdata`
+        // name above) used for truthiness -- the un-negated sibling of the
+        // negated `!actor->target`/`!mo->player` arm this module already
+        // has (`is_option_valued(expr, ctx)` at the top of this match), just
+        // never needed bare until this first real corpus example.
+        Expr::Member { .. } if is_option_valued(cond, ctx) => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
         // `if (linetarget)` (`A_Punch`) -- a bare, non-negated `Option`-
@@ -1715,11 +2520,43 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Ident(_) if is_option_valued(cond, ctx) => {
             Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
         }
+        // `if (onfloor)` (`P_ThingHeightClip`) -- the un-negated sibling of
+        // the bare-`bool`-local `!x` arm above (`ctx.bool_locals`):
+        // `onfloor` is a `boolean`-declared local whose only assignment is
+        // a real comparison, so it's already a genuine Rust `bool` by the
+        // time this reads it -- a bare truthiness check needs no `!= 0`
+        // cast, the same "already `bool`" reasoning as the negated case,
+        // never needed until this first real corpus example (every earlier
+        // `boolean`-local truthiness check in this codebase's own corpus
+        // so far only ever appeared negated).
+        Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) => Ok(render_expr(cond, ctx)?.0),
         // `if (player->powers[pw_strength])` (`A_Punch`) -- a bare array-
         // element read used for truthiness, the `Expr::Index` sibling of
         // the plain-`Member`-field arm just below: `powers` is a plain
         // `int` array (a tic-count flag, not `Option`-valued), so this is
         // ordinary C truthiness, `!= 0`.
+        // `if (activeplats[i])` / `activeplats[i] && ...` (`P_ActivateInStasis`)
+        // -- a bare `Option<Handle<Thinker>>`-valued global-array element
+        // used for truthiness (a null-pointer check in the original), the
+        // `Expr::Index` sibling of the bare-`Member`/bare-`Ident` `Option`-
+        // valued arms above. Checked before the generic `!= 0` arm just
+        // below, which would otherwise wrongly apply plain-`int`
+        // truthiness to a real `Option`.
+        Expr::Index { .. } if is_option_valued(cond, ctx) => {
+            Ok(format!("{}.is_some()", render_expr(cond, ctx)?.0))
+        }
+        // `if (player->cards[card]) return;` (`P_GiveCard`) -- a bare,
+        // non-negated index into a genuine Rust `bool` array (`cards`,
+        // `struct_fields.rs`'s own mapping), the un-negated sibling of
+        // `!player->cards[idx]`'s own already-correct plain-`!` fallback
+        // (`render_expr`'s own `Unary::Not` arm, whose doc comment
+        // explains why no cast is needed there either) -- already a real
+        // `bool`, so no truthiness cast at all, unlike the generic
+        // `Expr::Index` fallback just below (which assumes a plain `int`
+        // array).
+        Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards") => {
+            Ok(render_expr(cond, ctx)?.0)
+        }
         Expr::Index { .. } => Ok(format!("{} != 0", render_expr(cond, ctx)?.0)),
         // `if (actor->info->painsound)` (`A_Pain`) -- a bare struct-field
         // reference used for truthiness, same as `specialdata` above, but
@@ -1785,6 +2622,29 @@ fn render_condition(
     depth: usize,
 ) -> Result<(Vec<String>, String), String> {
     match cond {
+        // `if ((state = psp->state))` (`P_MovePsprites`) -- C evaluates the
+        // assignment, then tests the *assigned value's* own truthiness; no
+        // earlier `if` condition in this corpus has been a bare assignment
+        // itself. Hoisted as its own statement immediately before the `if`
+        // (the same "evaluate the side effect first, patch the condition"
+        // strategy `hoist_pre_inc_dec` already uses), then the now-plain
+        // local is tested directly -- `is_option_valued(rhs, ctx)` (not the
+        // LHS, which is only a bare `Expr::Ident` `render_bool_expr` can't
+        // yet see is `Option`-typed on its own) confirms the RHS is a known
+        // nullable field read (`psprite_walk_alias`'s own `state` arm)
+        // before committing to `.is_some()` rather than `!= 0`. Scoped to
+        // `ident = <nullable field>` specifically, not a fully general
+        // "any assignment can be an if-condition" transform.
+        Expr::Assign {
+            op: AssignOp::Assign,
+            lhs,
+            rhs,
+        } if matches!(lhs.as_ref(), Expr::Ident(_)) && is_option_valued(rhs, ctx) => {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            let hoisted = vec![format!("{}{lhs_text} = {rhs_text};", indent(depth))];
+            Ok((hoisted, format!("{lhs_text}.is_some()")))
+        }
         Expr::PreIncDec { expr, op } => {
             let (hoisted, target_text) = hoist_pre_inc_dec(expr, *op, ctx, depth)?;
             Ok((hoisted, format!("{target_text} != 0")))
@@ -1924,9 +2784,36 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         // deferred-inference local (unconditionally `mut`, the same as
         // every uninitialized decl below, rather than analyzing whether
         // this particular one is ever reassigned).
+        // `fixed_t height = MAXINT;` / `= 0;` (`P_FindLowestCeilingSurrounding`
+        // /`P_FindHighestCeilingSurrounding`, `p_spec.c`) -- a `fixed_t`-
+        // declared local's own initializer, straight from an opaque macro
+        // constant or a bare integer literal, with no `FRACUNIT`/cross-ref
+        // involvement `expr_is_fixed_t_valued` would already recognize.
+        // Unlike a self-struct field *write* (already wrapped elsewhere),
+        // a plain local's own declaration was rendered wholly inline before
+        // now -- Rust would then fix this binding's type from the bare
+        // `i32`-valued initializer alone, conflicting the moment the loop
+        // body reassigns a real `FixedT` (`world[other.unwrap()]
+        // .ceilingheight`) into the same binding, confirmed a real `E0308`
+        // by direct `rustc` reproduction before adding this. Guarded by
+        // `expr_is_fixed_t_valued` the same way the self-struct-field-write
+        // wrap already is, so an initializer that's already genuinely
+        // `FixedT`-valued (`sec->floorheight`, `-500*FRACUNIT`, ...) is
+        // never double-wrapped.
+        let is_fixed_t_decl = matches!(
+            d.specifiers.type_specifiers.as_slice(),
+            [TypeSpecifier::TypedefName(n)] if n == "fixed_t"
+        );
         let init_text = match &decl.initializer {
             None => String::new(),
-            Some(Initializer::Expr(e)) => format!(" = {}", render_expr(e, ctx)?.0),
+            Some(Initializer::Expr(e)) => {
+                let (text, _) = render_expr(e, ctx)?;
+                if is_fixed_t_decl && !expr_is_fixed_t_valued(e, ctx) {
+                    format!(" = FixedT({text})")
+                } else {
+                    format!(" = {text}")
+                }
+            }
             Some(Initializer::List(_)) => {
                 return Err(
                     "render_decl: a brace-list initializer is not supported so far".to_string(),
@@ -2113,15 +3000,20 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // at all -- an assignment is only ever a *statement* here, never
         // a value this renderer produces -- so the naive single-
         // statement translation fails outright rather than mistranslating
-        // (confirmed directly, not guessed at). Split into the two
+        // (confirmed directly, not guessed at). Flattened to however many
         // ordinary assignments C's own chain performs in sequence
-        // (innermost first, matching real evaluation order: `momy` is
-        // assigned before `momx` reads it back), each rendered through
-        // the ordinary single-assignment path below so every existing
-        // write-side special case (target/tracer writes, same-handle
-        // writes, ...) still applies to each piece independently --
-        // scoped to a plain `=` chain only, the one real corpus shape,
-        // not every possible mix of compound ops.
+        // (innermost first, matching real evaluation order: `momz` is
+        // assigned before `momy`/`momx` read it back), each rendered
+        // through the ordinary single-assignment path below so every
+        // existing write-side special case (target/tracer writes, same-
+        // handle writes, ...) still applies to each piece independently.
+        // Generalized from a fixed two-target split to any chain length
+        // (`mo->momx = mo->momy = mo->momz = 0;`, `P_ExplodeMissile`, a
+        // three-target chain the original two-target-only version
+        // couldn't recurse into -- its "first" half was still itself a
+        // chain, handed to `render_expr_stmt` rather than back through
+        // this same flattening) -- scoped to a plain `=` chain only, the
+        // one real corpus shape, not every possible mix of compound ops.
         Stmt::Expr(Some(Expr::Assign {
             op: AssignOp::Assign,
             lhs,
@@ -2134,40 +3026,92 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             }
         ) =>
         {
-            let Expr::Assign {
-                lhs: inner_lhs,
-                rhs: inner_rhs,
-                ..
-            } = rhs.as_ref()
-            else {
-                unreachable!("guarded above")
+            let mut targets = vec![lhs.as_ref().clone()];
+            let mut cur = rhs.as_ref();
+            let value = loop {
+                match cur {
+                    Expr::Assign {
+                        op: AssignOp::Assign,
+                        lhs: l2,
+                        rhs: r2,
+                    } => {
+                        targets.push(l2.as_ref().clone());
+                        cur = r2.as_ref();
+                    }
+                    other => break other.clone(),
+                }
             };
-            let first = Expr::Assign {
-                op: AssignOp::Assign,
-                lhs: inner_lhs.clone(),
-                rhs: inner_rhs.clone(),
-            };
-            let second = Expr::Assign {
-                op: AssignOp::Assign,
-                lhs: lhs.clone(),
-                rhs: inner_lhs.clone(),
-            };
-            Ok(vec![
-                format!("{}{};", indent(depth), render_expr_stmt(&first, ctx)?),
-                format!("{}{};", indent(depth), render_expr_stmt(&second, ctx)?),
-            ])
+            let mut lines = Vec::with_capacity(targets.len());
+            let mut rhs_expr = value;
+            for target in targets.into_iter().rev() {
+                let stmt = Expr::Assign {
+                    op: AssignOp::Assign,
+                    lhs: Box::new(target.clone()),
+                    rhs: Box::new(rhs_expr),
+                };
+                lines.push(format!(
+                    "{}{};",
+                    indent(depth),
+                    render_expr_stmt(&stmt, ctx)?
+                ));
+                rhs_expr = target;
+            }
+            Ok(lines)
         }
+        // `(activeplats[i])->thinker.function.acp1 = (actionf_p1)
+        // T_PlatRaise;` (`P_ActivateInStasis`/`EV_StopPlat`) -- discarded
+        // entirely, matching `is_function_pointer_assign`'s own reasoning
+        // for a constructor's identical idiom (see
+        // `is_active_array_function_pointer_assign`'s own doc comment).
+        // Checked here, in plain `render_stmt`, rather than a spawn
+        // function's own item-filtering loop, since this idiom appears
+        // nested inside a trigger function's `if` body, not at a
+        // constructor's top level.
+        Stmt::Expr(Some(e)) if is_active_array_function_pointer_assign(e) => Ok(vec![]),
         Stmt::Expr(Some(e)) => Ok(vec![format!(
             "{}{};",
             indent(depth),
             render_expr_stmt(e, ctx)?
         )]),
         Stmt::Return(None) => Ok(vec![format!("{}return;", indent(depth))]),
-        Stmt::Return(Some(e)) => Ok(vec![format!(
-            "{}return {};",
-            indent(depth),
-            render_expr(e, ctx)?.0
-        )]),
+        Stmt::Return(Some(e)) => {
+            let (text, _) = render_expr(e, ctx)?;
+            // `return line->frontsector;` (`getNextSector`, `p_spec.c`) --
+            // this function's own return type is `Option<SectorId>`
+            // (matching its sibling return, `return line->backsector;`,
+            // already `Option`-typed with no wrap needed), but
+            // `frontsector` itself is a bare, non-`Option` `SectorId`
+            // field (`struct_fields.rs`'s own corpus-verified asymmetry:
+            // only `backsector` is genuinely nullable). Hand-matched by
+            // field name, the same "no general struct-field-type registry
+            // yet, name it explicitly" style as `sides[i].sector`/
+            // `specialdata` elsewhere in this module, rather than a
+            // general "is this bare `Member` cross-reference-typed" check
+            // for a plain (non-`self`, non-`ctor`) parameter's own field --
+            // unproven beyond this one real corpus case so far.
+            let text = if matches!(ctx.return_type, Some(rt) if rt.starts_with("Option<"))
+                && matches!(e, Expr::Member { field, .. } if field == "frontsector")
+            {
+                format!("Some({text})")
+            } else if ctx.return_type == Some("i32") && return_expr_needs_i32_cast(e) {
+                // `return line->dy > 0;` (`P_PointOnLineSide`)/`return
+                // (sectors[sector].lines[line])->flags & ML_TWOSIDED;`
+                // (`twoSided`) -- both real, declared `int`-returning
+                // (not `boolean`-returning) functions whose own `return`
+                // expression renders as something narrower than `i32`: a
+                // comparison (`FixedT`/`i32`/... `>`/`<`/etc., a real Rust
+                // `bool`) or a bitwise-AND read straight off a `Line.flags:
+                // i16` field (`struct_fields.rs`), needing an explicit
+                // `as i32` wrap here rather than at `render_binary_operand`
+                // (that machinery only ever wraps an arithmetic *operand*,
+                // not a whole comparison/bitand result handed straight to
+                // `return`).
+                format!("({text}) as i32")
+            } else {
+                text
+            };
+            Ok(vec![format!("{}return {};", indent(depth), text)])
+        }
         Stmt::If {
             cond,
             then_branch,
@@ -2246,6 +3190,14 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
             "render_stmt: unsupported goto shape (target {label:?} not a recognized \
              forward-jump-to-common-tail)"
         )),
+        // A bare `;` (`P_PlayerInSpecialSector`'s own stray `};` right
+        // after its `switch`'s closing brace, confirmed a real empty
+        // statement in the parsed AST, not a parser quirk) -- C's grammar
+        // allows an empty statement anywhere a statement is expected, and
+        // it's a genuine no-op, so this renders as literally nothing
+        // (`Vec::new()`) rather than an empty Rust block or a stray `;`
+        // `cargo clippy` would flag.
+        Stmt::Expr(None) => Ok(Vec::new()),
         _ => Err(format!("render_stmt: unsupported statement shape: {s:?}")),
     }
 }
@@ -2617,6 +3569,284 @@ fn is_thinker_list_scan_for(stmt: &Stmt) -> Option<(&str, &Stmt)> {
     Some((var, body))
 }
 
+/// `sector = sectors;` -- the priming statement immediately before
+/// `is_sector_walk_for`'s own loop header (`EV_LightTurnOn`/
+/// `EV_TurnTagLightsOff`, `p_lights.c`), Doom's own "walk the whole
+/// `sectors[]` array in lockstep with an index" idiom: a `sector_t*`
+/// local assigned the bare array name itself (its first element,
+/// address-of elided the same way C's own array-to-pointer decay
+/// already does), then advanced one element per loop iteration via its
+/// own `sector++` step rather than a real index. Mirrors
+/// `is_thinker_list_scan_init`'s own shape exactly, just keyed off
+/// `sectors` instead of `thinkercap.next`.
+fn is_sector_walk_priming(stmt: &Stmt) -> Option<&str> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = stmt
+    else {
+        return None;
+    };
+    let Expr::Ident(var) = lhs.as_ref() else {
+        return None;
+    };
+    matches!(rhs.as_ref(), Expr::Ident(n) if n == "sectors").then_some(var.as_str())
+}
+
+/// `for (i=0;i<numsectors;i++,sector++) { .. }` -- the loop header
+/// pairing with `is_sector_walk_priming`'s own initializer, confirmed to
+/// advance the *same* pointer-local named there (not just assumed from
+/// adjacency), the same "confirm every real piece" discipline
+/// `is_thinker_list_scan_for` already established. Its own step is a
+/// genuine two-part comma expression (`i++, sector++`) -- a shape no
+/// earlier `for` loop in this corpus has needed -- returning just the
+/// counter's own name and the loop body; the pointer-local's own
+/// `sector++` half is dropped entirely from the rendered output, since
+/// `sector_walk_alias` already resolves every reference to it as
+/// `SectorId({counter} as u32)`, which needs no separate advancement of
+/// its own.
+fn is_sector_walk_for<'a>(stmt: &'a Stmt, var: &str) -> Option<(&'a str, &'a Stmt)> {
+    let Stmt::For {
+        init: Some(ForInit::Expr(init_expr)),
+        cond: Some(cond),
+        step: Some(step),
+        body,
+    } = stmt
+    else {
+        return None;
+    };
+    let Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: init_lhs,
+        rhs: init_rhs,
+    } = init_expr
+    else {
+        return None;
+    };
+    let Expr::Ident(counter) = init_lhs.as_ref() else {
+        return None;
+    };
+    if !matches!(init_rhs.as_ref(), Expr::IntLiteral(s) if s == "0") {
+        return None;
+    }
+    let Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: cond_lhs,
+        rhs: cond_rhs,
+    } = cond
+    else {
+        return None;
+    };
+    if !matches!(cond_lhs.as_ref(), Expr::Ident(n) if n == counter) {
+        return None;
+    }
+    if !matches!(cond_rhs.as_ref(), Expr::Ident(n) if n == "numsectors") {
+        return None;
+    }
+    let Expr::Comma(step1, step2) = step else {
+        return None;
+    };
+    let step1_ok = matches!(step1.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == counter));
+    if !step1_ok {
+        return None;
+    }
+    let step2_ok = matches!(step2.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == var));
+    if !step2_ok {
+        return None;
+    }
+    Some((counter, body))
+}
+
+/// Renders the whole `sector = sectors; for (i=0;i<numsectors;i++,
+/// sector++) { .. }` pair as one ordinary Rust counted loop over
+/// `world.sectors.len()`, reusing `render_for`'s own existing machinery
+/// (the `continue`-hoists-the-step handling included) by constructing a
+/// synthetic single-part step (`i++` alone, the pointer-local's own
+/// `sector++` half already made redundant by `sector_walk_alias`) rather
+/// than teaching `render_for` itself about a comma-step shape only this
+/// one idiom needs.
+fn render_sector_walk_for(
+    var: &str,
+    counter: &str,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let inner_ctx = FnBodyContext {
+        sector_walk_alias: Some((var, counter)),
+        ..*ctx
+    };
+    let init = Some(ForInit::Expr(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::IntLiteral("0".to_string())),
+    }));
+    let cond = Some(Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::Ident("numsectors".to_string())),
+    });
+    let step = Some(Expr::PostIncDec {
+        expr: Box::new(Expr::Ident(counter.to_string())),
+        op: IncDecOp::Inc,
+    });
+    render_for(&init, &cond, &step, body, &inner_ctx, depth)
+}
+
+/// `psp = &player->psprites[0];` -- the priming statement immediately
+/// before `is_psprite_walk_for`'s own loop header (`P_MovePsprites`,
+/// `p_pspr.c`), `is_sector_walk_priming`'s own sibling idiom for a self-
+/// owned, embedded-by-value array field: a `pspdef_t*` local assigned the
+/// address of the array's own first element (`&player->psprites[0]`, not
+/// a bare array-name decay the way `sector = sectors;` is -- `psprites`
+/// is a real fixed-size array *field*, not a top-level array global, so
+/// C needs an explicit `&`/`[0]` here), then advanced one element per
+/// loop iteration via its own `psp++` step. `self_param` is threaded
+/// through explicitly (unlike `is_sector_walk_priming`, which keys off
+/// the fixed global name `sectors`) since `psprites` is only ever reached
+/// through a real self-struct parameter, whose own name isn't fixed.
+fn is_psprite_walk_priming<'a>(stmt: &'a Stmt, self_param: &str) -> Option<&'a str> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = stmt
+    else {
+        return None;
+    };
+    let Expr::Ident(var) = lhs.as_ref() else {
+        return None;
+    };
+    let Expr::Unary {
+        op: UnaryOp::AddrOf,
+        expr,
+    } = rhs.as_ref()
+    else {
+        return None;
+    };
+    let Expr::Index { base, index } = expr.as_ref() else {
+        return None;
+    };
+    if !matches!(index.as_ref(), Expr::IntLiteral(s) if s == "0") {
+        return None;
+    }
+    let Expr::Member {
+        base: mbase,
+        field,
+        arrow: true,
+    } = base.as_ref()
+    else {
+        return None;
+    };
+    if field != "psprites" {
+        return None;
+    }
+    if !matches!(mbase.as_ref(), Expr::Ident(n) if n == self_param) {
+        return None;
+    }
+    Some(var.as_str())
+}
+
+/// `for (i=0;i<NUMPSPRITES;i++,psp++) { .. }` -- the loop header pairing
+/// with `is_psprite_walk_priming`'s own initializer, `is_sector_walk_for`'s
+/// own sibling: the same genuine two-part comma step (`i++, psp++`), just
+/// bounded by the fixed `NUMPSPRITES` enum constant (`p_pspr.h`) rather
+/// than the runtime `numsectors` global, since `psprites` is a fixed-size
+/// array field, not a level-sized one. The pointer-local's own `psp++`
+/// half is dropped the same way `sector++`'s is, since `psprite_walk_
+/// alias` already resolves every reference to it directly.
+fn is_psprite_walk_for<'a>(stmt: &'a Stmt, var: &str) -> Option<(&'a str, &'a Stmt)> {
+    let Stmt::For {
+        init: Some(ForInit::Expr(init_expr)),
+        cond: Some(cond),
+        step: Some(step),
+        body,
+    } = stmt
+    else {
+        return None;
+    };
+    let Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: init_lhs,
+        rhs: init_rhs,
+    } = init_expr
+    else {
+        return None;
+    };
+    let Expr::Ident(counter) = init_lhs.as_ref() else {
+        return None;
+    };
+    if !matches!(init_rhs.as_ref(), Expr::IntLiteral(s) if s == "0") {
+        return None;
+    }
+    let Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: cond_lhs,
+        rhs: cond_rhs,
+    } = cond
+    else {
+        return None;
+    };
+    if !matches!(cond_lhs.as_ref(), Expr::Ident(n) if n == counter) {
+        return None;
+    }
+    if !matches!(cond_rhs.as_ref(), Expr::Ident(n) if n == "NUMPSPRITES") {
+        return None;
+    }
+    let Expr::Comma(step1, step2) = step else {
+        return None;
+    };
+    let step1_ok = matches!(step1.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == counter));
+    if !step1_ok {
+        return None;
+    }
+    let step2_ok = matches!(step2.as_ref(), Expr::PostIncDec { expr, op: IncDecOp::Inc }
+        if matches!(expr.as_ref(), Expr::Ident(n) if n == var));
+    if !step2_ok {
+        return None;
+    }
+    Some((counter, body))
+}
+
+/// Renders the whole `psp = &player->psprites[0]; for (i=0;i<NUMPSPRITES;
+/// i++,psp++) { .. }` pair as one ordinary Rust counted loop bounded by
+/// `NUMPSPRITES`, `render_sector_walk_for`'s own sibling: reuses `render_
+/// for`'s existing machinery via the same synthetic single-part step
+/// construction, just setting `psprite_walk_alias` instead of `sector_
+/// walk_alias` in the inner context and bounding by `NUMPSPRITES` instead
+/// of `numsectors`.
+fn render_psprite_walk_for(
+    var: &str,
+    counter: &str,
+    body: &Stmt,
+    ctx: &FnBodyContext,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    let inner_ctx = FnBodyContext {
+        psprite_walk_alias: Some((var, counter)),
+        ..*ctx
+    };
+    let init = Some(ForInit::Expr(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::IntLiteral("0".to_string())),
+    }));
+    let cond = Some(Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs: Box::new(Expr::Ident(counter.to_string())),
+        rhs: Box::new(Expr::Ident("NUMPSPRITES".to_string())),
+    });
+    let step = Some(Expr::PostIncDec {
+        expr: Box::new(Expr::Ident(counter.to_string())),
+        op: IncDecOp::Inc,
+    });
+    render_for(&init, &cond, &step, body, &inner_ctx, depth)
+}
+
 /// `curvar->function.acp1 == (actionf_p1)P_MobjThinker` -- the tag check
 /// every real corpus scan uses to confirm a raw `thinker_t*` is actually
 /// a live `mobj_t` before casting to it. Stripped rather than rendered:
@@ -2964,6 +4194,16 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
             matches!(arg, Expr::Unary { op: UnaryOp::AddrOf, expr }
                 if matches!(expr.as_ref(), Expr::Member { base, field, arrow: true }
                     if field == "thinker" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
+                // `P_RemoveThinker((thinker_t*)mobj)` (`P_RemoveMobj`'s own
+                // idiom) -- a second, genuinely different real shape for
+                // the same "remove my own handle" call: a direct cast of
+                // the receiver itself to `thinker_t*`, not `&self->thinker`
+                // (`mobj_t`'s own embedded `thinker_t thinker;` header
+                // field is dropped entirely under this project's own
+                // memory model, so there's no `.thinker` to take the
+                // address of here -- the cast *is* the whole expression).
+                || matches!(arg, Expr::Cast { expr, .. }
+                    if matches!(expr.as_ref(), Expr::Ident(n) if n == self_param))
         }
         // `P_RemoveMobj(mo)` (`A_SpawnFly`'s own idiom, `p_mobj.c`'s real
         // declared shape `void P_RemoveMobj(mobj_t* mobj)`) -- a second,
@@ -3001,9 +4241,100 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
 /// `FixedT`," not "definitely plain `int`," so this only ever adds a
 /// wrap, never removes information a caller's already-typed value
 /// needs.
+/// Whether `e` is a bare reference to one of `self_param`'s own sibling
+/// locals declared genuinely `fixed_t` (`FnBodyContext::fixed_t_locals`,
+/// e.g. `P_CheckMissileRange`'s own `dist`) -- see that field's own doc
+/// comment.
+fn is_fixed_t_local_ident(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Ident(n) if ctx.fixed_t_locals.contains(n.as_str()))
+}
+
+/// A *direct* self-struct field registered `"FixedT"` (`mo->momz`, not a
+/// further chain through it like `plat->sector->floorheight`), or a bare
+/// hand-matched-by-name `World` `FixedT` global (`openrange <= 0`,
+/// `P_RecursiveSound`'s own idiom -- `is_world_fixed_t_global`) -- used
+/// by the literal-comparison-wrap arm below, deliberately narrower than
+/// `expr_is_fixed_t_valued`'s own (already-correct, more permissive)
+/// notion of "definitely `FixedT`", since that arm's safety specifically
+/// depends on the *other* side being an unambiguous `Expr::IntLiteral`,
+/// not on this side being exhaustively recognized.
+fn is_self_fixed_t_field(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Member { base, field, .. }
+        if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+            && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT"))
+        || matches!(e, Expr::Ident(n) if is_world_fixed_t_global(n))
+}
+
+/// `line->dx`/`line->dy` (`P_PointOnLineSide`, `p_maputl.c`) -- the same
+/// "direct field known `FixedT`, compare/negate against a bare `0`
+/// literal" shape `is_self_fixed_t_field` already covers, but for a
+/// `render_world_fn`-style function (no real `self_param`/
+/// `self_field_types` at all -- `line` is tracked only in
+/// `extra_cross_ref_idents`, the same "no general struct-field-type
+/// registry for a plain parameter" gap `frontsector`/`backsector`'s own
+/// hand-matched `Member` arms already worked around). `Line.dx`/`.dy` are
+/// both `FixedT` (`struct_fields.rs`), confirmed directly, so this is
+/// narrowly scoped to exactly those two field names on a `LineId`-typed
+/// base -- not a general "any field of a cross-reference-typed parameter"
+/// check, which would need a real per-struct field-type registry this
+/// module doesn't have yet.
+fn is_line_dx_dy_field(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Member { base, field, .. }
+        if (field == "dx" || field == "dy")
+            && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("LineId")))
+}
+
+/// Whether a bare identifier is genuinely `i32`-valued in a way this
+/// module can already prove: registered `"i32"` in `extra_cross_ref_idents`
+/// -- either a genuine function *parameter* declared that way directly
+/// (e.g. `EV_LightTurnOn`'s own `bright`, a `render_trigger_fn`/
+/// `render_world_fn` parameter -- a parameter's Rust type is fixed by its
+/// own declared signature, never freely re-inferable) or a local
+/// `collect_i32_widened_locals` has confirmed is *also* assigned from one
+/// somewhere in the body (e.g. `P_FindMinSurroundingLight`'s own `min`,
+/// `min = max;` -- see that function's own doc comment for why a bare
+/// "declared plain `int`" local check isn't safe here). Used by the
+/// `Sector.lightlevel: i16`-vs-`i32` widening/narrowing arms below --
+/// `struct_fields.rs`'s own mapping confirms `lightlevel` is genuinely
+/// `i16`, a real mismatch against either shape this catches.
+fn ident_is_plain_i32(name: &str, ctx: &FnBodyContext) -> bool {
+    ctx.extra_cross_ref_idents.get(name).map(String::as_str) == Some("i32")
+}
+
 fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
     match e {
-        Expr::Ident(n) => n == "FRACUNIT",
+        // `P_AproxDistance`'s own bare `dx`/`dy` -- a plain function
+        // *parameter* genuinely declared `fixed_t` in the real C source,
+        // registered `"FixedT"`-valued in `extra_cross_ref_idents` the
+        // same way `render_pure_fn` registers every one of its own
+        // parameters -- distinct from a self-struct field (resolved via
+        // the `Member` arm below) or a `fixed_t`-declared *local*
+        // (`FnBodyContext::fixed_t_locals`, populated only from a
+        // function's own top-level `Decl`s, which a parameter never is).
+        Expr::Ident(n)
+            if ctx
+                .extra_cross_ref_idents
+                .get(n.as_str())
+                .map(String::as_str)
+                == Some("FixedT") =>
+        {
+            true
+        }
+        // `delta`/`dist` (`P_ZMovement`'s own `fixed_t`-declared locals,
+        // `FnBodyContext::fixed_t_locals`) -- genuinely `FixedT`-valued
+        // the same way a self-struct field is, just never checked here
+        // before now: every earlier caller of this function either didn't
+        // have a `fixed_t`-declared local in the expression at all, or
+        // (`is_fixed_t_local_ident`'s own separate, narrower callers)
+        // only ever needed to recognize a *bare* fixed_t local, not one
+        // buried inside a larger arithmetic expression (`-(delta*3)`) --
+        // confirmed a real gap by tracing `P_ZMovement`'s own `dist <
+        // -(delta*3)` through by hand: without this, `-(delta*3)` looks
+        // *not* already `FixedT`-valued, so the comparison-wrap arm below
+        // would double-wrap an already-genuine `FixedT` expression in
+        // `FixedT(..)` a second time, the identical class of bug
+        // `corpsehit->momy`'s own arm just above was built to prevent.
+        Expr::Ident(n) => n == "FRACUNIT" || ctx.fixed_t_locals.contains(n.as_str()),
         Expr::Member { base, field, .. } => {
             // `corpsehit->momy` (`PIT_VileCheck`) -- a third real source,
             // alongside `self_param`'s own fields and a spawned `Handle<
@@ -3024,8 +4355,30 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
                     ctx.self_field_types,
                     ctx.extra_cross_ref_idents,
                 );
-            base_is_self_or_handle_local
+            if base_is_self_or_handle_local
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT")
+            {
+                return true;
+            }
+            // `other->floorheight`/`sec->ceilingheight`
+            // (`P_FindLowestFloorSurrounding`/`P_FindHighestFloorSurrounding`'s
+            // own idiom) -- a *different* real source again, this time a
+            // plain `SectorId`/`Option<SectorId>`-typed parameter or local
+            // (registered in `extra_cross_ref_idents`, not `self_param`'s
+            // own fields) dereferencing one of `Sector`'s two corpus-
+            // verified `FixedT` fields (`r_defs.h`). Hand-matched by field
+            // name, the same "no general struct-field-type registry"
+            // discipline `sides[i].sector`/`line->frontsector` already
+            // established, rather than a general cross-ref-field-type
+            // lookup nothing else here has needed yet. Confirmed a real
+            // gap (not just extra caution) by direct `rustc` reproduction:
+            // without this, comparing a bare `fixed_t` local (`floor`)
+            // against `other->floorheight` wrongly took the bare-`fixed_t`-
+            // local-vs-plain-`int` comparison-wrap arm above, double-
+            // wrapping an already-genuine `FixedT` value in `FixedT(..)` a
+            // second time.
+            matches!(field.as_str(), "floorheight" | "ceilingheight")
+                && matches!(base.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("SectorId") | Some("Option<SectorId>")))
         }
         Expr::Binary {
             op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
@@ -3118,6 +4471,31 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             return Ok(format!(
                 "if let Some(Thinker::{}({})) = thinkers.get_mut({}) {{ {}.{field} = {rhs_text}; }}",
                 mh.rust_type, mh.var, mh.handle_expr, mh.var
+            ));
+        }
+        // `(activeplats[i])->field = expr;` -- the array-index sibling of
+        // the `mutating_handle` write arm just above, same fresh-per-
+        // access `thinkers.get_mut(..)` discipline, for the two global
+        // "active movers" arrays instead of a constructor's own back-
+        // reference (`P_ActivateInStasis`'s own `(activeplats[i])->status
+        // = (activeplats[i])->oldstatus;`).
+        if *op == AssignOp::Assign
+            && let Expr::Member {
+                base,
+                field: lhs_field,
+                ..
+            } = lhs.as_ref()
+            && let Some((variant, var)) = active_array_variant(base)
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            let rhs_ctx = FnBodyContext {
+                same_handle_write: Some(var),
+                ..*ctx
+            };
+            let (rhs_text, _) = render_expr(rhs, &rhs_ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            return Ok(format!(
+                "if let Some(Thinker::{variant}({var})) = thinkers.get_mut({base_text}.unwrap()) {{ {var}.{field} = {rhs_text}; }}"
             ));
         }
         // `th->field = expr;` / `th->field -= expr;` -- writing a field of
@@ -3217,6 +4595,33 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             };
             return Ok(format!(
                 "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({name}) {{ m.{field} {} {rhs_text}; }}",
+                render_assign_op(*op)
+            ));
+        }
+        // `mo->player->viewheight -= ..;` / `.deltaviewheight = ..;`
+        // (`P_ZMovement`'s own idiom) -- writing through a self-struct
+        // field itself `Option<PlayerId>`-typed. Unlike every
+        // `Handle<Thinker>`-mediated write in this function, this needs
+        // no `Arena` borrow-scoping dance at all: `World::players` is a
+        // plain, ordinary Rust array (`runtime/player.rs`'s own fixed-
+        // size design), not an arena with a `get`/`get_mut` API, so
+        // `world[mo.player.unwrap()].field op= rhs;` is just a normal
+        // indexed write, safe regardless of what else the same RHS reads
+        // (no live borrow to conflict with, unlike `thinkers.get_mut`).
+        if let Expr::Member {
+            base,
+            field: lhs_field,
+            ..
+        } = lhs.as_ref()
+            && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                if matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    && ctx.self_field_types.get(bf.as_str()).map(String::as_str) == Some("Option<PlayerId>"))
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            return Ok(format!(
+                "world[{base_text}.unwrap()].{field} {} {rhs_text}",
                 render_assign_op(*op)
             ));
         }
@@ -3426,9 +4831,110 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         // guessed at.
         let lhs_is_plain_int_local =
             matches!(lhs.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()));
+        // `mo->momx = mo->momy = mo->momz = 0;` (`P_ExplodeMissile`, once
+        // flattened by `render_stmt`'s own chained-assignment handling
+        // into three separate plain assignments) -- a raw `int` literal
+        // (`0`) written straight into a *plain self-struct* `FixedT`
+        // field, the same "C's `fixed_t` is just `int`, Rust's `FixedT`
+        // needs its own wrapper" gap the target/tracer write arms above
+        // (`is_fixed_t_field`, `PIT_VileCheck`'s `corpsehit->momy = 0;`)
+        // already close for a *target/tracer-typed* base -- this is that
+        // same fix for the far more common case of writing straight to
+        // one of the function's own `self`-struct fields, never needed
+        // before because every earlier `A_*`/tick function's own literal-
+        // into-`FixedT`-field writes happened to go through a target/
+        // tracer or spawned-mobj alias instead. Deliberately scoped to a
+        // genuine `Expr::IntLiteral` RHS only, *not* the broader
+        // `!expr_is_fixed_t_valued` check the target/tracer arms use --
+        // tried that first and it was a real regression, not just overly
+        // cautious: `T_MoveCeiling`'s own `ceiling->speed = CEILSPEED;`
+        // (`CEILSPEED` a `#define`d alias for `FRACUNIT`, `p_spec.h`,
+        // confirmed by direct read) is already correctly `FixedT`-typed
+        // end to end, but this parser never macro-expands `#define`s
+        // (matching `enum_values.rs`'s own documented stance), so
+        // `expr_is_fixed_t_valued` -- which only recognizes the literal
+        // identifier `FRACUNIT`, not every macro that happens to expand
+        // to it -- can't tell it apart from a genuinely-plain-`int`
+        // constant; wrapping it in `FixedT(CEILSPEED)` would have been
+        // a real `rustc` rejection (building a `FixedT` from a `FixedT`
+        // argument). A bare integer literal has no such ambiguity: it is
+        // never itself already `FixedT`-typed, so this narrower check is
+        // both sufficient for `P_ExplodeMissile`'s own need and safe
+        // against every other already-shipped translation.
+        let lhs_is_fixed_t_self_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("FixedT"));
+        // `openrange = 0;` (`P_LineOpening`'s own single-sided-line early
+        // return) -- the same raw-`int`-literal-into-`FixedT` gap
+        // `lhs_is_fixed_t_self_field` closes for a self-struct field, just
+        // for a bare identifier that renames to one of `World`'s own
+        // hand-matched-by-name `FixedT` globals (`opentop`/`openbottom`/
+        // `openrange`/`lowfloor`/`viletryx`/`viletryy`) instead of a
+        // struct field.
+        let lhs_is_world_fixed_t_global =
+            matches!(lhs.as_ref(), Expr::Ident(n) if is_world_fixed_t_global(n));
+        // `dist = 200;`/`dist = 160;` (`P_CheckMissileRange`, clamping a
+        // genuinely `fixed_t`-declared local) -- the same raw-`int`-
+        // literal-into-`FixedT` gap `lhs_is_fixed_t_self_field` closes for
+        // a self-struct field, just for a plain local (`FnBodyContext::
+        // fixed_t_locals`) instead.
+        let lhs_is_fixed_t_local = is_fixed_t_local_ident(lhs, ctx);
+        // `dx = abs(dx);` (`P_AproxDistance`) -- self-reassignment through
+        // `abs()`, the one real corpus shape needing `abs()`'s existing
+        // raw-magnitude extraction (`(dx).0.abs()`, already correct for
+        // `PIT_VileCheck`'s own "compare against a plain `int`" use)
+        // re-wrapped back into `FixedT` here, since `dx` stays genuinely
+        // `fixed_t`-typed afterward (used in real `FixedT` arithmetic --
+        // `dx>>1`, `dx+dy` -- not compared against a bare `int` the way
+        // `PIT_VileCheck`'s own use is). Scoped to a bare-`Ident` LHS
+        // that's itself known `FixedT`-valued (a self-struct field, a
+        // `fixed_t`-declared local, or -- new here -- one of `render_pure_
+        // fn`'s own `FixedT`-registered parameters, `dx`/`dy` themselves,
+        // via `expr_is_fixed_t_valued`'s new `extra_cross_ref_idents`
+        // arm), not every possible `abs()` reassignment.
+        let lhs_is_fixed_t_typed_ident = matches!(lhs.as_ref(), Expr::Ident(_))
+            && (lhs_is_fixed_t_local || expr_is_fixed_t_valued(lhs, ctx));
+        let rhs_is_abs_call = matches!(rhs.as_ref(), Expr::Call { callee, .. }
+            if matches!(callee.as_ref(), Expr::Ident(n) if n == "abs"));
+        let rhs_is_int_literal = matches!(rhs.as_ref(), Expr::IntLiteral(_));
+        // `player->cards[card] = 1;` (`P_GiveCard`) -- a plain `int`
+        // literal written into a genuine Rust `bool` array element
+        // (`cards`, `struct_fields.rs`'s own mapping) -- C's own `int`-
+        // as-`boolean` idiom needs an explicit `true`/`false` here, the
+        // same "one value, two different real types" gap `FixedT`'s own
+        // literal-into-field wrap already closes for `fixed_t`, just for
+        // `bool` instead. No real corpus call site writes anything but a
+        // literal `1` here, so only that value is recognized -- anything
+        // else fails loudly rather than guessing.
+        let lhs_is_cards_index = matches!(lhs.as_ref(), Expr::Index { base, .. }
+            if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards"));
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
+        // `min = check->lightlevel;` (`P_FindMinSurroundingLight`)/`bright
+        // = temp->lightlevel;` (`EV_LightTurnOn`) -- the assignment-site
+        // sibling of `render_expr`'s own new `lightlevel`-vs-`i32`
+        // comparison-widening arm: `Sector.lightlevel: i16` written
+        // straight into an already-`i32`-typed identifier
+        // (`ident_is_plain_i32`) needs the same explicit `as i32` widening
+        // `rhs_is_u32_self_field` above already gets for `angle_t`, just
+        // for this field/direction instead.
+        let rhs_is_lightlevel_field =
+            matches!(rhs.as_ref(), Expr::Member { field, .. } if field == "lightlevel");
+        let lhs_is_plain_i32_ident =
+            matches!(lhs.as_ref(), Expr::Ident(n) if ident_is_plain_i32(n, ctx));
+        // `sector->lightlevel = bright;` (`EV_LightTurnOn`) -- the reverse
+        // direction: a plain `i32`-valued identifier written into
+        // `Sector.lightlevel: i16` (through `FnBodyContext::
+        // sector_walk_alias`'s own pointer-walk aliasing, not a real
+        // `self_param`), needing an explicit narrowing `as i16` instead --
+        // sound here specifically because `bright` only ever holds a value
+        // that itself came from an `i16` `lightlevel` field or a small
+        // literal, never genuinely out of `i16` range in this function.
+        let lhs_is_lightlevel_field =
+            matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "lightlevel");
+        let rhs_is_plain_i32_ident =
+            matches!(rhs.as_ref(), Expr::Ident(n) if ident_is_plain_i32(n, ctx));
         // `dist = P_AproxDistance (dest->x - actor->x, dest->y - actor->y);`
         // (`A_SkullAttack`) -- the same "C silently reinterprets the bits"
         // idiom as `rhs_is_u32_self_field` just above, but for `FixedT`:
@@ -3514,6 +5020,14 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && (field == "target" || field == "tracer"));
         let rhs_is_handle_local = matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
+        // `activeplats[i] = plat;` (`P_AddActivePlat`) -- storing a bare
+        // `Handle<Thinker>`-typed parameter straight into a slot of the
+        // `Option<Handle<Thinker>>`-typed global array, the same `Some(..)`
+        // wrap `lhs_is_target_or_tracer_self_field`'s own write already
+        // needs, just for an `Index` LHS (a global array element) instead
+        // of a self-struct field.
+        let lhs_is_activeplats_index = matches!(lhs.as_ref(), Expr::Index { base, .. }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "activeplats" || n == "activeceilings"));
         // `corpsehit = thing;` (`PIT_VileCheck`) -- assigning `self` itself
         // (`thing`) straight into a *global* registered `Option<Handle<
         // Thinker>>` (`corpsehit`, `world.rs`'s own doc comment), not a
@@ -3559,10 +5073,32 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             "Some(handle)".to_string()
         } else if (lhs_is_specialdata && rhs_is_ctor_var)
             || (lhs_is_target_or_tracer_self_field && rhs_is_handle_local)
+            || (lhs_is_activeplats_index && rhs_is_handle_local)
+            || (lhs_is_option_handle_global && rhs_is_handle_local)
         {
+            // `soundtarget = target;` (`P_NoiseAlert`) -- the last real
+            // gap `lhs_is_option_handle_global`'s own `rhs_is_self` arm
+            // didn't cover: assigning a bare `Handle<Thinker>`-registered
+            // *parameter* (not `self_param` itself) into a hand-matched-
+            // by-name `Option<Handle<Thinker>>` global, the same `Some(..)`
+            // wrap every other bare-handle-into-`Option`-slot write in
+            // this function already gets, just for this one more LHS/RHS
+            // pairing.
             format!("Some({rhs_text})")
-        } else if lhs_is_plain_int_local && rhs_is_u32_self_field {
+        } else if lhs_is_plain_int_local && rhs_is_u32_self_field
+            || lhs_is_plain_i32_ident && *op == AssignOp::Assign && rhs_is_lightlevel_field
+        {
+            // Both `angle = actor->angle;` (`u32` widened into a plain
+            // `int` local) and `min = check->lightlevel;` (`i16` widened
+            // into an already-`i32` local/parameter, see
+            // `ident_is_plain_i32`'s own doc comment) need the identical
+            // `as i32` widening -- merged into one arm (rather than two
+            // separate ones with the same body) since `clippy::if_same_
+            // then_else` correctly flags duplicated bodies as a real
+            // maintenance hazard, not just a style nit.
             format!("{rhs_text} as i32")
+        } else if lhs_is_lightlevel_field && *op == AssignOp::Assign && rhs_is_plain_i32_ident {
+            format!("{rhs_text} as i16")
         } else if lhs_is_known_non_bool_self_field
             && *op == AssignOp::Assign
             && rhs_is_true_or_false_literal
@@ -3641,6 +5177,22 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             text
         } else if (lhs_is_u32_self_field || lhs_is_angle_t_local) && *op != AssignOp::Assign {
             format!("({rhs_text}) as u32")
+        } else if *op == AssignOp::Assign
+            && ((lhs_is_fixed_t_self_field || lhs_is_fixed_t_local || lhs_is_world_fixed_t_global)
+                && rhs_is_int_literal
+                || lhs_is_fixed_t_typed_ident && rhs_is_abs_call)
+        {
+            format!("FixedT({rhs_text})")
+        } else if *op == AssignOp::Assign && lhs_is_cards_index && rhs_is_int_literal {
+            match rhs.as_ref() {
+                Expr::IntLiteral(s) if s == "1" => "true".to_string(),
+                Expr::IntLiteral(s) if s == "0" => "false".to_string(),
+                _ => {
+                    return Err(format!(
+                        "unsupported int literal `{rhs_text}` assigned into a bool `cards` element"
+                    ));
+                }
+            }
         } else {
             rhs_text
         };
@@ -3748,7 +5300,7 @@ fn render_compound_items(
     // is about to be swallowed by the scan lookahead, the same "drop a
     // provably-dead local" treatment `render_decl` already gives an
     // `embedded_ctor` variable.
-    let scan_vars = thinker_scan_var_names(items);
+    let scan_vars = thinker_scan_var_names(items, ctx.self_param);
     let mut out = Vec::new();
     let mut i = 0;
     while i < items.len() {
@@ -3790,6 +5342,34 @@ fn render_compound_items(
             i += 1;
             continue;
         }
+        // `sector = sectors; for (i=0;i<numsectors;i++,sector++) { .. }`
+        // (`is_sector_walk_priming`/`is_sector_walk_for`'s own doc
+        // comments, `EV_LightTurnOn`/`EV_TurnTagLightsOff`) -- another
+        // two-statement idiom, the same "needs its own lookahead" reason
+        // as the thinker-list scan just above.
+        if let BlockItem::Stmt(priming_stmt) = &items[i]
+            && let Some(var) = is_sector_walk_priming(priming_stmt)
+            && let Some(BlockItem::Stmt(for_stmt)) = items.get(i + 1)
+            && let Some((counter, body)) = is_sector_walk_for(for_stmt, var)
+        {
+            out.extend(render_sector_walk_for(var, counter, body, ctx, depth)?);
+            i += 2;
+            continue;
+        }
+        // `psp = &player->psprites[0]; for (i=0;i<NUMPSPRITES;i++,psp++)
+        // { .. }` (`is_psprite_walk_priming`/`is_psprite_walk_for`'s own
+        // doc comments, `P_MovePsprites`) -- `sector_walk_alias`'s own
+        // sibling two-statement idiom, for a self-owned array field
+        // instead of a `World`-indexed global one.
+        if let BlockItem::Stmt(priming_stmt) = &items[i]
+            && let Some(var) = is_psprite_walk_priming(priming_stmt, ctx.self_param)
+            && let Some(BlockItem::Stmt(for_stmt)) = items.get(i + 1)
+            && let Some((counter, body)) = is_psprite_walk_for(for_stmt, var)
+        {
+            out.extend(render_psprite_walk_for(var, counter, body, ctx, depth)?);
+            i += 2;
+            continue;
+        }
         if let BlockItem::Decl(d) = &items[i]
             && d.declarators.len() == 1
             && declarator_name(&d.declarators[0].declarator).is_some_and(|n| scan_vars.contains(&n))
@@ -3810,13 +5390,37 @@ fn render_compound_items(
 /// swallow anywhere in `items` -- see the doc comment at its own call
 /// site for why a matching bare declaration needs to be dropped, not
 /// rendered.
-fn thinker_scan_var_names(items: &[BlockItem]) -> HashSet<String> {
+fn thinker_scan_var_names(items: &[BlockItem], self_param: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     for pair in items.windows(2) {
         if let BlockItem::Stmt(init_stmt) = &pair[0]
             && let Some(var) = is_thinker_list_scan_init(init_stmt)
             && let BlockItem::Stmt(while_stmt) = &pair[1]
             && is_thinker_list_scan_while(while_stmt, var).is_some()
+        {
+            names.insert(var.to_string());
+        }
+        // `sector = sectors;`'s own declaration (`sector_t* sector;`,
+        // declared once earlier in the function) becomes dead the same
+        // way `currentthinker`'s own does: `sector_walk_alias` resolves
+        // every reference to it without ever really binding it in Rust,
+        // so leaving its own `let mut sector;` in would be genuinely
+        // uninferable, unassigned dead code.
+        if let BlockItem::Stmt(priming_stmt) = &pair[0]
+            && let Some(var) = is_sector_walk_priming(priming_stmt)
+            && let BlockItem::Stmt(for_stmt) = &pair[1]
+            && is_sector_walk_for(for_stmt, var).is_some()
+        {
+            names.insert(var.to_string());
+        }
+        // `psp = &player->psprites[0];`'s own declaration (`pspdef_t*
+        // psp;`) becomes dead the same way `sector`'s own does just
+        // above: `psprite_walk_alias` resolves every reference to it
+        // without ever really binding it in Rust.
+        if let BlockItem::Stmt(priming_stmt) = &pair[0]
+            && let Some(var) = is_psprite_walk_priming(priming_stmt, self_param)
+            && let BlockItem::Stmt(for_stmt) = &pair[1]
+            && is_psprite_walk_for(for_stmt, var).is_some()
         {
             names.insert(var.to_string());
         }
@@ -3989,6 +5593,31 @@ fn collect_angle_t_locals(items: &[BlockItem]) -> HashSet<String> {
     names
 }
 
+/// Mirrors `collect_angle_t_locals`, but for a local declared `fixed_t`
+/// (`m_fixed.h`'s `typedef int fixed_t;`, `[TypeSpecifier::TypedefName(
+/// "fixed_t")]`) -- see `FnBodyContext::fixed_t_locals`'s own doc comment
+/// for why this is needed. Same deliberately shallow, top-level-only scan.
+fn collect_fixed_t_locals(items: &[BlockItem]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in items {
+        let BlockItem::Decl(d) = item else { continue };
+        if !matches!(
+            d.specifiers.type_specifiers.as_slice(),
+            [TypeSpecifier::TypedefName(n)] if n == "fixed_t"
+        ) {
+            continue;
+        }
+        for decl in &d.declarators {
+            if let DirectDeclarator::Ident(_) = decl.declarator.direct
+                && let Some(name) = declarator_name(&decl.declarator)
+            {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
 /// Lowercases `fn_name` and inserts `_` before each interior uppercase
 /// letter not already preceded by one (`"A_BrainSpit"` -> `"a_brain_
 /// spit"`) -- a minimal, single-purpose snake-case fold, not a general
@@ -4021,13 +5650,17 @@ fn fn_name_to_snake_case(fn_name: &str) -> String {
 /// real corpus example declares a `static` anywhere but a function's own
 /// top level.
 /// A plain local assigned straight from a real-`bool`-returning call
-/// (`check = P_CheckPosition(..);`, `PIT_VileCheck`'s own idiom) --
-/// `FnBodyContext::bool_locals`'s own doc comment covers why this is
-/// needed. Mirrors `collect_target_tracer_aliases`'s own recursive-scan
-/// shape (an assignment-sourced trait, so it has to look inside `if`/
-/// `switch`/loop bodies too, unlike a decl-based collector like
-/// `collect_plain_int_locals`, which only ever looks at the function's
-/// own top-level declarations).
+/// (`check = P_CheckPosition(..);`, `PIT_VileCheck`'s own idiom) *or* a
+/// direct comparison/logical expression (`onfloor = (thing->z ==
+/// thing->floorz);`, `P_ThingHeightClip`'s own idiom -- the same
+/// `is_comparison_or_logical` op set `render_bool_expr`'s top-level
+/// dispatch already recognizes as producing a genuine Rust `bool`, not
+/// just a call) -- `FnBodyContext::bool_locals`'s own doc comment covers
+/// why this is needed. Mirrors `collect_target_tracer_aliases`'s own
+/// recursive-scan shape (an assignment-sourced trait, so it has to look
+/// inside `if`/`switch`/loop bodies too, unlike a decl-based collector
+/// like `collect_plain_int_locals`, which only ever looks at the
+/// function's own top-level declarations).
 fn collect_bool_locals(items: &[BlockItem]) -> HashSet<String> {
     let mut names = HashSet::new();
     collect_bool_locals_in(items, &mut names);
@@ -4042,6 +5675,11 @@ fn collect_bool_locals_in(items: &[BlockItem], names: &mut HashSet<String>) {
     }
 }
 
+fn is_bool_valued_rhs(expr: &Expr) -> bool {
+    is_bool_returning_call(expr)
+        || matches!(expr, Expr::Binary { op, .. } if is_comparison_or_logical(*op))
+}
+
 fn collect_bool_locals_stmt(s: &Stmt, names: &mut HashSet<String>) {
     if let Stmt::Expr(Some(Expr::Assign {
         op: AssignOp::Assign,
@@ -4049,7 +5687,7 @@ fn collect_bool_locals_stmt(s: &Stmt, names: &mut HashSet<String>) {
         rhs,
     })) = s
         && let Expr::Ident(name) = lhs.as_ref()
-        && is_bool_returning_call(rhs)
+        && is_bool_valued_rhs(rhs)
     {
         names.insert(name.clone());
     }
@@ -4157,6 +5795,30 @@ pub fn render_fn_with_scalar_param(
     )
 }
 
+/// `render_fn_with_scalar_param`'s own twin for `P_Thrust`'s third real
+/// parameter (`move: fixed_t`) -- see `render_fn_impl_with_two_scalar_
+/// params`'s own doc comment.
+pub fn render_fn_with_two_scalar_params(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    scalar_param_type: &str,
+    scalar_param2_type: &str,
+) -> Result<String, String> {
+    render_fn_impl_with_two_scalar_params(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        None,
+        Some(scalar_param_type),
+        Some(scalar_param2_type),
+    )
+}
+
 /// `render_fn`'s own `boolean`-returning twin -- `P_CheckMeleeRange`/
 /// `P_CheckMissileRange` (`p_enemy.c`) are `boolean P_Check...(mobj_t*
 /// actor)`, the same single-self-struct-parameter shape `render_fn`
@@ -4185,6 +5847,32 @@ pub fn render_bool_fn(
     )
 }
 
+/// `render_bool_fn`/`render_fn_with_scalar_param`'s own combination --
+/// `boolean P_GiveBody(player_t* player, int num)` (`p_inter.c`) is both
+/// `boolean`-returning *and* takes a second plain-scalar parameter, a
+/// shape neither existing thin wrapper covers alone. A third small
+/// wrapper over the same shared `render_fn_impl`, matching this module's
+/// established "add the wrapper once a real corpus function needs the
+/// combination, not speculatively" style.
+pub fn render_bool_fn_with_scalar_param(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    scalar_param_type: &str,
+) -> Result<String, String> {
+    render_fn_impl(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        Some("bool"),
+        Some(scalar_param_type),
+    )
+}
+
 fn render_fn_impl(
     corpus_dir: &Path,
     file: &str,
@@ -4193,6 +5881,36 @@ fn render_fn_impl(
     self_field_types: &HashMap<String, String>,
     return_type: Option<&str>,
     scalar_param_type: Option<&str>,
+) -> Result<String, String> {
+    render_fn_impl_with_two_scalar_params(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        return_type,
+        scalar_param_type,
+        None,
+    )
+}
+
+/// `render_fn_impl`'s own twin for `P_Thrust (player_t* player, angle_t
+/// angle, fixed_t move)` (`p_user.c`) -- a *third* real parameter, one
+/// more plain scalar beyond what `scalar_param_type` alone (`A_PainShootSkull`'s
+/// own single extra parameter) supports. Every earlier `render_fn_impl`
+/// caller still goes through the original three-argument-shaped
+/// `render_fn_impl` above, now a thin wrapper passing `None` for the new
+/// third slot -- no existing call site's behavior changes.
+#[allow(clippy::too_many_arguments)]
+fn render_fn_impl_with_two_scalar_params(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+    scalar_param_type: Option<&str>,
+    scalar_param2_type: Option<&str>,
 ) -> Result<String, String> {
     let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
     let f = find_function_def(&unit.items, fn_name)
@@ -4213,6 +5931,17 @@ fn render_fn_impl(
             Ok::<_, String>((name, ty))
         })
         .transpose()?;
+    // `P_Thrust`'s own third parameter (`move: fixed_t`) -- the identical
+    // "caller supplies the type, the name comes from the real C source"
+    // pattern as `scalar_param` just above, one slot further out
+    // (`nth_param_name(f, 2)`).
+    let scalar_param2 = scalar_param2_type
+        .map(|ty| {
+            let name = nth_param_name(f, 2)
+                .ok_or_else(|| format!("{fn_name}: third parameter has no plain name"))?;
+            Ok::<_, String>((name, ty))
+        })
+        .transpose()?;
     let target_tracer_aliases =
         collect_target_tracer_aliases(&f.body.items, &param_name, self_field_types);
     let spawn_mobj_locals = collect_spawn_mobj_locals(&f.body.items);
@@ -4222,6 +5951,15 @@ fn render_fn_impl(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone())),
     );
+    // `sector = player->mo->subsector->sector;`
+    // (`P_PlayerInSpecialSector`) -- the first `render_fn`/`render_fn_
+    // impl` caller needing a plain local aliased from a cross-reference
+    // chain rather than through `target`/`tracer`/a freshly-spawned
+    // mobj: `render_world_fn`'s own equivalent extension (`P_LineOpening`'s
+    // own `front`/`back`) already merges this the identical way, just
+    // never previously threaded through this renderer's own self-struct-
+    // shaped sibling since no earlier caller needed it.
+    extra_cross_ref_idents.extend(collect_line_sector_aliases(&f.body.items));
     // `linetarget` (`p_local.h`'s own `extern mobj_t* linetarget;`) --
     // `render_weapon_fn`'s own idiom (`A_Punch`/`A_Saw`), needed here too
     // now that a plain `mobj_t*`-self action function references it
@@ -4253,10 +5991,49 @@ fn render_fn_impl(
         );
         extra_cross_ref_idents.insert("vileobj".to_string(), "Option<Handle<Thinker>>".to_string());
     }
+    // `tmthing` (`p_map.c`'s own file-scope `mobj_t* tmthing;`,
+    // `PIT_StompThing`'s own idiom), and its siblings `bombspot`/
+    // `bombsource` (`PIT_RadiusAttack`'s own "who caused this explosion"
+    // pair) -- all registered *bare* `Handle<Thinker>`, not `Option`-
+    // wrapped like `corpsehit`/`vileobj`: confirmed by grepping every real
+    // reference to each across the whole file, none is ever null-checked
+    // anywhere, always dereferenced or compared directly, the same
+    // "always valid in practice, never guarded" pattern a `P_SpawnMobj`
+    // result already gets. Unlike `corpsehit`/`vileobj`, none of these
+    // automatically light up `needs_target_deref` (`is_target_tracer_
+    // typed`'s own `Expr::Ident` arm only recognizes `Option<Handle
+    // <Thinker>>`, by design -- its sibling rendering arms hardcode
+    // `.unwrap()`, which would be wrong for a bare value), so they need
+    // their own narrow read-access flag below.
+    const BARE_HANDLE_GLOBALS: &[&str] = &["tmthing", "bombspot", "bombsource"];
+    let needs_bare_handle_global = BARE_HANDLE_GLOBALS
+        .iter()
+        .any(|name| body_has_any_ident_ref(&f.body.items, &[name]));
+    for name in BARE_HANDLE_GLOBALS {
+        if body_has_any_ident_ref(&f.body.items, &[name]) {
+            extra_cross_ref_idents.insert((*name).to_string(), "Handle<Thinker>".to_string());
+        }
+    }
     let plain_int_locals = collect_plain_int_locals(&f.body.items);
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
     let static_locals = collect_static_locals(&f.body.items, fn_name);
-    let bool_locals = collect_bool_locals(&f.body.items);
+    let mut bool_locals = collect_bool_locals(&f.body.items);
+    // `!accurate` (`P_GunShot`'s own `boolean accurate` second parameter)
+    // -- a scalar parameter declared `bool` in Rust needs the exact same
+    // `bool_locals` truthiness treatment a `boolean`-declared *local*
+    // already gets (`collect_bool_locals`'s own doc comment): its Rust
+    // type is already genuinely `bool` (fixed by the signature the
+    // caller supplied, `scalar_param_type`/`scalar_param2_type`), so a
+    // bare negation needs plain Rust `!`, not the generic `== 0` int-
+    // truthiness fallback every other (`int`) scalar parameter correctly
+    // gets -- confirmed a real `rustc` rejection (`bool` compared to
+    // `{integer}`) without this, not just extra caution.
+    for (name, ty) in scalar_param.iter().chain(scalar_param2.iter()) {
+        if *ty == "bool" {
+            bool_locals.insert(name.clone());
+        }
+    }
     // Only a tick function that actually removes itself somewhere in its
     // body (`is_self_removal_call`, possibly nested arbitrarily deep in
     // `switch`/`if` -- `T_VerticalDoor` buries several inside two levels
@@ -4303,6 +6080,21 @@ fn render_fn_impl(
         self_field_types,
         &extra_cross_ref_idents,
     );
+    // `player->mo->health = player->health;` (`P_GiveBody`) -- a *bare*
+    // (not `Option`-wrapped) `Handle<Thinker>` self-struct field
+    // (`is_self_bare_handle_field`'s own shape, `player.mo`), the first
+    // real non-`Mobj` self-struct needing it: every earlier `render_fn`/
+    // `render_bool_fn` caller has been `Mobj`-shaped, whose own bare-
+    // handle fields (`target`/`tracer`) are `Option`-wrapped and already
+    // covered by `needs_target_deref`/`needs_target_write` above --
+    // `render_weapon_fn` already built `body_has_self_handle_field_deref`/
+    // `body_has_self_handle_write` for this exact shape (`player.mo`
+    // there too), fully generic over `self_param`/`self_field_types`
+    // already, so reused verbatim rather than duplicated.
+    let needs_self_handle_field_deref =
+        body_has_self_handle_field_deref(&f.body.items, &param_name, self_field_types);
+    let needs_self_handle_field_write =
+        body_has_self_handle_write(&f.body.items, &param_name, self_field_types);
     // A body that assigns a local from `P_SpawnMobj(...)` and then
     // writes one of its fields (`A_Tracer`'s own `th->momz = ...;`)
     // needs real *mutable* `Arena` access -- unlike `needs_target_deref`
@@ -4343,6 +6135,13 @@ fn render_fn_impl(
         f.body.items.iter().any(
             |item| matches!(item, BlockItem::Stmt(s) if is_thinker_list_scan_for(s).is_some()),
         );
+    // `thing == tmthing` (`PIT_StompThing`) -- the comparison-side sibling
+    // of `needs_self_handle_value`'s own assignment-side check (see
+    // `body_has_self_identity_comparison`'s own doc comment); drives the
+    // same `handle: Handle<Thinker>` parameter for a genuinely different
+    // reason, so it's its own flag rather than folded into that one.
+    let needs_self_identity_comparison =
+        body_has_self_identity_comparison(&f.body.items, &param_name, &extra_cross_ref_idents);
     // `A_SpawnFly`'s own idiom (self-removal *and* target-alias
     // dereferencing/spawned-mobj writes in the same body) is the first
     // real function needing both at once -- previously rejected outright.
@@ -4357,7 +6156,7 @@ fn render_fn_impl(
     // separately-named `arena` parameter. `needs_self_handle_value`
     // combined with self-removal has no real corpus example yet (unlike
     // this one), so that combination is left rejected rather than guessed.
-    if needs_self_removal && needs_self_handle_value {
+    if needs_self_removal && (needs_self_handle_value || needs_self_identity_comparison) {
         return Err(format!(
             "{fn_name}: needs both self-removal and a spawned mobj's own handle value -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
         ));
@@ -4381,38 +6180,88 @@ fn render_fn_impl(
         same_target_write: None,
         plain_int_locals: &plain_int_locals,
         angle_t_locals: &angle_t_locals,
+        fixed_t_locals: &fixed_t_locals,
         static_locals: &static_locals,
         bool_locals: &bool_locals,
         self_removal_ident,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
     let handle_part = if needs_self_removal && !composed_self_removal {
         ", handle: Handle<Thinker>, arena: &mut Arena<Thinker>"
-    } else if needs_self_removal || needs_self_handle_value {
+    } else if needs_self_removal || needs_self_handle_value || needs_self_identity_comparison {
         ", handle: Handle<Thinker>"
     } else {
         ""
     };
     let thinkers_part = if needs_self_removal && !composed_self_removal {
         ""
-    } else if needs_spawn_mut || composed_self_removal || needs_target_write {
+    } else if needs_spawn_mut
+        || composed_self_removal
+        || needs_target_write
+        || needs_self_handle_field_write
+    {
         ", thinkers: &mut Arena<Thinker>"
-    } else if needs_target_deref || needs_linetarget || needs_thinker_scan_for {
+    } else if needs_target_deref
+        || needs_linetarget
+        || needs_thinker_scan_for
+        || needs_bare_handle_global
+        || needs_self_handle_field_deref
+    {
         ", thinkers: &Arena<Thinker>"
     } else {
         ""
     };
     let extra_params = format!("{thinkers_part}{handle_part}");
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    // `P_Thrust`'s own second scalar parameter is literally named `move`
+    // -- a real Rust keyword (used for closures), needing the same raw-
+    // identifier escape `render_params` already applies to every
+    // `render_trigger_fn`/`render_world_fn`/`render_pure_fn` parameter
+    // (`rust_field_name`) -- this signature-building path had never
+    // needed it before (every earlier scalar parameter, `angle`/`num`/
+    // `armortype`/`power`/`card`, happens not to collide). A bare
+    // reference to it inside the body already escapes correctly on its
+    // own, through `render_expr`'s own generic `Expr::Ident` fallback
+    // (`rust_ident_name`, unrelated to this variable) -- only the
+    // signature text built here was missing the same treatment.
+    //
+    // `P_Thrust`'s own `angle >>= ANGLETOFINESHIFT;` reassigns its second
+    // scalar parameter in place -- the same "a reassigned parameter needs
+    // `mut`" gap `render_params`'s own `body_reassigns_ident` check
+    // already covers for `render_trigger_fn`/etc. (`P_AproxDistance`'s
+    // own `dx = abs(dx);`), never needed here before since no earlier
+    // `scalar_param` was ever reassigned.
     let scalar_part = scalar_param
-        .map(|(name, ty)| format!(", {name}: {ty}"))
+        .map(|(name, ty)| {
+            let mut_prefix = if body_reassigns_ident(&f.body.items, &name) {
+                "mut "
+            } else {
+                ""
+            };
+            Ok::<_, String>(format!(", {mut_prefix}{}: {ty}", rust_field_name(&name)?))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let scalar_part2 = scalar_param2
+        .map(|(name, ty)| {
+            let mut_prefix = if body_reassigns_ident(&f.body.items, &name) {
+                "mut "
+            } else {
+                ""
+            };
+            Ok::<_, String>(format!(", {mut_prefix}{}: {ty}", rust_field_name(&name)?))
+        })
+        .transpose()?
         .unwrap_or_default();
     Ok(format!(
-        "pub fn {fn_name}({param_name}: &mut {self_rust_type}{scalar_part}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
+        "pub fn {fn_name}({param_name}: &mut {self_rust_type}{scalar_part}{scalar_part2}, world: &mut World{extra_params}){return_arrow} {{\n{}\n}}",
         body_lines.join("\n")
     ))
 }
@@ -4471,6 +6320,7 @@ pub fn render_weapon_fn(
         );
     }
     let angle_t_locals = collect_angle_t_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: &player_param,
         self_field_types: player_field_types,
@@ -4485,10 +6335,14 @@ pub fn render_weapon_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &angle_t_locals,
+        fixed_t_locals: &fixed_t_locals,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -4502,7 +6356,22 @@ pub fn render_weapon_fn(
     // already makes for the self-struct-tick shape.
     let needs_self_handle_write =
         body_has_self_handle_write(&f.body.items, &player_param, player_field_types);
-    let world_part = if needs_linetarget {
+    // `bulletslope` (`A_FireShotgun2`'s own `P_LineAttack(..., bulletslope
+    // + .., ..)`, `p_pspr.c`) -- a *second*, independent reason a weapon
+    // action needs `world` at all, distinct from `needs_linetarget`:
+    // `P_BulletSlope`'s own entry above registers `bulletslope` as a
+    // `World` field (the same by-name category `viletryx`/`attackrange`/
+    // `swingx`/`swingy` already established), which this already-shipped
+    // caller reads but, until now, had no `world` parameter to read it
+    // through at all -- confirmed a real gap by the full suite itself
+    // (not assumed), the exact "re-run the full suite when generalizing"
+    // case this project's own discipline exists for. `needs_world` now
+    // covers both reasons instead of only `needs_linetarget`, so a future
+    // by-name `World` global reached from a weapon action gets the same
+    // treatment with no further signature-shape change needed.
+    let needs_bulletslope = body_has_any_ident_ref(&f.body.items, &["bulletslope"]);
+    let needs_world = needs_linetarget || needs_bulletslope;
+    let world_part = if needs_world {
         ", world: &mut World"
     } else {
         ""
@@ -4940,6 +6809,211 @@ fn collect_target_tracer_aliases_stmt(
     }
 }
 
+/// Locals directly assigned a line's own `frontsector`/`backsector`
+/// (`front = linedef->frontsector; back = linedef->backsector;`,
+/// `P_LineOpening`'s own idiom) -- registers `front` as `"SectorId"`
+/// (bare, matching `frontsector`'s own corpus-verified non-nullable
+/// mapping) and `back` as `"Option<SectorId>"` (matching `backsector`'s
+/// own genuinely-nullable one), into the same `extra_cross_ref_idents`
+/// map shape every other alias collector in this module already
+/// produces. Deliberately hand-matched by *field name* alone (`"no
+/// general struct-field-type registry yet"`, the same style
+/// `line->frontsector`'s own dedicated `Expr::Member` arm already
+/// established for a self-struct chain), not by the base expression's
+/// own type -- correct for every real corpus call site, since
+/// `frontsector`/`backsector` are only ever read off a real `line_t*`
+/// value regardless of how that value itself was obtained.
+///
+/// Two more shapes joined once `P_RecursiveSound` (`p_enemy.c`) needed
+/// them: `check = sec->lines[i];` (`Sector.lines: Vec<LineId>`, the
+/// first real local alias of an indexed cross-reference *array* field,
+/// not just a bare cross-reference field) -> `"LineId"`; `other =
+/// sides[check->sidenum[1]].sector;` (`side_t.sector`, the existing
+/// dedicated `sides[i].sector` `Expr::Member` arm's own shape, now also
+/// recognized as an alias *source*, not just a rendering target) ->
+/// `"SectorId"`.
+fn collect_line_sector_aliases(items: &[BlockItem]) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    collect_line_sector_aliases_in(items, &mut aliases);
+    aliases
+}
+
+fn line_sector_field_alias_type(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::Member { field, .. } if field == "frontsector" => Some("SectorId"),
+        Expr::Member { field, .. } if field == "backsector" => Some("Option<SectorId>"),
+        Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "lines") => {
+            Some("LineId")
+        }
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "sides")) =>
+        {
+            Some("SectorId")
+        }
+        // `sector = player->mo->subsector->sector;`
+        // (`P_PlayerInSpecialSector`) -- the same `.subsector->sector`
+        // shape `render_expr`'s own dedicated `Expr::Member` arm already
+        // renders (see its own widened guard, `is_self_bare_handle_
+        // field(bb, ..)`), recognized here too so the local it's assigned
+        // into (`sector`) itself gets registered `"SectorId"`, not just
+        // the standalone expression rendering correctly in place. Matched
+        // structurally by field name alone (`.mo.subsector.sector`), the
+        // same "no general struct-field-type registry" convention every
+        // other alias source in this function already follows, rather
+        // than requiring `self_param`/`self_field_types` context this
+        // free function (deliberately) doesn't take.
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                    if bf == "subsector"
+                        && matches!(bb.as_ref(), Expr::Member { field: bbf, .. } if bbf == "mo")) =>
+        {
+            Some("SectorId")
+        }
+        // `tsec = getNextSector(templine, sector);` (`EV_LightTurnOn`/
+        // `EV_TurnTagLightsOff`) -- `getNextSector`'s own real, already-
+        // translated return type is `Option<SectorId>` (confirmed by
+        // direct read, `p_spec.c`), the same "hand-match the one real
+        // callee" style `collect_spawn_mobj_locals` already uses for
+        // `P_SpawnMobj`/`P_SpawnMissile`.
+        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "getNextSector") => {
+            Some("Option<SectorId>")
+        }
+        _ => None,
+    }
+}
+
+fn collect_line_sector_aliases_in(items: &[BlockItem], aliases: &mut HashMap<String, String>) {
+    for item in items {
+        match item {
+            BlockItem::Decl(d) => {
+                for decl in &d.declarators {
+                    if let Some(Initializer::Expr(e)) = &decl.initializer
+                        && let Some(t) = line_sector_field_alias_type(e)
+                        && let Some(name) = declarator_name(&decl.declarator)
+                    {
+                        aliases.insert(name, t.to_string());
+                    }
+                }
+            }
+            BlockItem::Stmt(s) => collect_line_sector_aliases_stmt(s, aliases),
+        }
+    }
+}
+
+fn collect_line_sector_aliases_stmt(s: &Stmt, aliases: &mut HashMap<String, String>) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && let Some(t) = line_sector_field_alias_type(rhs)
+    {
+        aliases.insert(name.clone(), t.to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_line_sector_aliases_in(&c.items, aliases),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_line_sector_aliases_stmt(then_branch, aliases);
+            if let Some(eb) = else_branch {
+                collect_line_sector_aliases_stmt(eb, aliases);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_line_sector_aliases_stmt(body, aliases),
+        Stmt::Case { stmt, .. } => collect_line_sector_aliases_stmt(stmt, aliases),
+        Stmt::Default(stmt) => collect_line_sector_aliases_stmt(stmt, aliases),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_line_sector_aliases_stmt(body, aliases)
+        }
+        Stmt::For { body, .. } => collect_line_sector_aliases_stmt(body, aliases),
+        _ => {}
+    }
+}
+
+/// `min = max;` (`P_FindMinSurroundingLight`, `p_spec.c`) -- registers a
+/// local later compared/assigned against `Sector.lightlevel: i16` as
+/// genuinely `"i32"`-typed in `extra_cross_ref_idents` (reusing
+/// `ident_is_plain_i32`'s existing parameter check, rather than adding a
+/// separate `FnBodyContext` field), but *only* when it's assigned
+/// somewhere from another identifier already known `"i32"` in `params`
+/// (a real function parameter, e.g. `max`) -- a bare "declared plain
+/// `int`" local check (`FnBodyContext::plain_int_locals`) isn't enough:
+/// `EV_TurnTagLightsOff`'s own identically-shaped `min` (`p_lights.c`) is
+/// assigned *only* from a `lightlevel` field itself (`min = sector->
+/// lightlevel;`), never from anything independently `i32`-typed, so
+/// Rust's ordinary deferred-`let` inference already settles it as `i16`
+/// for free -- confirmed a real regression against that function's own
+/// already-shipped exact-text test when this was first tried as a bare
+/// `plain_int_locals` check, not just extra caution. Mirrors
+/// `collect_line_sector_aliases`'s own "scan once, extend
+/// `extra_cross_ref_idents`" shape and recursion structure exactly, just
+/// keyed on a different RHS predicate.
+fn collect_i32_widened_locals(
+    items: &[BlockItem],
+    params: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut widened = HashMap::new();
+    collect_i32_widened_locals_in(items, params, &mut widened);
+    widened
+}
+
+fn collect_i32_widened_locals_in(
+    items: &[BlockItem],
+    params: &HashMap<String, String>,
+    widened: &mut HashMap<String, String>,
+) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_i32_widened_locals_stmt(s, params, widened);
+        }
+    }
+}
+
+fn collect_i32_widened_locals_stmt(
+    s: &Stmt,
+    params: &HashMap<String, String>,
+    widened: &mut HashMap<String, String>,
+) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(lname) = lhs.as_ref()
+        && let Expr::Ident(rname) = rhs.as_ref()
+        && params.get(rname.as_str()).map(String::as_str) == Some("i32")
+    {
+        widened.insert(lname.clone(), "i32".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_i32_widened_locals_in(&c.items, params, widened),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_i32_widened_locals_stmt(then_branch, params, widened);
+            if let Some(eb) = else_branch {
+                collect_i32_widened_locals_stmt(eb, params, widened);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_i32_widened_locals_stmt(body, params, widened),
+        Stmt::Case { stmt, .. } => collect_i32_widened_locals_stmt(stmt, params, widened),
+        Stmt::Default(stmt) => collect_i32_widened_locals_stmt(stmt, params, widened),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_i32_widened_locals_stmt(body, params, widened)
+        }
+        Stmt::For { body, .. } => collect_i32_widened_locals_stmt(body, params, widened),
+        _ => {}
+    }
+}
+
 /// Locals directly assigned from a fresh `P_SpawnMobj(...)`/
 /// `P_SpawnMissile(...)` call (`th = P_SpawnMobj(...);`, `A_Tracer`'s/
 /// `A_VileTarget`'s own idiom; `mo = P_SpawnMissile(...);`,
@@ -5108,6 +7182,96 @@ fn stmt_has_self_handle_value(
         }
         Stmt::While { body, .. } => {
             stmt_has_self_handle_value(body, self_param, spawn_locals, extra_cross_ref_idents)
+        }
+        _ => false,
+    }
+}
+
+/// `thing == tmthing` (`PIT_StompThing`'s own "don't clip against self"
+/// check) -- comparing the function's own receiver's *identity* against
+/// a foreign `Handle<Thinker>`-typed cross-reference (here a bare global,
+/// `tmthing`, registered the same by-name way `corpsehit`/`vileobj`
+/// already are). The comparison-side sibling of `is_self_handle_value_
+/// assign`'s own assignment-side check: `self_param` alone renders as a
+/// `&mut Mobj`, not the `Handle<Thinker>` this comparison actually needs,
+/// so it doesn't type-check directly -- needs the same fixed `handle`
+/// parameter substitution `render_fn_impl`'s signature extension already
+/// supplies for `body_has_self_handle_value`'s own case, just triggered
+/// by a different real shape. Unlike that assignment-only check, this
+/// lives inside a *condition*, so it recurses into `if`/`while`'s own
+/// `cond` expressions too, not just nested statement bodies.
+fn body_has_self_identity_comparison(
+    items: &[BlockItem],
+    self_param: &str,
+    extra_cross_ref_idents: &HashMap<String, String>,
+) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => {
+            stmt_has_self_identity_comparison(s, self_param, extra_cross_ref_idents)
+        }
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn expr_has_self_identity_comparison(
+    e: &Expr,
+    self_param: &str,
+    extra_cross_ref_idents: &HashMap<String, String>,
+) -> bool {
+    let Expr::Binary { op, lhs, rhs } = e else {
+        return false;
+    };
+    if !matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+        return false;
+    }
+    let is_self = |x: &Expr| matches!(x, Expr::Ident(n) if n == self_param);
+    let is_handle_cross_ref = |x: &Expr| {
+        matches!(x, Expr::Ident(n)
+            if extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+    };
+    (is_self(lhs) && is_handle_cross_ref(rhs)) || (is_self(rhs) && is_handle_cross_ref(lhs))
+}
+
+fn stmt_has_self_identity_comparison(
+    s: &Stmt,
+    self_param: &str,
+    extra_cross_ref_idents: &HashMap<String, String>,
+) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => {
+            expr_has_self_identity_comparison(e, self_param, extra_cross_ref_idents)
+        }
+        Stmt::Compound(c) => {
+            body_has_self_identity_comparison(&c.items, self_param, extra_cross_ref_idents)
+        }
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_self_identity_comparison(cond, self_param, extra_cross_ref_idents)
+                || stmt_has_self_identity_comparison(
+                    then_branch,
+                    self_param,
+                    extra_cross_ref_idents,
+                )
+                || else_branch.as_ref().is_some_and(|eb| {
+                    stmt_has_self_identity_comparison(eb, self_param, extra_cross_ref_idents)
+                })
+        }
+        Stmt::Switch { cond, body } => {
+            expr_has_self_identity_comparison(cond, self_param, extra_cross_ref_idents)
+                || stmt_has_self_identity_comparison(body, self_param, extra_cross_ref_idents)
+        }
+        Stmt::Case { stmt, .. } => {
+            stmt_has_self_identity_comparison(stmt, self_param, extra_cross_ref_idents)
+        }
+        Stmt::Default(stmt) => {
+            stmt_has_self_identity_comparison(stmt, self_param, extra_cross_ref_idents)
+        }
+        Stmt::While { cond, body } => {
+            expr_has_self_identity_comparison(cond, self_param, extra_cross_ref_idents)
+                || stmt_has_self_identity_comparison(body, self_param, extra_cross_ref_idents)
         }
         _ => false,
     }
@@ -5495,6 +7659,101 @@ fn body_has_linetarget_ref(items: &[BlockItem]) -> bool {
     body_has_any_ident_ref(items, &["linetarget"])
 }
 
+/// Whether `name` is ever the direct target of an assignment anywhere in
+/// `items` (`dx = abs(dx);`, `P_AproxDistance`'s own idiom, reassigning
+/// one of its own parameters) -- unlike `body_has_any_ident_ref` (which
+/// would also count a plain *read*, e.g. the `dx` inside `abs(dx)`
+/// itself), this only fires for a genuine write, since it's used to
+/// decide whether a rendered Rust parameter needs `mut` -- marking one
+/// `mut` when it's only ever read would be a real `clippy::unused_mut`
+/// warning, not just imprecise. Same shallow, top-level-plus-nested-
+/// control-flow traversal shape as `stmt_has_any_ident_ref`, just checking
+/// each `Expr::Assign`'s own `lhs` specifically rather than every operand.
+fn body_reassigns_ident(items: &[BlockItem], name: &str) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Decl(_) => false,
+        BlockItem::Stmt(s) => stmt_reassigns_ident(s, name),
+    })
+}
+
+fn expr_reassigns_ident(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Assign { lhs, rhs, .. } => {
+            matches!(lhs.as_ref(), Expr::Ident(n) if n == name) || expr_reassigns_ident(rhs, name)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::PreIncDec { expr, .. }
+        | Expr::PostIncDec { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Sizeof(SizeofArg::Expr(expr)) => expr_reassigns_ident(expr, name),
+        Expr::Binary { lhs, rhs, .. } | Expr::Comma(lhs, rhs) => {
+            expr_reassigns_ident(lhs, name) || expr_reassigns_ident(rhs, name)
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_reassigns_ident(cond, name)
+                || expr_reassigns_ident(then_expr, name)
+                || expr_reassigns_ident(else_expr, name)
+        }
+        Expr::Call { callee, args } => {
+            expr_reassigns_ident(callee, name) || args.iter().any(|a| expr_reassigns_ident(a, name))
+        }
+        Expr::Index { base, index } => {
+            expr_reassigns_ident(base, name) || expr_reassigns_ident(index, name)
+        }
+        Expr::Member { base, .. } => expr_reassigns_ident(base, name),
+        _ => false,
+    }
+}
+
+fn stmt_reassigns_ident(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => expr_reassigns_ident(e, name),
+        Stmt::Expr(None) => false,
+        Stmt::Compound(c) => body_reassigns_ident(&c.items, name),
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_reassigns_ident(cond, name)
+                || stmt_reassigns_ident(then_branch, name)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_reassigns_ident(eb, name))
+        }
+        Stmt::Switch { cond, body } => {
+            expr_reassigns_ident(cond, name) || stmt_reassigns_ident(body, name)
+        }
+        Stmt::Case { expr, stmt } => {
+            expr_reassigns_ident(expr, name) || stmt_reassigns_ident(stmt, name)
+        }
+        Stmt::Default(stmt) => stmt_reassigns_ident(stmt, name),
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr_reassigns_ident(cond, name) || stmt_reassigns_ident(body, name)
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::Decl(_) => false,
+                ForInit::Expr(e) => expr_reassigns_ident(e, name),
+            }) || cond.as_ref().is_some_and(|c| expr_reassigns_ident(c, name))
+                || step.as_ref().is_some_and(|s| expr_reassigns_ident(s, name))
+                || stmt_reassigns_ident(body, name)
+        }
+        Stmt::Return(Some(e)) => expr_reassigns_ident(e, name),
+        Stmt::Labeled { stmt, .. } => stmt_reassigns_ident(stmt, name),
+        _ => false,
+    }
+}
+
 /// True for `var = Z_Malloc(...);` -- the allocation call itself, always
 /// discarded (see module docs: `render_spawn_fn` replaces it with
 /// `Arena::insert`).
@@ -5520,26 +7779,81 @@ fn is_add_thinker_call(s: &Stmt) -> bool {
     matches!(callee.as_ref(), Expr::Ident(n) if n == "P_AddThinker")
 }
 
+/// `activeplats[i]`/`activeceilings[j]` (`Option<Handle<Thinker>>`
+/// global arrays, `P_AddActivePlat`/`P_AddActiveCeiling`'s own idiom) --
+/// which `Thinker` variant, and what to call the bound match-arm
+/// variable, a dereference through that array element needs.
+/// Hand-matched by array name, the same "no general struct-field-type
+/// registry, name it explicitly" style `sides`/`sectors` already
+/// established for their own dedicated `Expr::Index` arms -- there are
+/// only these two such global arrays in the whole corpus.
+fn active_array_variant(expr: &Expr) -> Option<(&'static str, &'static str)> {
+    let Expr::Index { base, .. } = expr else {
+        return None;
+    };
+    match base.as_ref() {
+        Expr::Ident(n) if n == "activeplats" => Some(("Plat", "p")),
+        Expr::Ident(n) if n == "activeceilings" => Some(("Ceiling", "c")),
+        _ => None,
+    }
+}
+
+/// The deepest `Member` in a chain (closest to its own real base),
+/// alongside that member's own field name -- e.g. `var->thinker.
+/// function.acp1` walks past `.acp1`/`.function` to land on `(var,
+/// "thinker")`. Shared by `is_function_pointer_assign` (a constructor's
+/// own `var` base, a plain `Ident`) and `is_active_array_function_
+/// pointer_assign` (an existing thinker found through `activeplats[i]`/
+/// `activeceilings[j]`, an `Expr::Index` base) -- the two real corpus
+/// shapes that reassign a thinker's function pointer, on genuinely
+/// different base expressions but the identical "walk to the innermost
+/// `.thinker`" logic.
+fn innermost_member_field(e: &Expr) -> Option<(&Expr, &str)> {
+    let Expr::Member { base, field, .. } = e else {
+        return None;
+    };
+    match base.as_ref() {
+        Expr::Member { .. } => innermost_member_field(base),
+        other => Some((other, field.as_str())),
+    }
+}
+
 /// True for `var->thinker.function.acpN = (cast) FnName;` -- the deepest
 /// `Member` in the chain (closest to `var`) names field `"thinker"`,
 /// regardless of how many `.function`/`.acpN` levels sit on top of it.
 /// Always discarded: the enum variant tag already encodes which function
 /// this is.
 fn is_function_pointer_assign(s: &Stmt, ctor_var: &str) -> bool {
-    fn innermost_base_and_field(e: &Expr) -> Option<(&str, &str)> {
-        let Expr::Member { base, field, .. } = e else {
-            return None;
-        };
-        match base.as_ref() {
-            Expr::Ident(name) => Some((name.as_str(), field.as_str())),
-            inner => innermost_base_and_field(inner),
-        }
-    }
     let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s else {
         return false;
     };
-    innermost_base_and_field(lhs)
-        .is_some_and(|(base, field)| base == ctor_var && field == "thinker")
+    matches!(innermost_member_field(lhs), Some((Expr::Ident(name), field)) if name == ctor_var && field == "thinker")
+}
+
+/// True for `(activeplats[i])->thinker.function.acp1 = (actionf_p1)
+/// T_PlatRaise;` / `.acv = (actionf_v)NULL;` (`P_ActivateInStasis`/
+/// `EV_StopPlat`'s own idiom, restarting/pausing an *existing* thinker
+/// found through one of the two global "active movers" arrays) -- the
+/// same discard `is_function_pointer_assign` already applies to a
+/// constructor's own `var->thinker.function.acpN = ...;`, just for this
+/// different base shape (an `activeplats[i]`/`activeceilings[j]` index,
+/// not a plain ctor-var identifier). The enum variant tag already fixes
+/// which function a `Plat`/`Ceiling` dispatches to, so reassigning (or
+/// nulling) the function pointer changes nothing real in the translated
+/// design -- confirmed by `T_PlatRaise`'s own already-translated
+/// `in_stasis => {}` no-op arm, which already makes "the tick function is
+/// skipped entirely" and "the tick function runs but does nothing"
+/// behaviorally identical, so this discard is exact, not an
+/// approximation. Checked directly against `Stmt::Expr`'s own inner
+/// expression (unlike `is_function_pointer_assign`, called from ordinary
+/// `render_stmt`, not a constructor's own item-filtering loop, since this
+/// idiom appears nested inside a plain trigger function's `if` body, not
+/// at a spawn function's top level).
+fn is_active_array_function_pointer_assign(e: &Expr) -> bool {
+    let Expr::Assign { lhs, .. } = e else {
+        return false;
+    };
+    matches!(innermost_member_field(lhs), Some((base, "thinker")) if active_array_variant(base).is_some())
 }
 
 /// `var->field = expr;`, split into which field and the right-hand side
@@ -5873,7 +8187,24 @@ fn render_params(
         let rust_type = param_types
             .get(&name)
             .ok_or_else(|| format!("{fn_name}: parameter `{name}`'s Rust type isn't known"))?;
-        rendered.push(format!("{}: {rust_type}", rust_field_name(&name)?));
+        // `dx = abs(dx);` (`P_AproxDistance`) -- the first real corpus
+        // function to reassign one of its own parameters (every earlier
+        // `render_trigger_fn` caller only ever reads its params) -- a
+        // genuine `rustc` rejection (`cannot assign to immutable
+        // argument`) without `mut` here, confirmed by compiling the naive
+        // version first, not guessed at. `body_reassigns_ident` (not the
+        // looser `body_has_any_ident_ref`, which would also fire for a
+        // plain read and produce a spurious `unused_mut` on every
+        // never-reassigned param) decides this per parameter.
+        let mut_prefix = if body_reassigns_ident(&f.body.items, &name) {
+            "mut "
+        } else {
+            ""
+        };
+        rendered.push(format!(
+            "{mut_prefix}{}: {rust_type}",
+            rust_field_name(&name)?
+        ));
     }
     Ok(rendered)
 }
@@ -5933,10 +8264,14 @@ pub fn render_spawn_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -6295,10 +8630,14 @@ pub fn render_trigger_fn(
         self_removal_ident: "arena",
         plain_int_locals: &HashSet::new(),
         angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &HashSet::new(),
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
+        psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
     };
@@ -6307,6 +8646,183 @@ pub fn render_trigger_fn(
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
     Ok(format!(
         "pub fn {fn_name}({}, world: &mut World, thinkers: &mut Arena<Thinker>){return_arrow} {{\n{}\n}}",
+        rendered_params.join(", "),
+        body_lines.join("\n")
+    ))
+}
+
+/// `render_trigger_fn`'s own leaner sibling for a genuinely different
+/// shape: a small, self-contained helper (`P_AproxDistance(fixed_t dx,
+/// fixed_t dy)`, `p_maputl.c`) whose body touches no global state at all
+/// -- no `self`-struct receiver, no `World`, no `Arena<Thinker>`, just its
+/// own parameters in and a plain value out. `render_trigger_fn` always
+/// appends a fixed `, world: &mut World, thinkers: &mut Arena<Thinker>)`
+/// to its signature, which would be actively wrong here (no real corpus
+/// call site anywhere passes those to `P_AproxDistance`, confirmed by
+/// every already-translated caller's own rendered text, e.g. `A_Tracer`'s
+/// `P_AproxDistance(dx, dy)`) -- so this renders a bare signature instead,
+/// with `param_types` doing double duty as `extra_cross_ref_idents`
+/// (letting `expr_is_fixed_t_valued`'s own new `"FixedT"`-registered-
+/// parameter arm recognize a bare `dx`/`dy` reference as genuinely
+/// `FixedT`-valued, the same way a self-struct field or `fixed_t`-declared
+/// local already are) exactly the way `render_trigger_fn` already reuses
+/// its own `param_types` for that map.
+pub fn render_pure_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    param_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+    let rendered_params = render_params(f, fn_name, param_types)?;
+    let plain_int_locals = collect_plain_int_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
+    let ctx = FnBodyContext {
+        self_param: "",
+        self_field_types: &HashMap::new(),
+        extra_cross_ref_idents: param_types,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
+        embedded_ctor: None,
+        mutating_handle: None,
+        same_handle_write: None,
+        same_target_write: None,
+        self_removal_ident: "arena",
+        plain_int_locals: &plain_int_locals,
+        angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &fixed_t_locals,
+        thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
+        psprite_walk_alias: None,
+        active_goto_label: None,
+        active_for_continue_step: None,
+        return_type,
+        static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
+    };
+
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    Ok(format!(
+        "pub fn {fn_name}({}){return_arrow} {{\n{}\n}}",
+        rendered_params.join(", "),
+        body_lines.join("\n")
+    ))
+}
+
+/// `render_pure_fn`'s own twin for a function that touches no `self`-
+/// struct receiver and no `Arena<Thinker>`, but *does* read/write real
+/// sector state directly through its own plain parameters --
+/// `T_MovePlane` (`p_floor.c`), called by every already-translated
+/// sector-mover tick function (`T_MoveFloor`/`T_MoveCeiling`/
+/// `T_PlatRaise`/`T_VerticalDoor`, all of which already call it as a
+/// forward-referenced stub, e.g. `T_MoveFloor`'s own rendered
+/// `T_MovePlane(floor.sector, floor.speed, floor.floordestheight,
+/// floor.crush, 0, floor.direction)`) but never itself a
+/// `state_t.action` entry, thinker-list constructor, or tagged-sector
+/// trigger. Its `sector` parameter is a plain `SectorId` -- `is_cross_ref`
+/// already resolves `sector->floorheight` to `world[sector].floorheight`
+/// from `extra_cross_ref_idents` alone (the same generic mechanism a
+/// trigger's own loop-local `sec`/`sector` already uses), so the only
+/// genuinely new piece is the signature shape itself: `world: &mut
+/// World` (mutable, unlike every real caller's own read-only-through-
+/// `world[..]` access, since this is the one function that actually
+/// assigns `sector->floorheight`/`.ceilingheight`), with no
+/// `Arena<Thinker>` parameter at all (this function never touches a
+/// `Thinker` -- no self-removal, no target/tracer, no spawn). Neither
+/// `render_pure_fn` (no `World` access) nor `render_trigger_fn` (always
+/// appends both `world` *and* `thinkers`, and assumes a `LineId`-tagged-
+/// sector loop shape this function doesn't have) fits, so this is its
+/// own thin variant rather than a misfit reuse of either.
+pub fn render_world_fn(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    param_types: &HashMap<String, String>,
+    return_type: Option<&str>,
+) -> Result<String, String> {
+    let (_, unit) = parse_full(corpus_dir.join(file).to_str().unwrap())?;
+    let f = find_function_def(&unit.items, fn_name)
+        .ok_or_else(|| format!("{fn_name} not found in {file}"))?;
+    let rendered_params = render_params(f, fn_name, param_types)?;
+    let plain_int_locals = collect_plain_int_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
+    // `front`/`back` (`P_LineOpening`'s own `sector_t* front; sector_t*
+    // back;`, assigned from `linedef->frontsector`/`.backsector`) --
+    // merged into `param_types` the same way `render_fn_impl` merges
+    // `target_tracer_aliases` on top of `self_field_types`, so a real
+    // `Line`-typed parameter's own `frontsector`/`backsector` fields can
+    // be aliased into a plain local and dereferenced through `World`
+    // afterward, not just read opaquely.
+    let mut extra_cross_ref_idents = param_types.clone();
+    extra_cross_ref_idents.extend(collect_line_sector_aliases(&f.body.items));
+    // `min = max;` (`P_FindMinSurroundingLight`) -- see
+    // `collect_i32_widened_locals`'s own doc comment for why this needs
+    // its own separate pre-scan, not just `param_types.clone()` above.
+    extra_cross_ref_idents.extend(collect_i32_widened_locals(&f.body.items, param_types));
+    // `soundtarget` (`p_enemy.c`'s own file-scope `mobj_t* soundtarget;`,
+    // `P_RecursiveSound`'s own `sec->soundtarget = soundtarget;`) --
+    // registered the same conditional way `render_fn_impl` registers
+    // `linetarget`/`corpsehit`/`vileobj`, so the existing `Option<Handle
+    // <Thinker>>`-aware machinery (here, the `lhs_is_option_handle_global`
+    // write arm) applies to it automatically.
+    if body_has_any_ident_ref(&f.body.items, &["soundtarget"]) {
+        extra_cross_ref_idents.insert(
+            "soundtarget".to_string(),
+            "Option<Handle<Thinker>>".to_string(),
+        );
+    }
+    // `emmiter->subsector->sector` (`P_NoiseAlert`) -- a bare `Handle<
+    // Thinker>`-registered *parameter* (not a self-struct receiver, this
+    // shape has none) dereferenced through, needing a real `Arena` lookup
+    // the same way `render_fn_impl`'s own `needs_target_deref`/
+    // `needs_bare_handle_global` do -- measured directly against this
+    // function's own registered parameters (any real corpus caller of
+    // `render_world_fn` so far, `P_LineOpening`/`T_MovePlane`/
+    // `P_RecursiveSound`, has none, so this is a no-op for them).
+    let needs_thinkers = extra_cross_ref_idents.iter().any(|(name, ty)| {
+        ty == "Handle<Thinker>" && body_has_any_ident_ref(&f.body.items, &[name.as_str()])
+    });
+    let ctx = FnBodyContext {
+        self_param: "",
+        self_field_types: &HashMap::new(),
+        extra_cross_ref_idents: &extra_cross_ref_idents,
+        ctor_var: "",
+        ctor_var_handle_name: "",
+        ctor_field_types: &HashMap::new(),
+        embedded_ctor: None,
+        mutating_handle: None,
+        same_handle_write: None,
+        same_target_write: None,
+        self_removal_ident: "arena",
+        plain_int_locals: &plain_int_locals,
+        angle_t_locals: &HashSet::new(),
+        fixed_t_locals: &fixed_t_locals,
+        thinker_scan_alias: None,
+        thinker_scan_handle_alias: None,
+        sector_walk_alias: None,
+        psprite_walk_alias: None,
+        active_goto_label: None,
+        active_for_continue_step: None,
+        return_type,
+        static_locals: &HashMap::new(),
+        bool_locals: &HashSet::new(),
+    };
+
+    let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
+    let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
+    let thinkers_part = if needs_thinkers {
+        ", thinkers: &Arena<Thinker>"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "pub fn {fn_name}({}, world: &mut World{thinkers_part}){return_arrow} {{\n{}\n}}",
         rendered_params.join(", "),
         body_lines.join("\n")
     ))
@@ -7018,10 +9534,14 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -7113,10 +9633,14 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -7168,10 +9692,14 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -7244,10 +9772,14 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -7407,10 +9939,14 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -8266,6 +10802,25 @@ pub fn EV_DoPlat(line: LineId, r#type: i32, amount: i32, world: &mut World, thin
     /// own `!` already. Verified compiling the complete function with
     /// `rustc` directly (hand-written `World`/`Player`/`Mobj`/`Thinker`/
     /// `Arena`/`Handle` stand-ins), zero errors.
+    ///
+    /// **A real, latent bug in this test's own expected string, found and
+    /// fixed while adding `P_GiveCard`'s `cards` handling (a later
+    /// round)**: `cards[it_bluecard]` (and its five siblings here/in
+    /// `EV_VerticalDoor`) was missing the `as usize` cast every other
+    /// enum-constant array index already gets (`powers[pw_strength as
+    /// usize]`, `A_Punch`) -- `it_bluecard` is a real `i32` constant
+    /// (`enum_values.rs`'s own uniform mapping), so `cards[it_bluecard]`
+    /// never actually compiles (confirmed by direct `rustc` reproduction:
+    /// `E0277`, "the type `[bool]` cannot be indexed by `i32`"). This
+    /// test's own original "verified compiling for real" claim must have
+    /// used a non-canonical stand-in (`it_bluecard` itself declared
+    /// `usize`) rather than the real, uniform `i32` every enum constant
+    /// actually gets -- caught only once `cards` joined the by-name `as
+    /// usize` index-cast list for a different function, at which point
+    /// the *full* test suite (not just the new test) surfaced this
+    /// mismatch. Fixed by adding the cast here (and in `EV_VerticalDoor`
+    /// below) to match the corrected, more broadly-applicable rendering,
+    /// not by narrowing the new code to dodge it.
     #[test]
     fn test_ev_do_locked_door_renders_exactly() {
         let params: HashMap<String, String> = [
@@ -8300,7 +10855,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
             if p.is_none() {
                 return 0;
             }
-            if !world[p.unwrap()].cards[it_bluecard] && !world[p.unwrap()].cards[it_blueskull] {
+            if !world[p.unwrap()].cards[it_bluecard as usize] && !world[p.unwrap()].cards[it_blueskull as usize] {
                 world[p.unwrap()].message = PD_BLUEO;
                 S_StartSound(None, sfx_oof);
                 return 0;
@@ -8310,7 +10865,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
             if p.is_none() {
                 return 0;
             }
-            if !world[p.unwrap()].cards[it_redcard] && !world[p.unwrap()].cards[it_redskull] {
+            if !world[p.unwrap()].cards[it_redcard as usize] && !world[p.unwrap()].cards[it_redskull as usize] {
                 world[p.unwrap()].message = PD_REDO;
                 S_StartSound(None, sfx_oof);
                 return 0;
@@ -8320,7 +10875,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
             if p.is_none() {
                 return 0;
             }
-            if !world[p.unwrap()].cards[it_yellowcard] && !world[p.unwrap()].cards[it_yellowskull] {
+            if !world[p.unwrap()].cards[it_yellowcard as usize] && !world[p.unwrap()].cards[it_yellowskull as usize] {
                 world[p.unwrap()].message = PD_YELLOWO;
                 S_StartSound(None, sfx_oof);
                 return 0;
@@ -8423,7 +10978,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             if player.is_none() {
                 return;
             }
-            if !world[player.unwrap()].cards[it_bluecard] && !world[player.unwrap()].cards[it_blueskull] {
+            if !world[player.unwrap()].cards[it_bluecard as usize] && !world[player.unwrap()].cards[it_blueskull as usize] {
                 world[player.unwrap()].message = PD_BLUEK;
                 S_StartSound(None, sfx_oof);
                 return;
@@ -8433,7 +10988,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             if player.is_none() {
                 return;
             }
-            if !world[player.unwrap()].cards[it_yellowcard] && !world[player.unwrap()].cards[it_yellowskull] {
+            if !world[player.unwrap()].cards[it_yellowcard as usize] && !world[player.unwrap()].cards[it_yellowskull as usize] {
                 world[player.unwrap()].message = PD_YELLOWK;
                 S_StartSound(None, sfx_oof);
                 return;
@@ -8443,7 +10998,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             if player.is_none() {
                 return;
             }
-            if !world[player.unwrap()].cards[it_redcard] && !world[player.unwrap()].cards[it_redskull] {
+            if !world[player.unwrap()].cards[it_redcard as usize] && !world[player.unwrap()].cards[it_redskull as usize] {
                 world[player.unwrap()].message = PD_REDK;
                 S_StartSound(None, sfx_oof);
                 return;
@@ -8565,10 +11120,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -8636,10 +11195,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -8733,10 +11296,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -8810,10 +11377,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -8888,10 +11459,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -8971,10 +11546,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -9860,14 +12439,17 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// through the rescaling `FixedMul`/`FixedDiv` -- `runtime/fixed.rs`
     /// gains `Mul<FixedT> for i32`/`Mul<i32> for FixedT`/`Div<i32> for
     /// FixedT` (raw representation arithmetic, the same idea `Add`/`Sub`
-    /// already model for `+`/`-`) plus `AddAssign`/`SubAssign`. `dist`
-    /// itself is treated as a plain scalar throughout (declared `fixed_t`
-    /// in the original, but only ever divided by/compared against plain
-    /// `int`s after `P_AproxDistance` computes it here) -- the
-    /// verification harness's own `P_AproxDistance` stub returns `i32`
-    /// to match, the same "stub signature matches this real call site's
-    /// own usage, not necessarily the callee's eventual one" precedent
-    /// already documented for `S_StartSound` (`EV_VerticalDoor`).
+    /// already model for `+`/`-`) plus `AddAssign`/`SubAssign`. **Revised
+    /// once `P_CheckMissileRange` closed the general mechanism**: `dist`
+    /// is genuinely declared `fixed_t` here too, and its own comparison/
+    /// reassignment against a bare `int` literal (`if (dist < 1) dist =
+    /// 1;`) now correctly renders `FixedT(1)` on both sides via
+    /// `FnBodyContext::fixed_t_locals` -- this entry originally shipped
+    /// with the verification harness's own `P_AproxDistance` stub
+    /// deliberately returning `i32` (not the real corpus declaration's
+    /// `fixed_t`) specifically to dodge this exact gap; that dodge is
+    /// gone now that the general fix exists, and the harness's stub
+    /// return type is corrected to match the real `p_local.h` signature.
     /// `finecosine[exact]`/`finesine[exact]` need an explicit `as usize`
     /// even though `exact` is a plain index identifier (unlike
     /// `sidenum[side^1]`'s fresh, single-purpose local): `exact` is
@@ -9937,8 +12519,8 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              actor.momy = FixedMul(actor.info.speed, finesine[exact as usize]);\n    \
              dist = P_AproxDistance(match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - actor.x, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - actor.y);\n    \
              dist = dist / actor.info.speed;\n    \
-             if dist < 1 {\n        \
-             dist = 1;\n    \
+             if dist < FixedT(1) {\n        \
+             dist = FixedT(1);\n    \
              }\n    \
              slope = (match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + 40 * FRACUNIT - actor.z) / dist;\n    \
              if slope < actor.momz {\n        \
@@ -10429,10 +13011,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             self_removal_ident: "arena",
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -10515,11 +13101,24 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// all (both sides are genuinely `u32`, matching the established
     /// "stub matches the caller's real usage" precedent). `bulletslope`
     /// (`p_pspr.c`'s own file-scope `fixed_t` global, set by the
-    /// forward-referenced `P_BulletSlope`) needs no new handling: an
-    /// unregistered bare identifier already renders as plain opaque
-    /// pass-through text (the same `MISSILERANGE`/`textureheight[]`
-    /// precedent), and `FixedT + i32` (`bulletslope + (...)<<5`) already
-    /// has a real trait impl from `A_Tracer`'s own earlier work.
+    /// forward-referenced `P_BulletSlope`) originally needed no new
+    /// handling here at all, rendering as a plain opaque bare-identifier
+    /// pass-through (the same `MISSILERANGE`/`textureheight[]` precedent)
+    /// -- **revised once `P_BulletSlope` itself was translated**:
+    /// registering `bulletslope` as a real `World` field there (the
+    /// `viletryx`/`attackrange`/`swingx`/`swingy` category) means this
+    /// already-shipped rendering must change too, from the bare
+    /// identifier to `world.bulletslope`, and `render_weapon_fn` needs its
+    /// own `world` parameter widened to fire on this reason as well as
+    /// `needs_linetarget` (`needs_bulletslope`, `body_has_any_ident_ref`)
+    /// -- confirmed a real gap by the full suite itself catching this
+    /// test regress, not assumed, the exact "re-run the full suite when
+    /// generalizing" case this project's own discipline exists for; fixed
+    /// by widening `needs_world` rather than narrowing `P_BulletSlope`'s
+    /// own `bulletslope` registration to dodge it, since the wider
+    /// `World` field is the more broadly correct rendering. `FixedT + i32`
+    /// (`world.bulletslope + (...)<<5`) already has a real trait impl
+    /// from `A_Tracer`'s own earlier work.
     #[test]
     fn test_a_fire_shotgun2_renders_exactly() {
         let field_types = field_types(&[("mo", "Handle<Thinker>")]);
@@ -10527,7 +13126,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_FireShotgun2(player: &mut Player, psp: &mut PlayerSpriteState, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_FireShotgun2(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
              let mut i;\n    \
              let mut angle;\n    \
              let mut damage;\n    \
@@ -10541,7 +13140,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              damage = 5 * (P_Random() % 3 + 1);\n        \
              angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n        \
              angle += (P_Random() - P_Random() << 19) as u32;\n        \
-             P_LineAttack(player.mo, angle, MISSILERANGE, bulletslope + (P_Random() - P_Random() << 5), damage);\n        \
+             P_LineAttack(player.mo, angle, MISSILERANGE, world.bulletslope + (P_Random() - P_Random() << 5), damage);\n        \
              i += 1;\n    \
              }\n\
              }"
@@ -11185,11 +13784,15 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             same_target_write: None,
             plain_int_locals: &HashSet::new(),
             angle_t_locals: &HashSet::new(),
+            fixed_t_locals: &HashSet::new(),
             self_removal_ident: "arena",
             thinker_scan_alias: None,
             thinker_scan_handle_alias: None,
+            sector_walk_alias: None,
+            psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
         };
@@ -12315,5 +14918,3058 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              S_StartSound(None, sfx_bossit);\n\
              }"
         );
+    }
+
+    /// `P_ExplodeMissile` (`p_mobj.c`) -- the first real three-target
+    /// chained assignment (`mo->momx = mo->momy = mo->momz = 0;`), the
+    /// case the old two-target-only chain-flattening couldn't reach:
+    /// its "first" half (`momy = momz = 0`) was still itself a chain,
+    /// handed straight to `render_expr_stmt` rather than back through
+    /// the same flattening logic, so it would have failed outright on
+    /// exactly this shape. Generalized `render_stmt`'s chained-assignment
+    /// arm to flatten any chain length instead. Otherwise a clean,
+    /// already-provisioned mix: `mobjinfo[mo->type].deathstate` (the
+    /// already-proven `mobjinfo[]`-by-variable-index rendering, `MOBJINFO
+    /// [mo.r#type as usize]`), `mo->tics -= ..`/clamp, a `flags &=`
+    /// clear, and `mo->info->deathsound` truthiness (`mo.info.deathsound
+    /// != 0`) guarding an `S_StartSound` call -- every one of these
+    /// already proven by earlier `A_*` functions.
+    #[test]
+    fn test_p_explode_missile_renders_exactly() {
+        let field_types = field_types(&[
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("type", "i32"),
+            ("tics", "i32"),
+            ("flags", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_ExplodeMissile",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_ExplodeMissile(mo: &mut Mobj, world: &mut World) {\n    \
+             mo.momz = FixedT(0);\n    \
+             mo.momy = mo.momz;\n    \
+             mo.momx = mo.momy;\n    \
+             P_SetMobjState(mo, MOBJINFO[mo.r#type as usize].deathstate);\n    \
+             mo.tics -= P_Random() & 3;\n    \
+             if mo.tics < 1 {\n        \
+             mo.tics = 1;\n    \
+             }\n    \
+             mo.flags &= !MF_MISSILE;\n    \
+             if mo.info.deathsound != 0 {\n        \
+             S_StartSound(mo, mo.info.deathsound);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `P_CheckMissileSpawn` (`p_mobj.c`) -- a clean, already-fully-
+    /// provisioned function needing no new mechanism at all: `tics -=`/
+    /// clamp (`P_ExplodeMissile`'s own idiom just above), `th->x +=
+    /// (th->momx>>1);` reusing `FixedT`'s existing `Shr<i32>`/`AddAssign`
+    /// (first proven for `A_SkullAttack`'s own `dist` gap), and a
+    /// `P_TryMove` call through the already-registered bool-returning-
+    /// helper machinery (`is_bool_returning_call`) for the closing
+    /// `if (!P_TryMove(..)) P_ExplodeMissile(th);` -- a forward reference
+    /// to the just-translated sibling above, the same "call an already-
+    /// translated function by name" convention every other cross-function
+    /// call in this corpus already relies on.
+    #[test]
+    fn test_p_check_missile_spawn_renders_exactly() {
+        let field_types = field_types(&[
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("tics", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_CheckMissileSpawn",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_CheckMissileSpawn(th: &mut Mobj, world: &mut World) {\n    \
+             th.tics -= P_Random() & 3;\n    \
+             if th.tics < 1 {\n        \
+             th.tics = 1;\n    \
+             }\n    \
+             th.x += th.momx >> 1;\n    \
+             th.y += th.momy >> 1;\n    \
+             th.z += th.momz >> 1;\n    \
+             if !P_TryMove(th, th.x, th.y) {\n        \
+             P_ExplodeMissile(th);\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `P_TryWalk` (`p_enemy.c`) -- another clean, already-fully-
+    /// provisioned function: a `boolean`-returning single-self-struct
+    /// helper (`render_bool_fn`, the same shape `P_CheckMeleeRange`
+    /// already proved), forward-referencing the not-yet-translated
+    /// `P_Move` through the same by-name-call convention every other
+    /// cross-function reference in this corpus already relies on
+    /// (`P_Move` itself is already registered in `is_bool_returning_call`,
+    /// so its negated-condition use, `if (!P_Move(actor))`, renders
+    /// correctly without needing its own body translated first).
+    #[test]
+    fn test_p_try_walk_renders_exactly() {
+        let field_types = field_types(&[("movecount", "i32")]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_TryWalk",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_TryWalk(actor: &mut Mobj, world: &mut World) -> bool {\n    \
+             if !P_Move(actor) {\n        \
+             return false;\n    \
+             }\n    \
+             actor.movecount = P_Random() & 15;\n    \
+             return true;\n\
+             }"
+        );
+    }
+
+    /// `P_CheckMissileRange` (`p_enemy.c`) -- surfaced two genuinely new,
+    /// narrowly-scoped mechanisms, both caught by actually compiling the
+    /// naive output with `rustc` first rather than by inspection. (1) its
+    /// own `dist` local is declared *genuinely* `fixed_t` in the real C
+    /// source (unlike `A_SkullAttack`'s same-named local, declared plain
+    /// `int` there, needing the different `.0`-extraction treatment
+    /// `is_approx_distance_call` already covers) -- `FnBodyContext::
+    /// fixed_t_locals`/`collect_fixed_t_locals` register it, so `dist =
+    /// P_AproxDistance(..) - 64*FRACUNIT;`/`dist -= 128*FRACUNIT;`/`dist
+    /// >>= 16;` all stay real `FixedT` arithmetic with no wrap needed
+    /// (every operand involved is already `FixedT`-valued). (2) every
+    /// comparison against a bare `int` (`dist > 14*64`, `dist < 196`,
+    /// `dist = 200`, `P_Random() < dist`) needed the plain-`int` side
+    /// wrapped in `FixedT(..)`: this project's `FixedT` deliberately has
+    /// no `PartialOrd<i32>`/assignment-from-`i32` (the whole point of the
+    /// newtype is catching an accidental raw-`int` mix at compile time,
+    /// per `runtime/fixed.rs`'s own doc comment), so a bare comparison/
+    /// assignment against one of these locals needs the same "know the
+    /// real C type, wrap the literal/call side" idiom the self-struct
+    /// `FixedT`-field write arm already established, extended to a plain
+    /// local (assignment) and, new here, to comparisons in *either*
+    /// operand order (`P_Random() < dist` needed the literal-`int`-
+    /// returning call wrapped on the *left*). Guarded by the existing
+    /// `expr_is_fixed_t_valued` so an already-`FixedT`-valued other
+    /// operand is never double-wrapped. `actor->target->x`/`.y` (target
+    /// dereference read, inside the very same `P_AproxDistance` call
+    /// argument) and `P_CheckSight(actor, actor->target)` (a bare-`Option`
+    /// argument, `P_CheckMeleeRange`'s own precedent) needed no new work
+    /// at all. Compile-verified for real with a hand-written `FixedT`/
+    /// `Mobj`/`MobjInfo`/`Thinker`/`Arena`/`Handle`/`World` stand-in
+    /// (`rustc --edition 2021 --crate-type lib`) -- zero errors.
+    /// `test_p_check_missile_range_renders_exactly`. 405/405 tests passing.
+    #[test]
+    fn test_p_check_missile_range_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("reactiontime", "i32"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("type", "i32"),
+            ("target", "Option<Handle<Thinker>>"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_CheckMissileRange",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_CheckMissileRange(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) -> bool {\n    \
+             let mut dist;\n    \
+             if !P_CheckSight(actor, actor.target) {\n        \
+             return false;\n    \
+             }\n    \
+             if (actor.flags & MF_JUSTHIT) != 0 {\n        \
+             actor.flags &= !MF_JUSTHIT;\n        \
+             return true;\n    \
+             }\n    \
+             if actor.reactiontime != 0 {\n        \
+             return false;\n    \
+             }\n    \
+             dist = P_AproxDistance(actor.x - match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, actor.y - match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }) - 64 * FRACUNIT;\n    \
+             if actor.info.meleestate == 0 {\n        \
+             dist -= 128 * FRACUNIT;\n    \
+             }\n    \
+             dist >>= 16;\n    \
+             if actor.r#type == MT_VILE {\n        \
+             if dist > FixedT(14 * 64) {\n            \
+             return false;\n        \
+             }\n    \
+             }\n    \
+             if actor.r#type == MT_UNDEAD {\n        \
+             if dist < FixedT(196) {\n            \
+             return false;\n        \
+             }\n        \
+             dist >>= 1;\n    \
+             }\n    \
+             if actor.r#type == MT_CYBORG || actor.r#type == MT_SPIDER || actor.r#type == MT_SKULL {\n        \
+             dist >>= 1;\n    \
+             }\n    \
+             if dist > FixedT(200) {\n        \
+             dist = FixedT(200);\n    \
+             }\n    \
+             if actor.r#type == MT_CYBORG && dist > FixedT(160) {\n        \
+             dist = FixedT(160);\n    \
+             }\n    \
+             if FixedT(P_Random()) < dist {\n        \
+             return false;\n    \
+             }\n    \
+             return true;\n\
+             }"
+        );
+    }
+
+    /// `P_AproxDistance` (`p_maputl.c`) -- the first function needing
+    /// `render_pure_fn`'s own leaner signature (no `self`, no `World`, no
+    /// `Arena<Thinker>` -- a small self-contained helper touching no
+    /// global state at all). Two new, narrowly-scoped mechanisms: (1)
+    /// `expr_is_fixed_t_valued` gains a `"FixedT"`-registered-parameter
+    /// arm (`dx`/`dy` themselves, plain function parameters genuinely
+    /// declared `fixed_t`, distinct from a self-struct field or a
+    /// `fixed_t`-declared local) so `abs(dx)` renders its already-correct
+    /// raw-magnitude extraction (`(dx).0.abs()`, `PIT_VileCheck`'s own
+    /// precedent); (2) `dx = abs(dx);` reassigns `dx` right back into
+    /// itself, needing the extracted `i32` magnitude re-wrapped in
+    /// `FixedT(..)` since `dx` stays genuinely `fixed_t`-typed afterward
+    /// (`dx>>1`, `dx+dy`) -- unlike `PIT_VileCheck`'s own `abs(..)` use,
+    /// which stays a bare `i32` because it's compared against a plain
+    /// `int` field. **A second, independent gap surfaced by actually
+    /// compiling the naive output with `rustc`**: reassigning a Rust
+    /// function *parameter* needs it declared `mut` in the signature --
+    /// the first real corpus function to reassign one of its own
+    /// parameters (every earlier `render_trigger_fn` caller only ever
+    /// reads its params) -- `render_params` now checks each parameter
+    /// with the new `body_reassigns_ident` (a precise write-only scan,
+    /// not the looser `body_has_any_ident_ref`, which would also fire on
+    /// a plain read and produce a spurious `clippy::unused_mut` on every
+    /// never-reassigned parameter). Compile-verified for real with a
+    /// hand-written `FixedT` stand-in (`rustc --edition 2021`, both
+    /// `--crate-type lib` and a `--crate-type bin` smoke run actually
+    /// executing it against `P_AproxDistance(3, -4) == 6`) -- zero
+    /// errors. `test_p_aprox_distance_renders_exactly`.
+    #[test]
+    fn test_p_aprox_distance_renders_exactly() {
+        let param_types = field_types(&[("dx", "FixedT"), ("dy", "FixedT")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_maputl.c",
+            "P_AproxDistance",
+            &param_types,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_AproxDistance(mut dx: FixedT, mut dy: FixedT) -> FixedT {\n    \
+             dx = FixedT((dx).0.abs());\n    \
+             dy = FixedT((dy).0.abs());\n    \
+             if dx < dy {\n        \
+             return dx + dy - (dx >> 1);\n    \
+             }\n    \
+             return dx + dy - (dy >> 1);\n\
+             }"
+        );
+    }
+
+    /// `P_AddActivePlat` (`p_plats.c`) -- the first function reading/
+    /// writing `World::activeplats`, a global `[Option<Handle<Thinker>>;
+    /// MAXPLATS]` array (`NULL` marking an empty slot, matching this
+    /// exact function's own `if (activeplats[i] == NULL)` scan), the same
+    /// hand-matched-by-name category `braintargets` already established.
+    /// `Handle<Thinker>: PartialEq`/`Eq` (already hand-written in
+    /// `runtime/arena.rs`, not derived) makes `world.activeplats[i as
+    /// usize] == None` -- `Option<Handle<Thinker>>`'s own derived
+    /// equality against the `None` variant -- compile with no new trait
+    /// work at all; `activeplats[i] = plat;` needed a new `Some(..)` wrap
+    /// (`lhs_is_activeplats_index`), the array-index-write mirror of the
+    /// existing `lhs_is_target_or_tracer_self_field`'s own self-struct-
+    /// field write. Also the first function needing a bare C string-
+    /// literal call argument (`I_Error ("P_AddActivePlat: no more
+    /// plats!");`) -- `render_expr` gains an `Expr::StringLiteral` arm,
+    /// passing the AST's own already-quoted text straight through (not a
+    /// general C-to-Rust string-escape translator, just this one real
+    /// shape). Compile-verified for real with a hand-written `Handle`/
+    /// `Arena`/`Thinker`/`World` stand-in (`rustc --edition 2021
+    /// --crate-type lib`) -- zero errors. `test_p_add_active_plat_renders_exactly`.
+    #[test]
+    fn test_p_add_active_plat_renders_exactly() {
+        let params = field_types(&[("plat", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "P_AddActivePlat",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_AddActivePlat(plat: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             i = 0;\n    \
+             while i < MAXPLATS {\n        \
+             if world.activeplats[i as usize] == None {\n            \
+             world.activeplats[i as usize] = Some(plat);\n            \
+             return;\n        \
+             }\n        \
+             i += 1;\n    \
+             }\n    \
+             I_Error(\"P_AddActivePlat: no more plats!\");\n\
+             }"
+        );
+    }
+
+    /// `P_AddActiveCeiling` (`p_ceilng.c`) -- `P_AddActivePlat`'s own
+    /// exact twin, one `Thinker` variant over (`World::activeceilings`,
+    /// same hand-matched-by-name treatment), and slightly simpler: no
+    /// `I_Error` fallback at all, the loop just falls through if every
+    /// slot is full (confirmed by direct read of the real corpus body,
+    /// not assumed from its sibling's shape). No new mechanism needed
+    /// beyond `activeceilings` joining `activeplats` in the same by-name
+    /// lists. Compile-verified for real the same way. `test_p_add_active_ceiling_renders_exactly`.
+    #[test]
+    fn test_p_add_active_ceiling_renders_exactly() {
+        let params = field_types(&[("c", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "P_AddActiveCeiling",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_AddActiveCeiling(c: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             i = 0;\n    \
+             while i < MAXCEILINGS {\n        \
+             if world.activeceilings[i as usize] == None {\n            \
+             world.activeceilings[i as usize] = Some(c);\n            \
+             return;\n        \
+             }\n        \
+             i += 1;\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `T_MovePlane` (`p_floor.c`) -- the sector-mutating helper every
+    /// already-translated mover tick function (`T_MoveFloor`/
+    /// `T_MoveCeiling`/`T_PlatRaise`/`T_VerticalDoor`) has called as a
+    /// forward-referenced stub since its own entry closed, itself never
+    /// translated until now. Confirmed by reading the whole function
+    /// first (`linuxdoom-1.10/p_floor.c`): a nested `switch(floorOrCeiling)`
+    /// / `switch(direction)`, no `default:` on either (case `0`/`1` and
+    /// case `-1`/`1` respectively, needing a synthetic trailing `_ => {}`
+    /// each), each innermost `if`/`else` reading/writing
+    /// `sector->floorheight`/`.ceilingheight` directly and calling the
+    /// not-yet-translated `P_ChangeSector` (a forward-reference stub,
+    /// same convention as `S_StartSound`). No new renderer mechanism was
+    /// actually needed: `sector`'s own plain `SectorId` parameter type
+    /// already resolves through `is_cross_ref`/`extra_cross_ref_idents`
+    /// to `world[sector].field` with zero new code (the same generic
+    /// path a trigger loop's own `sec`/`sector` local already uses), and
+    /// `boolean flag;`/`fixed_t lastpos;` (both `TypedefName` locals)
+    /// already fall through `render_decl`'s existing deferred-inference
+    /// case. `render_world_fn` (new) is only a thin signature-shape
+    /// wrapper: no `self`, no `Arena<Thinker>`, just `world: &mut World`
+    /// appended, since neither `render_pure_fn` (no `World` at all) nor
+    /// `render_trigger_fn` (always appends `Arena<Thinker>` too, and
+    /// assumes a tagged-sector-loop body shape this function doesn't
+    /// have) fits. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against hand-written `World`/`Sector` stand-ins
+    /// and a stub `P_ChangeSector(SectorId, bool) -> bool` matching this
+    /// real call site's own argument shape -- zero errors.
+    #[test]
+    fn test_t_move_plane_renders_exactly() {
+        let params = field_types(&[
+            ("sector", "SectorId"),
+            ("speed", "FixedT"),
+            ("dest", "FixedT"),
+            ("crush", "bool"),
+            ("floorOrCeiling", "i32"),
+            ("direction", "i32"),
+        ]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_floor.c",
+            "T_MovePlane",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn T_MovePlane(sector: SectorId, speed: FixedT, dest: FixedT, crush: bool, floorOrCeiling: i32, direction: i32, world: &mut World) -> i32 {
+    let mut flag;
+    let mut lastpos;
+    match floorOrCeiling {
+        0 => {
+            match direction {
+                -1 => {
+                    if world[sector].floorheight - speed < dest {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight -= speed;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                            return crushed;
+                        }
+                    }
+                }
+                1 => {
+                    if world[sector].floorheight + speed > dest {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].floorheight;
+                        world[sector].floorheight += speed;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            if crush == true {
+                                return crushed;
+                            }
+                            world[sector].floorheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                            return crushed;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        1 => {
+            match direction {
+                -1 => {
+                    if world[sector].ceilingheight - speed < dest {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].ceilingheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight -= speed;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            if crush == true {
+                                return crushed;
+                            }
+                            world[sector].ceilingheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                            return crushed;
+                        }
+                    }
+                }
+                1 => {
+                    if world[sector].ceilingheight + speed > dest {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight = dest;
+                        flag = P_ChangeSector(sector, crush);
+                        if flag == true {
+                            world[sector].ceilingheight = lastpos;
+                            P_ChangeSector(sector, crush);
+                        }
+                        return pastdest;
+                    } else {
+                        lastpos = world[sector].ceilingheight;
+                        world[sector].ceilingheight += speed;
+                        flag = P_ChangeSector(sector, crush);
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return ok;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ThingHeightClip` (`p_map.c`) -- a plain `boolean`-returning
+    /// self-struct function, the same shape `render_bool_fn` already
+    /// handles for `P_CheckMeleeRange`/`P_CheckMissileRange`, needing no
+    /// new mechanism at all once actually checked against the real body:
+    /// `thing->z`/`.floorz`/`.ceilingz`/`.height` are all already-
+    /// registered `FixedT` `Mobj` fields, `boolean onfloor;` is a plain
+    /// `TypedefName` local already handled by `render_decl`'s deferred-
+    /// inference case and picked up by `collect_bool_locals` (so `if
+    /// (onfloor)` renders as real `if onfloor`, not a `!= 0` truthiness
+    /// cast), and `P_CheckPosition(thing, thing->x, thing->y)` is a plain
+    /// forward-referenced call (same convention as `S_StartSound`) whose
+    /// two "out parameters", `tmfloorz`/`tmceilingz`, are bare global
+    /// reads (same pass-through convention already established for
+    /// `leveltime`/`MISSILERANGE`, not something this function itself
+    /// writes). Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against hand-written `Mobj`/`World` stand-ins,
+    /// bare `tmfloorz`/`tmceilingz: FixedT` statics, and a stub
+    /// `P_CheckPosition(&mut Mobj, FixedT, FixedT)` matching this real
+    /// call site's own argument shape -- zero errors.
+    #[test]
+    fn test_p_thing_height_clip_renders_exactly() {
+        let field_types = field_types(&[
+            ("z", "FixedT"),
+            ("floorz", "FixedT"),
+            ("ceilingz", "FixedT"),
+            ("height", "FixedT"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "P_ThingHeightClip",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ThingHeightClip(thing: &mut Mobj, world: &mut World) -> bool {
+    let mut onfloor;
+    onfloor = thing.z == thing.floorz;
+    P_CheckPosition(thing, thing.x, thing.y);
+    thing.floorz = tmfloorz;
+    thing.ceilingz = tmceilingz;
+    if onfloor {
+        thing.z = thing.floorz;
+    } else {
+        if thing.z + thing.height > thing.ceilingz {
+            thing.z = thing.ceilingz - thing.height;
+        }
+    }
+    if thing.ceilingz - thing.floorz < thing.height {
+        return false;
+    }
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `PIT_StompThing` (`p_map.c`) -- a `boolean`-returning callback
+    /// function (`P_BlockThingsIterator`'s own `func` parameter shape,
+    /// already proven passable as a bare forward-referenced identifier by
+    /// `A_VileChase`'s own `P_BlockThingsIterator(bx, by, PIT_VileCheck)`)
+    /// dereferencing `tmthing` -- a bare, file-scope `mobj_t* tmthing;`
+    /// (`p_map.c`), confirmed by grepping every real reference to it
+    /// across the whole file: never null-checked anywhere, so registered
+    /// *bare* `Handle<Thinker>` (`render_fn_impl`'s new `needs_tmthing`
+    /// check), not `Option`-wrapped like `corpsehit`/`vileobj`.
+    /// `tmthing->radius`/`.player` then render through the fully generic,
+    /// already-existing `Handle<Thinker>` `Expr::Member` arm with zero new
+    /// rendering code. **One genuinely new shape**: `thing == tmthing`
+    /// compares the function's own receiver's *identity* (`thing`, a
+    /// `&mut Mobj`) against `tmthing` (a `Handle<Thinker>` *value*) --
+    /// doesn't type-check as a bare passthrough, needing the function's
+    /// own `handle: Handle<Thinker>` parameter (`body_has_self_identity_
+    /// comparison`, the comparison-side sibling of `body_has_self_handle_
+    /// value`'s own assignment-side check) and a new `render_expr` arm
+    /// substituting `handle` for the self side of the comparison.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written `Mobj`/`World`/`Handle`/`Arena` stand-ins,
+    /// a bare `Handle<Thinker>`-typed `tmthing`/`FixedT`-typed `tmx`/`tmy`
+    /// static, and a stub `P_DamageMobj` matching this real call site's
+    /// own argument shape -- zero errors.
+    #[test]
+    fn test_pit_stomp_thing_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("radius", "FixedT"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("player", "Option<PlayerId>"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "PIT_StompThing",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn PIT_StompThing(thing: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>, handle: Handle<Thinker>) -> bool {
+    let mut blockdist;
+    if thing.flags & MF_SHOOTABLE == 0 {
+        return true;
+    }
+    blockdist = thing.radius + match thinkers.get(tmthing) { Some(Thinker::Mobj(m)) => m.radius, _ => unreachable!() };
+    if FixedT((thing.x - tmx).0.abs()) >= blockdist || FixedT((thing.y - tmy).0.abs()) >= blockdist {
+        return true;
+    }
+    if handle == tmthing {
+        return true;
+    }
+    if match thinkers.get(tmthing) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_none() && gamemap != 30 {
+        return false;
+    }
+    P_DamageMobj(thing, tmthing, tmthing, 10000);
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `PIT_RadiusAttack` (`p_map.c`) -- another `boolean`-returning
+    /// `P_BlockThingsIterator`/`P_RadiusAttack` callback, generalizing the
+    /// bare-`Handle<Thinker>`-global registration `PIT_StompThing`'s own
+    /// `tmthing` needed to its two siblings `bombspot`/`bombsource`
+    /// (`p_map.c`'s own file-scope `mobj_t* bombspot;`/`bombsource;`,
+    /// grepped never null-checked anywhere either) -- zero new mechanism
+    /// for that part beyond widening the by-name list. Three genuinely new
+    /// pieces surfaced by this function specifically: (1) `dx>dy ? dx :
+    /// dy` -- C's ternary operator, never needed until now; Rust's own
+    /// `if`/`else` is already a real expression, so `Expr::Conditional`
+    /// renders straight into one, no new machinery beyond that one
+    /// `render_expr` arm. (2) `(dist - thing->radius) >> FRACBITS` --
+    /// shifting a `FixedT` by the real corpus `FRACBITS` constant, whose
+    /// real declared Rust type is `u32` (`runtime::FRACBITS`), not the
+    /// bare `i32` shift-count `Shr<i32> for FixedT` already handles (`dest
+    /// ->height>>1`) -- added `Shr<u32> for FixedT` alongside it (`runtime/
+    /// fixed.rs`), the same "both operand types get impl'd" precedent
+    /// `Add<i32>`/`Mul<i32>` already established (Rust's own `-` binding
+    /// tighter than `>>`, matching C's precedence exactly, means the
+    /// rendered text needs no parens here either). (3) `bombdamage - dist`
+    /// -- `dist` is genuinely `fixed_t`-declared (so far correctly
+    /// `FixedT`-typed throughout, including the `0`-clamp comparison just
+    /// above, via wholly pre-existing machinery), but by this point in the
+    /// function it's already been reassigned through the `>> FRACBITS`
+    /// shift into a plain map-unit scalar -- the same "one C variable, two
+    /// roles" idiom already documented for `A_Tracer`'s own `dist`/`A_
+    /// BrainExplode`'s `x`/`y`/`z`. Confirmed a real `rustc` rejection
+    /// first (`cannot subtract FixedT from i32`, no blind assumption): the
+    /// naive render leaves this as a bare `bombdamage - dist`, and neither
+    /// existing direction fits -- `Add<FixedT> for i32`'s own `Output =
+    /// FixedT` would be wrong reused here, since this value's real
+    /// destination (`P_DamageMobj`'s `damage: int` parameter) is plain
+    /// `i32`, not `FixedT`. Fixed with a new, deliberately narrow
+    /// `render_expr` arm (`Sub` only, RHS a bare `fixed_t_locals` ident,
+    /// LHS not already known `FixedT`-valued) that extracts the raw
+    /// representation (`.0`) rather than widening `runtime/fixed.rs`'s own
+    /// `Sub` impls with an output-type choice that would collide with
+    /// `Add`'s existing one for the identical operand pairing. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against hand-written `Mobj`/`World`/`Handle`/`Arena` stand-ins, bare
+    /// `Handle<Thinker>`-typed `bombspot`/`bombsource`, a plain `i32`
+    /// `bombdamage` static, and stub `P_CheckSight`/`P_DamageMobj`
+    /// matching this real call site's own argument shapes -- zero errors.
+    #[test]
+    fn test_pit_radius_attack_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("type", "i32"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("radius", "FixedT"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "PIT_RadiusAttack",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn PIT_RadiusAttack(thing: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) -> bool {
+    let mut dx;
+    let mut dy;
+    let mut dist;
+    if thing.flags & MF_SHOOTABLE == 0 {
+        return true;
+    }
+    if thing.r#type == MT_CYBORG || thing.r#type == MT_SPIDER {
+        return true;
+    }
+    dx = FixedT((thing.x - match thinkers.get(bombspot) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }).0.abs());
+    dy = FixedT((thing.y - match thinkers.get(bombspot) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }).0.abs());
+    dist = if dx > dy { dx } else { dy };
+    dist = dist - thing.radius >> FRACBITS;
+    if dist < FixedT(0) {
+        dist = FixedT(0);
+    }
+    if dist >= FixedT(bombdamage) {
+        return true;
+    }
+    if P_CheckSight(thing, bombspot) {
+        P_DamageMobj(thing, bombspot, bombsource, bombdamage - dist.0);
+    }
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FindSectorFromLineTag` (`p_spec.c`) -- opens a fresh batch of
+    /// non-`A_*`/non-mover functions, called (as a forward-referenced
+    /// stub) by every already-translated tagged-sector trigger
+    /// (`EV_DoCeiling`/`EV_DoDoor`/`EV_DoPlat`/`EV_StartLightStrobing`'s
+    /// own `while ((secnum = P_FindSectorFromLineTag(line,secnum)) >=
+    /// 0)`), but never itself translated until now. `render_world_fn`'s
+    /// existing shape fits directly (a plain `line: &Line`/`start: i32`
+    /// parameter pair, `-> i32`, real `World` access, no `self`-struct,
+    /// no `Arena<Thinker>`) -- the only two genuinely new pieces are both
+    /// by-name global registrations, the same style `braintargets`/
+    /// `activeplats` already established: `numsectors` (`p_setup.c`'s own
+    /// file-scope `int numsectors;`) renders as `world.sectors.len() as
+    /// i32` rather than a fresh `World` field, since it's a read-only
+    /// derived quantity always exactly equal to the sector array's own
+    /// length (both set together at level load in the real engine) --
+    /// giving it a second, independent field would just be a redundant
+    /// place for the same number to drift out of sync, matching the
+    /// "don't duplicate the source of truth" reasoning `mobj_t.info`/
+    /// `sector_t.linecount` already established at the struct-field
+    /// level. Bare (non-`&`) `sectors[i]` (`sectors[i].tag`) generalizes
+    /// the existing bare `sides[i]` special case to its sibling global
+    /// array: `sector_t*` already maps to `SectorId`, so this needs no
+    /// real indexing either, just wrapping the index with `is_crossref:
+    /// true` so the chained `.tag` resolves through `world[...]` the same
+    /// way. `line->tag` needs nothing new at all: `tag` is a plain `i16`
+    /// field on both `Sector`/`Line` (confirmed by direct read of
+    /// `r_defs.h`, not assumed), so the comparison is ordinary `i16 ==
+    /// i16`. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Line`/`Sector`/`World`
+    /// stand-in -- zero errors. `test_p_find_sector_from_line_tag_renders_exactly`.
+    #[test]
+    fn test_p_find_sector_from_line_tag_renders_exactly() {
+        let params = field_types(&[("line", "&Line"), ("start", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindSectorFromLineTag",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindSectorFromLineTag(line: &Line, start: i32, world: &mut World) -> i32 {
+    let mut i;
+    i = start + 1;
+    while i < world.sectors.len() as i32 {
+        if world[SectorId(i as u32)].tag == line.tag {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `getNextSector` (`p_spec.c`) -- a small pure helper (no `self`-
+    /// struct, no `World`/`Arena` access at all: both `line`/`sec` are
+    /// plain parameters, so `render_pure_fn` fits directly), the first
+    /// real corpus function needing `Stmt::Return`'s new `Option<..>`-
+    /// wrap: its own return type is `Option<SectorId>` (a genuinely
+    /// nullable `sector_t*`, `!(one-sided) -> NULL`), and while `return
+    /// line->backsector;` needs no wrap (`backsector` is already `Option
+    /// <SectorId>`, the corpus-verified nullable one of the pair), its
+    /// sibling `return line->frontsector;` returns the bare, non-nullable
+    /// twin -- needing `Some(..)`, hand-matched by field name (`"no
+    /// general struct-field-type registry yet"`, the same style
+    /// `sides[i].sector`/`specialdata` already established) rather than a
+    /// general is-this-bare-Member-cross-reference-typed check unproven
+    /// beyond this one real case. `return NULL;` needs nothing new either
+    /// -- `Expr::Ident("NULL")` already renders as `None` unconditionally
+    /// via the existing generic arm. `!(line->flags & ML_TWOSIDED)`
+    /// reuses the already-proven negated-non-comparison-`Binary`
+    /// truthiness arm (`A_Chase`'s own `!(actor->target->flags&
+    /// MF_SHOOTABLE)`) with zero changes -- `ML_TWOSIDED` itself is a
+    /// plain `#define`d macro (`doomdata.h`, confirmed by direct read,
+    /// not an enum constant), rendered as opaque pass-through text, the
+    /// same `MISSILERANGE`/`SKULLSPEED` precedent. `line->frontsector ==
+    /// sec` needs nothing new either: `SectorId` already derives
+    /// `PartialEq`/`Eq`. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against a hand-written `Line`/`SectorId`
+    /// stand-in (`ML_TWOSIDED: i16 = 4`, matching the real macro's own
+    /// value) -- zero errors. `test_get_next_sector_renders_exactly`.
+    #[test]
+    fn test_get_next_sector_renders_exactly() {
+        let params = field_types(&[("line", "&Line"), ("sec", "SectorId")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "getNextSector",
+            &params,
+            Some("Option<SectorId>"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn getNextSector(line: &Line, sec: SectorId) -> Option<SectorId> {
+    if line.flags & ML_TWOSIDED == 0 {
+        return None;
+    }
+    if line.frontsector == sec {
+        return line.backsector;
+    }
+    return Some(line.frontsector);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FindLowestFloorSurrounding`/`P_FindHighestFloorSurrounding`
+    /// (`p_spec.c`) translated -- `getNextSector`'s own direct sibling
+    /// family (same file, same `sec->linecount`/`sec->lines[i]`/
+    /// `getNextSector(check,sec)` for-loop shape `P_RecursiveSound`'s own
+    /// `check`/`other` alias idiom already anticipated), needing **zero**
+    /// new renderer code at all: `render_world_fn` already merges
+    /// `collect_line_sector_aliases` into `extra_cross_ref_idents`
+    /// (`P_RecursiveSound`'s own entry), and that collector's existing
+    /// `Expr::Index{base: Member{field:"lines"}}` -> `"LineId"` and
+    /// `Expr::Call{callee: "getNextSector"}` -> `"Option<SectorId>"` rules
+    /// match this family's `check = sec->lines[i]; other =
+    /// getNextSector(check,sec);` idiom by expression *shape* alone, not
+    /// variable name, so they fire unchanged. `sec->floorheight` (`FixedT`,
+    /// confirmed by direct read of `r_defs.h`) resolves through the wholly
+    /// generic `Expr::Member` fallback (`render_expr`'s own bottom arm)
+    /// once `sec` itself is a registered `"SectorId"` parameter -- no
+    /// `frontsector`-style hand-matched field name needed, since that
+    /// fallback already wraps any cross-ref-typed base in `world[..]`
+    /// generically. `fixed_t floor = sec->floorheight;` (a self-struct-free
+    /// cross-ref field read) and `= -500*FRACUNIT;` (a `FRACUNIT`-scaled
+    /// literal, `expr_is_fixed_t_valued`'s existing `FRACUNIT` recognition
+    /// making the commutative `Mul<FixedT> for i32` resolve the same way
+    /// `4*FRACUNIT` already does) are both already-proven initializer
+    /// shapes needing nothing new. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written
+    /// `Sector`/`Line`/`World`/`FixedT`/stub-`getNextSector` stand-in for
+    /// both functions -- zero errors.
+    /// `test_p_find_lowest_floor_surrounding_renders_exactly`,
+    /// `test_p_find_highest_floor_surrounding_renders_exactly`.
+    ///
+    /// **`P_FindLowestCeilingSurrounding`/`P_FindHighestCeilingSurrounding`
+    /// (same file, same shape) deliberately NOT translated this round**: a
+    /// genuine new gap, confirmed by direct `rustc` reproduction rather
+    /// than assumed -- both declare `fixed_t height = MAXINT;` / `= 0;`,
+    /// initializing a `fixed_t`-declared local straight from an opaque
+    /// macro constant / bare integer literal with no cross-ref or
+    /// `FRACUNIT` involvement at all. `render_decl` has no wrap for this
+    /// shape (only a self-struct-field *write*'s literal RHS gets the
+    /// `FixedT(..)` wrap treatment, e.g. `P_ExplodeMissile`'s own `momz =
+    /// 0;` -- a plain local's own *declaration* initializer is rendered
+    /// wholly inline, never wrapped): the local's Rust type gets fixed by
+    /// its initializer (`i32`, `MAXINT`'s/the literal's own real type),
+    /// then conflicts the moment the loop body assigns a real `FixedT`
+    /// (`world[other.unwrap()].ceilingheight`) into the same binding, or
+    /// `return`s it against the function's own `FixedT` return type --
+    /// confirmed a real `E0308` (not a style nit) with a minimal
+    /// `FixedT`/`MAXINT` stand-in reproducing exactly this shape. Left for
+    /// a future round to design a real fix (an initializer-wrap for
+    /// `fixed_t`-declared locals, mirroring the self-struct-field-write
+    /// wrap but for `render_decl` instead) rather than forced in now.
+    #[test]
+    fn test_p_find_lowest_floor_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindLowestFloorSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindLowestFloorSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut floor = world[sec].floorheight;
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].floorheight < floor {
+            floor = world[other.unwrap()].floorheight;
+        }
+        i += 1;
+    }
+    return floor;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn test_p_find_highest_floor_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindHighestFloorSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindHighestFloorSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut floor = -500 * FRACUNIT;
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].floorheight > floor {
+            floor = world[other.unwrap()].floorheight;
+        }
+        i += 1;
+    }
+    return floor;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FindLowestCeilingSurrounding`/`P_FindHighestCeilingSurrounding`
+    /// (`p_spec.c`) translated -- the two functions the previous entry
+    /// above deliberately left blocked on a `fixed_t`-declared local's own
+    /// declaration initializer needing a `FixedT(..)` wrap when it comes
+    /// from an opaque macro (`MAXINT`) or bare integer literal (`0`), with
+    /// no `FRACUNIT`/cross-ref involvement `expr_is_fixed_t_valued` already
+    /// recognizes. `render_decl` now applies that wrap whenever the
+    /// declared type is `fixed_t` and the initializer isn't already
+    /// `expr_is_fixed_t_valued` -- guarded the same way the pre-existing
+    /// self-struct-field-write wrap already is, so `sec->floorheight`/
+    /// `-500*FRACUNIT`-shaped initializers (the previous entry's own two
+    /// functions) are never double-wrapped; confirmed by re-running their
+    /// own tests unchanged, and the full suite (439/439, no regression)
+    /// since this generalizes `render_decl` itself, not just adds a new
+    /// narrow arm nothing else could hit. Otherwise these two are wholly
+    /// identical in shape to `P_FindLowestFloorSurrounding`/`P_Find
+    /// HighestFloorSurrounding`, needing nothing else new. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Sector`/`Line`/`World`/`FixedT`/stub-
+    /// `getNextSector` stand-in for both -- zero errors.
+    /// `test_p_find_lowest_ceiling_surrounding_renders_exactly`,
+    /// `test_p_find_highest_ceiling_surrounding_renders_exactly`.
+    #[test]
+    fn test_p_find_lowest_ceiling_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindLowestCeilingSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindLowestCeilingSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut height = FixedT(MAXINT);
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].ceilingheight < height {
+            height = world[other.unwrap()].ceilingheight;
+        }
+        i += 1;
+    }
+    return height;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn test_p_find_highest_ceiling_surrounding_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindHighestCeilingSurrounding",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindHighestCeilingSurrounding(sec: SectorId, world: &mut World) -> FixedT {
+    let mut i;
+    let mut check;
+    let mut other;
+    let mut height = FixedT(0);
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        other = getNextSector(check, sec);
+        if other.is_none() {
+            i += 1;
+            continue;
+        }
+        if world[other.unwrap()].ceilingheight > height {
+            height = world[other.unwrap()].ceilingheight;
+        }
+        i += 1;
+    }
+    return height;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FindMinSurroundingLight` (`p_spec.c`) -- `getNextSector`'s
+    /// surrounding-sector-query family's last remaining member (round 6
+    /// deferred it, see this file's own dated entry below), needing a
+    /// genuinely new i16-vs-i32 widening mechanism the earlier
+    /// `P_Find*Surrounding` siblings didn't: `min`'s own C declaration is
+    /// plain `int`, and (unlike `EV_TurnTagLightsOff`'s identically-
+    /// shaped `min`, which needs no cast at all -- Rust's deferred-`let`
+    /// inference settles it as `i16` for free since it's assigned *only*
+    /// from `lightlevel` fields) this one is *first* assigned from `max`
+    /// (a genuine `i32` parameter), forcing Rust to infer it `i32` for the
+    /// rest of the function -- so every later `check->lightlevel`
+    /// comparison/assignment against it is a real `i16`-vs-`i32`
+    /// mismatch, on *both* a comparison and an assignment (not just the
+    /// read-only comparison `EV_StopPlat`'s own `tag` fix already covers).
+    /// `collect_i32_widened_locals` (mirroring `collect_line_sector_
+    /// aliases`'s own "scan once, extend `extra_cross_ref_idents`" shape)
+    /// distinguishes the two cases by their one real structural
+    /// difference: whether the local is *ever* assigned from an
+    /// independently-`i32`-typed identifier (a parameter) anywhere in the
+    /// body, not just its own bare "declared plain `int`" status --
+    /// confirmed this narrower check was actually necessary (not just
+    /// extra caution) by first trying the broader `plain_int_locals`
+    /// version and hitting a real regression against `EV_TurnTagLightsOff`
+    /// 's own already-shipped exact-text test. The comparison-widening arm
+    /// also needed its `as i32` parenthesized (`(.. as i32) < min`, not
+    /// `.. as i32 < min`) -- confirmed a real `rustc` parse rejection
+    /// ("`<` is interpreted as a start of generic arguments"), not
+    /// assumed: `Type as i32 < x` doesn't parse as a comparison at all.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written `Sector`/`Line`/`World`/`FixedT`/stub-
+    /// `getNextSector` stand-ins -- zero errors.
+    #[test]
+    fn test_p_find_min_surrounding_light_renders_exactly() {
+        let params = field_types(&[("sector", "SectorId"), ("max", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_FindMinSurroundingLight",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FindMinSurroundingLight(sector: SectorId, max: i32, world: &mut World) -> i32 {
+    let mut i;
+    let mut min;
+    let mut line;
+    let mut check;
+    min = max;
+    i = 0;
+    while i < world[sector].linecount {
+        line = world[sector].lines[i as usize];
+        check = getNextSector(line, sector);
+        if check.is_none() {
+            i += 1;
+            continue;
+        }
+        if (world[check.unwrap()].lightlevel as i32) < min {
+            min = world[check.unwrap()].lightlevel as i32;
+        }
+        i += 1;
+    }
+    return min;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `twoSided`/`getSide`/`getSector` (`p_spec.c`) -- their own bodies,
+    /// re-investigated and closed out this round (round 6 had only
+    /// confirmed their *call sites*, from already-translated callers like
+    /// `EV_DoFloor`, were fine): all three chain an inline
+    /// `(sectors[param].lines[param])->field` expression with *no*
+    /// intermediate local variable, unlike `getNextSector`/
+    /// `P_RecursiveSound`'s own `check = sec->lines[i]; ... check->field`
+    /// idiom (`collect_line_sector_aliases`'s own shape). The generic
+    /// `Expr::Index` fallback always returned `is_crossref: false` for an
+    /// indexed array-*field* read (unlike the special-cased bare
+    /// `sides[i]`/`sectors[i]` globals) -- confirmed by tracing the real
+    /// AST shape, not assumed -- so a new dedicated arm recognizes
+    /// `Sector.lines: Vec<LineId>` indexing specifically and propagates
+    /// `is_crossref: true`, letting the immediately-following `->field`
+    /// chain (`->flags`/`->sidenum`) resolve through a second `world[...]`
+    /// wrap instead of treating the `LineId` result as if it were already
+    /// a real `Line`. `getSide` additionally needed `&sides[complex_expr]`
+    /// (the `&sectors[i]` idiom's own sibling, generalized to `sides`/
+    /// `SideId`) and a narrowly-scoped `sidenum[side]` index cast: unlike
+    /// `sidenum[side^1]`'s own already-correct no-cast rendering elsewhere
+    /// (`side` there a fresh deferred-`let` local, freely inferred
+    /// `usize`), `side` here is a genuine function *parameter* (fixed
+    /// `i32` by its own declared signature), so the cast is scoped to
+    /// exactly "`sidenum` base *and* a bare-`Ident` index" to leave every
+    /// other `sidenum[..]` shape (a literal, or the `^`-expression) byte-
+    /// for-byte unchanged -- confirmed no regression by running the full
+    /// suite before committing, not assumed safe. `twoSided`'s own return
+    /// type is `int`, but `(...)->flags & ML_TWOSIDED` is `i16`-valued
+    /// (`Line.flags: i16`) -- the `Stmt::Return`-site `as i32` wrap this
+    /// doc's own "Not yet done" list had flagged as needed, now
+    /// implemented (`return_expr_needs_i32_cast`, covering both this
+    /// bitwise-AND-on-`flags` shape and a bare comparison result, see
+    /// `P_PointOnLineSide` just below). Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against hand-written
+    /// `Sector`/`Line`/`Side`/`World` stand-ins -- zero errors.
+    #[test]
+    fn test_two_sided_renders_exactly() {
+        let params = field_types(&[("sector", "i32"), ("line", "i32")]);
+        let rendered = render_world_fn(&corpus_dir(), "p_spec.c", "twoSided", &params, Some("i32"))
+            .expect("should render cleanly");
+        let expected = "\
+pub fn twoSided(sector: i32, line: i32, world: &mut World) -> i32 {
+    return (world[world[SectorId(sector as u32)].lines[line as usize]].flags & ML_TWOSIDED) as i32;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `getSide` (`p_spec.c`) -- see `twoSided`'s own doc comment just
+    /// above for the shared inline-chain `is_crossref` propagation and
+    /// `sidenum[side]` cast this needed. Its own return type is `side_t*`
+    /// -> `SideId` (the existing memory-model decision), built from `&
+    /// sides[(sectors[currentSector].lines[line])->sidenum[side]]` -- the
+    /// new `&sides[complex_expr]` arm (mirroring `&sectors[i]`) strips the
+    /// `&` and wraps the whole index expression in `SideId(.. as u32)`,
+    /// needing no awareness of the index's own complexity since
+    /// `render_expr` already resolves it uniformly.
+    #[test]
+    fn test_get_side_renders_exactly() {
+        let params = field_types(&[("currentSector", "i32"), ("line", "i32"), ("side", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "getSide",
+            &params,
+            Some("SideId"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn getSide(currentSector: i32, line: i32, side: i32, world: &mut World) -> SideId {
+    return SideId(world[world[SectorId(currentSector as u32)].lines[line as usize]].sidenum[side as usize] as u32);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `getSector` (`p_spec.c`) -- `getSide`'s own direct sibling, one
+    /// more `.sector` member chained off the identical `sides[..]` base
+    /// (already `is_crossref: true` from the existing bare-`sides[i]`
+    /// arm), needing nothing beyond what `getSide` already proved.
+    #[test]
+    fn test_get_sector_renders_exactly() {
+        let params = field_types(&[("currentSector", "i32"), ("line", "i32"), ("side", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "getSector",
+            &params,
+            Some("SectorId"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn getSector(currentSector: i32, line: i32, side: i32, world: &mut World) -> SectorId {
+    return world[SideId(world[world[SectorId(currentSector as u32)].lines[line as usize]].sidenum[side as usize] as u32)].sector;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_PointOnLineSide` (`p_maputl.c`) -- closed out this round, the
+    /// "not yet read in full" blocker this doc's own list had carried for
+    /// several rounds. Three genuinely new pieces, all narrower than
+    /// feared once actually read: (1) a `Stmt::Return`-site `as i32` wrap
+    /// (`return_expr_needs_i32_cast`) for a bare comparison result handed
+    /// straight to `return` in an `int`-returning (not `boolean`-
+    /// returning) function -- `return line->dy > 0;` renders as a genuine
+    /// Rust `bool` (`FixedT` derives `PartialOrd`), needing the cast at
+    /// the `return` site itself since `render_binary_operand`'s own
+    /// existing wrap machinery only ever handles an arithmetic *operand*,
+    /// not a whole handed-to-`return` comparison. (2) `!line->dx`/`!line->
+    /// dy`'s own truthiness check hits a real gap the generic `== 0`
+    /// fallback doesn't survive: `Line.dx`/`.dy: FixedT` (`struct_fields.
+    /// rs`), and `FixedT` derives `PartialEq` against itself only, not
+    /// `i32` -- confirmed a real `rustc` rejection with the naive
+    /// translation first, not assumed. Fixed with a new `is_line_dx_dy_
+    /// field` predicate (the `is_self_fixed_t_field`-style "direct field
+    /// known `FixedT`" check, but for a `render_world_fn`-style function
+    /// with no real `self_param`/`self_field_types` at all -- `line` is
+    /// tracked only in `extra_cross_ref_idents`, narrowly scoped to
+    /// exactly `dx`/`dy` by name, the same "no general struct-field-type
+    /// registry for a plain parameter" reasoning `frontsector`/
+    /// `backsector`'s own hand-matched arms already established) feeding
+    /// both this negated-truthiness arm and the existing literal-
+    /// comparison-widening arm. (3) `line->v1->x`/`line->v1->y` -- a real,
+    /// previously undiscovered gap, *not* "resolves for free" as first
+    /// assumed: `Line.v1`/`.v2: VertexId` (a cross-reference index, not an
+    /// inline value), so `world[line].v1.x` doesn't compile at all (`no
+    /// field x on type VertexId`, confirmed directly with `rustc`) without
+    /// a second `world[...]` indirection -- a new hand-matched `v1`/`v2`
+    /// arm (mirroring `frontsector`) closes it, the exact "vertex-
+    /// dereference arm not yet modeled" gap this doc's own list had
+    /// flagged. `dx = (x - line->v1->x)`/`FixedMul(line->dy>>FRACBITS,
+    /// dx)` needed nothing further: `FixedT`'s own `Sub`/`Shr<u32>` impls
+    /// and `FixedMul`'s existing opaque-forward-reference-call rendering
+    /// already cover real `FixedT` arithmetic and the `>>FRACBITS`
+    /// idiom (`runtime::FRACBITS`) unchanged. Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against hand-written
+    /// `Line`/`Vertex`/`World`/`FixedT` stand-ins and a stub `FixedMul` --
+    /// zero errors.
+    #[test]
+    fn test_p_point_on_line_side_renders_exactly() {
+        let params = field_types(&[("x", "FixedT"), ("y", "FixedT"), ("line", "LineId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_maputl.c",
+            "P_PointOnLineSide",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_PointOnLineSide(x: FixedT, y: FixedT, line: LineId, world: &mut World) -> i32 {
+    let mut dx;
+    let mut dy;
+    let mut left;
+    let mut right;
+    if world[line].dx == FixedT(0) {
+        if x <= world[world[line].v1].x {
+            return (world[line].dy > FixedT(0)) as i32;
+        }
+        return (world[line].dy < FixedT(0)) as i32;
+    }
+    if world[line].dy == FixedT(0) {
+        if y <= world[world[line].v1].y {
+            return (world[line].dx < FixedT(0)) as i32;
+        }
+        return (world[line].dx > FixedT(0)) as i32;
+    }
+    dx = x - world[world[line].v1].x;
+    dy = y - world[world[line].v1].y;
+    left = FixedMul(world[line].dy >> FRACBITS, dx);
+    right = FixedMul(dy, world[line].dx >> FRACBITS);
+    if right < left {
+        return 0;
+    }
+    return 1;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `PIT_ChangeSector` (`p_map.c`) -- a `boolean`-returning
+    /// `P_BlockThingsIterator` callback, `PIT_ChangeSector`/`PIT_StompThing`'s
+    /// own family, needing two new by-name global registrations
+    /// (`crushchange`/`nofit`, `world.rs`'s own doc comment) and otherwise
+    /// reusing wholly pre-existing machinery: `P_ThingHeightClip(thing)`
+    /// is already a real translated `boolean`-returning `render_world_fn`
+    /// sibling, called here the same "forward-reference by name" way
+    /// every other cross-function call in this corpus already is;
+    /// `thing->flags &= ~MF_SOLID;` needs nothing new (`UnaryOp::BitNot`
+    /// already renders as Rust's own bitwise `!`, and compound-assign
+    /// through a self field is wholly proven); `thing->height = 0;`/
+    /// `.radius = 0;` reuse the already-shipped `Expr::IntLiteral`-into-
+    /// self-`FixedT`-field wrap (`P_ExplodeMissile`'s own `momz = 0;`
+    /// idiom); `P_DamageMobj(thing,NULL,NULL,10)` needs nothing new either
+    /// -- the existing generic `Expr::Ident("NULL") -> None` arm already
+    /// covers a bare `NULL` argument wherever it appears, not just the
+    /// `specialdata`-assignment shape it was first built for. `mo =
+    /// P_SpawnMobj(..)` / `mo->momx = (P_Random()-P_Random())<<12;`
+    /// reuses `A_BrainExplode`'s own precedent exactly: `momx`/`momy` are
+    /// registered `"FixedT"` in `self_field_types` (Mobj's own field-type
+    /// map, shared between a `self` write and a spawned-local write of
+    /// the same struct shape), so the plain-`i32`-shift-expression RHS
+    /// (no `FixedT` source in it at all) gets wrapped in `FixedT(..)` by
+    /// the same `is_fixed_t_field && !expr_is_fixed_t_valued(rhs, ..)`
+    /// check, needing no renderer changes. `P_RemoveMobj(thing)` is
+    /// confirmed, not assumed, to be genuine self-removal (the first
+    /// draft's own expected string here guessed wrong, treating it as a
+    /// plain opaque call, and the mismatch is what caught it): `thing`
+    /// *is* this callback's own receiver, so `is_self_removal_call`'s
+    /// existing `P_RemoveMobj(mo)` arm (`A_SpawnFly`'s own precedent,
+    /// already proven `P_RemoveMobj` internally calls `P_RemoveThinker`
+    /// on the same object) applies exactly, gaining the function its own
+    /// `handle: Handle<Thinker>` parameter and rendering `thinkers.
+    /// remove(handle)`. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against hand-written `Mobj`/`World`/
+    /// `Handle`/`Arena` stand-ins and stub `P_ThingHeightClip`/
+    /// `P_SetMobjState`/`P_DamageMobj`/`P_SpawnMobj`/`P_Random` matching
+    /// this real call site's own argument shapes -- zero errors.
+    /// `test_pit_change_sector_renders_exactly`.
+    #[test]
+    fn test_pit_change_sector_renders_exactly() {
+        let field_types = field_types(&[
+            ("health", "i32"),
+            ("flags", "i32"),
+            ("radius", "FixedT"),
+            ("height", "FixedT"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+        ]);
+        let rendered = render_bool_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "PIT_ChangeSector",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn PIT_ChangeSector(thing: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) -> bool {
+    let mut mo;
+    if P_ThingHeightClip(thing) {
+        return true;
+    }
+    if thing.health <= 0 {
+        P_SetMobjState(thing, S_GIBS);
+        thing.flags &= !MF_SOLID;
+        thing.height = FixedT(0);
+        thing.radius = FixedT(0);
+        return true;
+    }
+    if (thing.flags & MF_DROPPED) != 0 {
+        thinkers.remove(handle);
+        return true;
+    }
+    if thing.flags & MF_SHOOTABLE == 0 {
+        return true;
+    }
+    world.nofit = true;
+    if world.crushchange && leveltime & 3 == 0 {
+        P_DamageMobj(thing, None, None, 10);
+        mo = P_SpawnMobj(thing.x, thing.y, thing.z + thing.height / 2, MT_BLOOD);
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momx = FixedT(P_Random() - P_Random() << 12); };
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.momy = FixedT(P_Random() - P_Random() << 12); };
+    }
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_RemoveMobj` (`p_mobj.c`) -- the canonical "remove this thing"
+    /// helper every already-translated caller (`PIT_ChangeSector`, and
+    /// `A_SpawnFly`'s own precedent before it) already calls by name.
+    /// `World` gains `itemrespawnque`/`itemrespawntime`/`iquehead`/
+    /// `iquetail` (its own file-scope respawn-queue state, `world.rs`'s
+    /// own doc comment), the same by-name global category `crushchange`/
+    /// `nofit` already established. `P_RemoveThinker((thinker_t*)mobj)` is
+    /// a second, genuinely different self-removal shape: a direct cast of
+    /// the receiver to `thinker_t*`, not `&self->thinker` (`mobj_t`'s own
+    /// embedded `thinker_t thinker;` header is dropped entirely under
+    /// this project's memory model, so there's no `.thinker` field to
+    /// take the address of here) -- `is_self_removal_call` gains a second
+    /// arm recognizing `P_RemoveThinker(Cast(self_param))` alongside its
+    /// existing `P_RemoveThinker(&self_param->thinker)` one.
+    /// `P_UnsetThingPosition`/`S_StopSound` are plain forward-referenced
+    /// calls needing nothing new. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against hand-written `Mobj`/
+    /// `MapThing`/`World`/`Handle`/`Arena` stand-ins and stub
+    /// `P_UnsetThingPosition`/`S_StopSound` matching this real call
+    /// site's own argument shapes -- zero errors.
+    /// `test_p_remove_mobj_renders_exactly`.
+    #[test]
+    fn test_p_remove_mobj_renders_exactly() {
+        let field_types = field_types(&[
+            ("flags", "i32"),
+            ("type", "i32"),
+            ("spawnpoint", "MapThing"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_RemoveMobj",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_RemoveMobj(mobj: &mut Mobj, world: &mut World, handle: Handle<Thinker>, arena: &mut Arena<Thinker>) {
+    if (mobj.flags & MF_SPECIAL) != 0 && mobj.flags & MF_DROPPED == 0 && mobj.r#type != MT_INV && mobj.r#type != MT_INS {
+        world.itemrespawnque[world.iquehead as usize] = mobj.spawnpoint;
+        world.itemrespawntime[world.iquehead as usize] = leveltime;
+        world.iquehead = world.iquehead + 1 & ITEMQUESIZE - 1;
+        if world.iquehead == world.iquetail {
+            world.iquetail = world.iquetail + 1 & ITEMQUESIZE - 1;
+        }
+    }
+    P_UnsetThingPosition(mobj);
+    S_StopSound(mobj);
+    arena.remove(handle);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_LineOpening` (`p_maputl.c`) -- the first function needing
+    /// `World::lines`/`World::vertices` (added this round, alongside the
+    /// four new hand-matched-by-name `FixedT` globals it computes:
+    /// `opentop`/`openbottom`/`openrange`/`lowfloor`). Its own `linedef`
+    /// parameter is a real `&Line` reference (`getNextSector`'s own
+    /// precedent, not the `LineId` a trigger function's own signature
+    /// uses -- this is `render_world_fn`'s shape, no `World` needed to
+    /// resolve the parameter itself, just to resolve the *sectors* it
+    /// points at). `front = linedef->frontsector; back = linedef->
+    /// backsector;` needed one new alias collector
+    /// (`collect_line_sector_aliases`, merged into `render_world_fn`'s
+    /// own `extra_cross_ref_idents` the same way `render_fn_impl` merges
+    /// `target_tracer_aliases`): `front` resolves as a bare `SectorId`
+    /// through wholly pre-existing machinery (the generic `Expr::Member`
+    /// fallback already wraps any `extra_cross_ref_idents`-registered
+    /// cross-ref-typed base in `world[..]`), while `back` -- genuinely
+    /// nullable (`backsector: Option<SectorId>`, corpus-verified,
+    /// `struct_fields.rs`'s own asymmetric mapping) -- needed the
+    /// existing `Option<PlayerId>` unwrap arm generalized to also accept
+    /// `Option<SectorId>` (identical rendering either way, since `World`
+    /// indexes both). `openrange = 0;` needed one more new piece: a bare
+    /// integer literal written into a `World` global (not a self-struct
+    /// field, the only shape `P_ExplodeMissile`'s own `FixedT`-literal
+    /// wrap previously covered) -- `is_world_fixed_t_global` closes it,
+    /// scoped to exactly the six hand-matched-by-name `FixedT` globals
+    /// this module already knows about. `linedef->sidenum[1] == -1`,
+    /// the `if`/`else` single-statement branches, and `openrange =
+    /// opentop - openbottom;` (plain `FixedT - FixedT`, no new runtime
+    /// arithmetic needed at all) all reuse wholly pre-existing machinery.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Line`/`Sector`/`World`/`FixedT`
+    /// stand-in -- zero errors.
+    #[test]
+    fn test_p_line_opening_renders_exactly() {
+        let params = field_types(&[("linedef", "&Line")]);
+        let rendered = render_world_fn(&corpus_dir(), "p_maputl.c", "P_LineOpening", &params, None)
+            .expect("should render cleanly");
+        let expected = "\
+pub fn P_LineOpening(linedef: &Line, world: &mut World) {
+    let mut front;
+    let mut back;
+    if linedef.sidenum[1] == -1 {
+        world.openrange = FixedT(0);
+        return;
+    }
+    front = linedef.frontsector;
+    back = linedef.backsector;
+    if world[front].ceilingheight < world[back.unwrap()].ceilingheight {
+        world.opentop = world[front].ceilingheight;
+    } else {
+        world.opentop = world[back.unwrap()].ceilingheight;
+    }
+    if world[front].floorheight > world[back.unwrap()].floorheight {
+        world.openbottom = world[front].floorheight;
+        world.lowfloor = world[back.unwrap()].floorheight;
+    } else {
+        world.openbottom = world[back.unwrap()].floorheight;
+        world.lowfloor = world[front].floorheight;
+    }
+    world.openrange = world.opentop - world.openbottom;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ZMovement` (`p_mobj.c`) -- a plain self-struct tick function
+    /// (`render_fn`'s existing shape), needing four new, narrowly-scoped
+    /// pieces, none of them speculative -- each measured against this
+    /// real body before being trusted. (1) `mo->player->viewheight`/
+    /// `.deltaviewheight` -- the first read/write *through* a self-struct
+    /// field itself `Option<PlayerId>`-typed (`Mobj.player`, unlike
+    /// `EV_DoLockedDoor`'s own `player_t*` *parameter*): two new,
+    /// deliberately simple `render_expr`/`render_expr_stmt` arms, needing
+    /// no `Arena` borrow-scoping dance at all (`World::players` is a
+    /// plain array, not an arena with a `get`/`get_mut` API, so multiple
+    /// accesses to the same player within one statement's RHS pose no
+    /// Rust borrow conflict the way a `Handle<Thinker>` access would).
+    /// (2) `if (mo->player && ...)` -- the bare, un-negated truthiness
+    /// counterpart of the already-known negated `!mo->player` arm:
+    /// `render_bool_expr` had no arm at all for a bare (not hardcoded
+    /// `"specialdata"`) self-struct `Option<...>`-typed *field*, only a
+    /// bare `Ident` (`linetarget`) -- confirmed a real `render_bool_expr`
+    /// `Err` otherwise, not assumed. (3) `dist < -(delta*3)` --
+    /// `expr_is_fixed_t_valued`'s own `Ident` arm never checked `ctx.
+    /// fixed_t_locals` at all (only self-struct fields/`FRACUNIT`/
+    /// registered parameters), so `delta` (a genuinely `fixed_t`-declared
+    /// local) buried inside a larger arithmetic expression looked *not*
+    /// already `FixedT`-valued, which would have double-wrapped an
+    /// already-real `FixedT` value in `FixedT(..)` a second time -- fixed
+    /// by extending that one `Ident` arm, not by touching the comparison-
+    /// wrap arm itself. (4) `mo->momz < 0`/`== 0`/`> 0` -- a comparison
+    /// between a genuinely `FixedT`-valued self-struct field and a bare
+    /// integer literal, needing its own new, deliberately narrow arm
+    /// (`is_self_fixed_t_field`) rather than a blanket widening of the
+    /// existing `fixed_t_locals`-vs-literal comparison-wrap arm to
+    /// `expr_is_fixed_t_valued` on both sides -- tried first, and a real
+    /// regression, not just extra caution: `T_PlatRaise`'s own already-
+    /// shipped `plat.sector.floorheight == plat.low` compares two
+    /// genuinely `FixedT` values, but `expr_is_fixed_t_valued` has no way
+    /// to recognize a cross-reference *chain* (`plat.sector.floorheight`,
+    /// reached through `Sector`, a different struct than `self_param`'s
+    /// own `Plat`) as already-`FixedT` -- a blanket XOR wrongly wrapped
+    /// that already-correct side a second time, caught by the full test
+    /// suite itself (not inspection) before landing the narrower fix.
+    /// Everything else in the function -- the target-dereference chain
+    /// (`mo->target->x`/`.y`/`.z`, already proven), `Shr<i32>`/`Shl`-free
+    /// `FixedT` arithmetic, the bare unconditional `{ mo->z = ..; }` block
+    /// after an `if` with no `else` (`render_stmt`'s existing bare-
+    /// `Compound` dispatch, `EV_DoFloor`'s own precedent), and every
+    /// opaque macro identifier (`FLOATSPEED`/`GRAVITY`/`VIEWHEIGHT`,
+    /// assumed correctly `FixedT`-typed wherever the real generated crate
+    /// eventually defines them, the same `MISSILERANGE`/`CEILSPEED`
+    /// precedent) -- reused wholly pre-existing machinery. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Mobj`/`World`/`Player`/`Handle`/`Arena`/
+    /// `FixedT` stand-in and stub forward-referenced functions -- zero
+    /// errors. 420/420 tests passing.
+    #[test]
+    fn test_p_zmovement_renders_exactly() {
+        let field_types = field_types(&[
+            ("player", "Option<PlayerId>"),
+            ("z", "FixedT"),
+            ("floorz", "FixedT"),
+            ("ceilingz", "FixedT"),
+            ("momz", "FixedT"),
+            ("height", "FixedT"),
+            ("flags", "i32"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_ZMovement",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ZMovement(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {
+    let mut dist;
+    let mut delta;
+    if mo.player.is_some() && mo.z < mo.floorz {
+        world[mo.player.unwrap()].viewheight -= mo.floorz - mo.z;
+        world[mo.player.unwrap()].deltaviewheight = VIEWHEIGHT - world[mo.player.unwrap()].viewheight >> 3;
+    }
+    mo.z += mo.momz;
+    if (mo.flags & MF_FLOAT) != 0 && mo.target.is_some() {
+        if mo.flags & MF_SKULLFLY == 0 && mo.flags & MF_INFLOAT == 0 {
+            dist = P_AproxDistance(mo.x - match thinkers.get(mo.target.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, mo.y - match thinkers.get(mo.target.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });
+            delta = match thinkers.get(mo.target.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + (mo.height >> 1) - mo.z;
+            if delta < FixedT(0) && dist < -(delta * 3) {
+                mo.z -= FLOATSPEED;
+            } else {
+                if delta > FixedT(0) && dist < delta * 3 {
+                    mo.z += FLOATSPEED;
+                }
+            }
+        }
+    }
+    if mo.z <= mo.floorz {
+        if (mo.flags & MF_SKULLFLY) != 0 {
+            mo.momz = -mo.momz;
+        }
+        if mo.momz < FixedT(0) {
+            if mo.player.is_some() && mo.momz < -GRAVITY * 8 {
+                world[mo.player.unwrap()].deltaviewheight = mo.momz >> 3;
+                S_StartSound(mo, sfx_oof);
+            }
+            mo.momz = FixedT(0);
+        }
+        mo.z = mo.floorz;
+        if (mo.flags & MF_MISSILE) != 0 && mo.flags & MF_NOCLIP == 0 {
+            P_ExplodeMissile(mo);
+            return;
+        }
+    } else {
+        if mo.flags & MF_NOGRAVITY == 0 {
+            if mo.momz == FixedT(0) {
+                mo.momz = -GRAVITY * 2;
+            } else {
+                mo.momz -= GRAVITY;
+            }
+        }
+    }
+    if mo.z + mo.height > mo.ceilingz {
+        if mo.momz > FixedT(0) {
+            mo.momz = FixedT(0);
+        }
+        mo.z = mo.ceilingz - mo.height;
+        if (mo.flags & MF_SKULLFLY) != 0 {
+            mo.momz = -mo.momz;
+        }
+        if (mo.flags & MF_MISSILE) != 0 && mo.flags & MF_NOCLIP == 0 {
+            P_ExplodeMissile(mo);
+            return;
+        }
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_RecursiveSound` (`p_enemy.c`) -- `render_world_fn`'s existing
+    /// shape (`sec: SectorId, soundblocks: i32`, no self-struct, no
+    /// `Arena` access at all), needing three new, narrowly-scoped
+    /// pieces. (1) `validcount`/`soundtarget` -- two new hand-matched-by-
+    /// name `World` globals (`p_setup.c`'s own file-scope flood-fill
+    /// generation counter and `p_enemy.c`'s own file-scope `mobj_t*
+    /// soundtarget;`), the same category `viletryx`/`linetarget` already
+    /// established -- `sec->validcount == validcount` needed no new
+    /// rendering machinery at all (a `Sector` *field* named `validcount`
+    /// and this bare *global* of the same name are rendered through
+    /// entirely separate code paths, `Expr::Member` vs. `Expr::Ident`, so
+    /// there's no collision risk despite sharing a name). (2) `check =
+    /// sec->lines[i];`/`other = sides[check->sidenum[1]].sector;` --
+    /// `collect_line_sector_aliases` (`P_LineOpening`'s own collector)
+    /// gains two more recognized shapes: indexing a `Vec<LineId>` field
+    /// (`Sector.lines`) registers the result as `"LineId"`, and the
+    /// existing dedicated `sides[i].sector` rendering shape is now also
+    /// recognized as an alias *source* (`"SectorId"`), not just a
+    /// rendering target. `sec->lines[i]` also needed the by-name `as
+    /// usize` index-cast list extended to `field == "lines"`, since `i`
+    /// (a fresh loop counter that Rust *could* otherwise freely infer as
+    /// `usize`) is also compared against `sec->linecount` (a genuine
+    /// `i32` field) in the same loop header, so it must stay `i32`
+    /// throughout. (3) `openrange <= 0` -- `is_self_fixed_t_field` (the
+    /// narrow literal-comparison-wrap arm `P_ZMovement`'s own entry
+    /// added) widened to also recognize a bare `World`-global `FixedT`
+    /// identifier, not just a self-struct field, closing this gap for
+    /// both categories with the identical safe-by-construction reasoning.
+    /// Everything else (`P_LineOpening`'s own forward-referenced call,
+    /// the negated-non-comparison-`Binary` truthiness for `!(check->
+    /// flags & ML_TWOSIDED)`, the `for`-loop-to-`while` translation with
+    /// its own `continue`-hoists-the-step handling, the recursive self-
+    /// call using the original C argument list) reused wholly pre-
+    /// existing machinery. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against a hand-written `Sector`/`Side`/
+    /// `Line`/`World`/`FixedT` stand-in and a stub `P_LineOpening`
+    /// matching its own real signature -- zero errors. `test_p_recursive_
+    /// sound_renders_exactly`. 421/421 tests passing.
+    #[test]
+    fn test_p_recursive_sound_renders_exactly() {
+        let params = field_types(&[("sec", "SectorId"), ("soundblocks", "i32")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_enemy.c",
+            "P_RecursiveSound",
+            &params,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_RecursiveSound(sec: SectorId, soundblocks: i32, world: &mut World) {
+    let mut i;
+    let mut check;
+    let mut other;
+    if world[sec].validcount == world.validcount && world[sec].soundtraversed <= soundblocks + 1 {
+        return;
+    }
+    world[sec].validcount = world.validcount;
+    world[sec].soundtraversed = soundblocks + 1;
+    world[sec].soundtarget = world.soundtarget;
+    i = 0;
+    while i < world[sec].linecount {
+        check = world[sec].lines[i as usize];
+        if world[check].flags & ML_TWOSIDED == 0 {
+            i += 1;
+            continue;
+        }
+        P_LineOpening(check);
+        if world.openrange <= FixedT(0) {
+            i += 1;
+            continue;
+        }
+        if world[SideId(world[check].sidenum[0] as u32)].sector == sec {
+            other = world[SideId(world[check].sidenum[1] as u32)].sector;
+        } else {
+            other = world[SideId(world[check].sidenum[0] as u32)].sector;
+        }
+        if (world[check].flags & ML_SOUNDBLOCK) != 0 {
+            if soundblocks == 0 {
+                P_RecursiveSound(other, 1);
+            }
+        } else {
+            P_RecursiveSound(other, soundblocks);
+        }
+        i += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_NoiseAlert` (`p_enemy.c`) -- a small, three-statement
+    /// `render_world_fn` body, needing one new piece and one new
+    /// signature capability, both closing out gaps `P_RecursiveSound`'s
+    /// own entry above left open. (1) `emmiter->subsector->sector` --
+    /// the existing `actor->subsector->sector` dedicated `Expr::Member`
+    /// arm (`A_Look`'s own precedent) widened to also match a bare
+    /// `Handle<Thinker>`-registered *parameter* (not just `self_param`,
+    /// which this shape has none of) as the `subsector`'s own base --
+    /// the rendered `base` text already resolves correctly either way
+    /// (through the pre-existing bare-`Handle<Thinker>` `Member` arm,
+    /// `A_Punch`'s own precedent, generalized to any registered
+    /// identifier, not just a self-struct field), so only the guard
+    /// needed widening. (2) `render_world_fn` gains its own conditional
+    /// `thinkers: &Arena<Thinker>` parameter (mirroring `render_fn_impl`'s
+    /// `needs_target_deref`), added only once a real body dereferences
+    /// through a registered `"Handle<Thinker>"` parameter -- a no-op for
+    /// every earlier `render_world_fn` caller (`P_LineOpening`/
+    /// `T_MovePlane`/`P_RecursiveSound`), none of which have one.
+    /// `soundtarget = target;` needed one more new wrap combination
+    /// (`lhs_is_option_handle_global && rhs_is_handle_local`): assigning
+    /// a bare `Handle<Thinker>`-registered *parameter* (not `self_param`
+    /// itself, the only source `lhs_is_option_handle_global`'s own
+    /// `rhs_is_self` arm covered before) into the hand-matched-by-name
+    /// `Option<Handle<Thinker>>` global -- the same `Some(..)` wrap every
+    /// other bare-handle-into-`Option`-slot write in this module already
+    /// gets, just for this one more real pairing. `validcount++;` needed
+    /// nothing new at all: the existing generic standalone `PostIncDec`
+    /// arm already renders through any bare identifier's own `Expr::Ident`
+    /// rename, `validcount`'s included. Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against a hand-written
+    /// `World`/`Handle`/`Arena`/`Thinker`/`Mobj`/`Subsector`/`Sector`
+    /// stand-in and a stub `P_RecursiveSound` matching its own real call
+    /// site's argument shape -- zero errors. `test_p_noise_alert_renders_
+    /// exactly`. 422/422 tests passing.
+    #[test]
+    fn test_p_noise_alert_renders_exactly() {
+        let params = field_types(&[
+            ("target", "Handle<Thinker>"),
+            ("emmiter", "Handle<Thinker>"),
+        ]);
+        let rendered = render_world_fn(&corpus_dir(), "p_enemy.c", "P_NoiseAlert", &params, None)
+            .expect("should render cleanly");
+        let expected = "\
+pub fn P_NoiseAlert(target: Handle<Thinker>, emmiter: Handle<Thinker>, world: &mut World, thinkers: &Arena<Thinker>) {
+    world.soundtarget = Some(target);
+    world.validcount += 1;
+    P_RecursiveSound(world[match thinkers.get(emmiter) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector, 0);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_TurnTagLightsOff` (`p_lights.c`) -- the function whose own
+    /// `sector = sectors; for (j=0;j<numsectors;j++,sector++)` idiom this
+    /// round's earlier `World.lines`/`.vertices` entry left as an
+    /// explicitly investigated, deliberately not-yet-designed blocker.
+    /// `is_sector_walk_priming`/`is_sector_walk_for` (mirroring
+    /// `is_thinker_list_scan_init`/`_for`'s own two-statement-lookahead
+    /// shape) recognize the whole pair and render it as one ordinary
+    /// counted loop over `world.sectors.len()`, with `FnBodyContext::
+    /// sector_walk_alias` resolving every bare reference to the pointer-
+    /// local as `SectorId({counter} as u32)` directly -- the same "the
+    /// pointer already *is* the index" reasoning `sec-sectors`'s own
+    /// pointer-arithmetic special case established, just resolved per-
+    /// reference instead of via arithmetic, and needing no real advance
+    /// of its own (`sector++`'s own comma-step half is simply dropped,
+    /// `render_sector_walk_for` constructs a synthetic single-part step
+    /// for `render_for` to reuse unchanged). Its own declaration (`sector_
+    /// t* sector;`) is dropped the same way `currentthinker`'s already
+    /// is. `sector->lines[i]` and `getNextSector(templine,sector)` reuse
+    /// the alias-collector extensions `P_RecursiveSound`'s own entry
+    /// above just added (`templine` registers `"LineId"`), but `tsec =
+    /// getNextSector(..)` needed one more: a new by-callee-name rule
+    /// registering a local assigned from `getNextSector`'s own real
+    /// `Option<SectorId>` return, plus `is_option_valued`'s own `Ident`
+    /// arm widened to recognize `"Option<SectorId>"` alongside its
+    /// existing `Option<PlayerId>`/`Option<Handle<Thinker>>` pair --
+    /// `if (!tsec) continue;` needed exactly this to render `tsec.is_
+    /// none()` rather than failing outright. `min`'s own plain-`int`
+    /// declaration needs no cast at all despite `Sector.lightlevel`
+    /// being `i16`, not `i32`: Rust's ordinary deferred-`let` inference
+    /// settles it as `i16` from its own consistent uses (assigned from
+    /// and compared against `lightlevel` throughout, never mixed with a
+    /// real `i32`), the same "resolves for free" precedent `prestep`/
+    /// `x`/`y`/`z` already established elsewhere. Verified compiling for
+    /// real (`rustc --edition 2021 --crate-type lib`) against a hand-
+    /// written `Sector`/`Line`/`World`/stub-`getNextSector` stand-in --
+    /// zero errors. `test_ev_turn_tag_lights_off_renders_exactly`.
+    /// 423/423 tests passing.
+    #[test]
+    fn test_ev_turn_tag_lights_off_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_lights.c",
+            "EV_TurnTagLightsOff",
+            &params,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_TurnTagLightsOff(line: &Line, world: &mut World) {
+    let mut i;
+    let mut j;
+    let mut min;
+    let mut tsec;
+    let mut templine;
+    j = 0;
+    while j < world.sectors.len() as i32 {
+        if world[SectorId(j as u32)].tag == line.tag {
+            min = world[SectorId(j as u32)].lightlevel;
+            i = 0;
+            while i < world[SectorId(j as u32)].linecount {
+                templine = world[SectorId(j as u32)].lines[i as usize];
+                tsec = getNextSector(templine, SectorId(j as u32));
+                if tsec.is_none() {
+                    i += 1;
+                    continue;
+                }
+                if world[tsec.unwrap()].lightlevel < min {
+                    min = world[tsec.unwrap()].lightlevel;
+                }
+                i += 1;
+            }
+            world[SectorId(j as u32)].lightlevel = min;
+        }
+        j += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_LightTurnOn` (`p_lights.c`, `EV_TurnTagLightsOff`'s own direct
+    /// sibling) -- reuses that function's `sector`-walk mechanism
+    /// (`is_sector_walk_priming`/`is_sector_walk_for`/`FnBodyContext::
+    /// sector_walk_alias`) verbatim, closing round 6's own "narrower,
+    /// newly-identified gap" entry with *zero* further renderer changes
+    /// beyond this round's own `lightlevel`-vs-`i32` mechanism: unlike
+    /// `P_FindMinSurroundingLight`'s own local (needing the new
+    /// `collect_i32_widened_locals` pre-scan to distinguish it from
+    /// `EV_TurnTagLightsOff`'s identically-shaped, non-widened `min`),
+    /// `bright` is a genuine function *parameter* -- already registered
+    /// `"i32"` in `extra_cross_ref_idents` directly from `param_types.
+    /// clone()` (`render_world_fn`'s own existing first line), with no
+    /// pre-scan needed at all. All three of its own real mismatch sites
+    /// render correctly on the very first attempt: the read-direction
+    /// comparison/assignment (`if (temp->lightlevel > bright) bright =
+    /// temp->lightlevel;`, the identical shape `P_FindMinSurroundingLight`
+    /// just proved) *and* the reverse-direction narrowing write
+    /// (`sector->lightlevel = bright;`, `lhs_is_lightlevel_field &&
+    /// rhs_is_plain_i32_ident -> as i16`, proven for the first time here --
+    /// sound specifically because `bright` only ever holds a value that
+    /// itself came from an `i16` `lightlevel` field or a small literal).
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against the same hand-written `Sector`/`Line`/`World`/stub-
+    /// `getNextSector` stand-ins as `P_FindMinSurroundingLight` -- zero
+    /// errors.
+    #[test]
+    fn test_ev_light_turn_on_renders_exactly() {
+        let params = field_types(&[("line", "&Line"), ("bright", "i32")]);
+        let rendered =
+            render_world_fn(&corpus_dir(), "p_lights.c", "EV_LightTurnOn", &params, None)
+                .expect("should render cleanly");
+        let expected = "\
+pub fn EV_LightTurnOn(line: &Line, mut bright: i32, world: &mut World) {
+    let mut i;
+    let mut j;
+    let mut temp;
+    let mut templine;
+    i = 0;
+    while i < world.sectors.len() as i32 {
+        if world[SectorId(i as u32)].tag == line.tag {
+            if bright == 0 {
+                j = 0;
+                while j < world[SectorId(i as u32)].linecount {
+                    templine = world[SectorId(i as u32)].lines[j as usize];
+                    temp = getNextSector(templine, SectorId(i as u32));
+                    if temp.is_none() {
+                        j += 1;
+                        continue;
+                    }
+                    if (world[temp.unwrap()].lightlevel as i32) > bright {
+                        bright = world[temp.unwrap()].lightlevel as i32;
+                    }
+                    j += 1;
+                }
+            }
+            world[SectorId(i as u32)].lightlevel = bright as i16;
+        }
+        i += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ActivateInStasis` (`p_plats.c`) -- the first function
+    /// dereferencing *through* a `Handle<Thinker>` stored in one of the
+    /// two global "active movers" arrays (`activeplats`/`activeceilings`,
+    /// `P_AddActivePlat`/`P_AddActiveCeiling`'s own arrays, previously
+    /// only ever compared against `None`/assigned a fresh handle, never
+    /// read/written *through*). `active_array_variant` (hand-matched by
+    /// array name, the same style `sides`/`sectors` already established
+    /// for their own dedicated `Expr::Index` arms) resolves which
+    /// `Thinker` variant and bound match-arm name (`Plat`/`p`,
+    /// `Ceiling`/`c`) a dereference needs; a bare `activeplats[i]` used
+    /// for truthiness (`is_option_valued`'s own new `Expr::Index` arm)
+    /// gets `.is_some()`, matching `P_AddActivePlat`'s own established
+    /// `Option<Handle<Thinker>>`-array semantics. Each field read gets a
+    /// fresh `thinkers.get(..)` call at its own point of use (the same
+    /// per-access-borrow discipline `mutating_handle`'s own read arm
+    /// already established), *except* when the read is of a *different*
+    /// field of the exact same handle a sibling write in the same
+    /// statement already holds mutably (`(activeplats[i])->status =
+    /// (activeplats[i])->oldstatus;`) -- reusing `same_handle_write`
+    /// (keyed here by the fixed bound name, `"p"`/`"c"`, rather than a
+    /// bare identifier) avoids a real overlapping-borrow rejection a
+    /// naive second `thinkers.get(..)` inside the write's own `get_mut`
+    /// block would hit. `(activeplats[i])->thinker.function.acp1 =
+    /// (actionf_p1) T_PlatRaise;` is discarded entirely (`is_active_
+    /// array_function_pointer_assign`, a new `render_stmt` arm returning
+    /// an empty `Vec`): the enum variant tag already fixes which function
+    /// a `Plat` dispatches to, so reassigning the function pointer
+    /// changes nothing real in the translated design -- confirmed by
+    /// `T_PlatRaise`'s own already-translated `in_stasis => {}` no-op
+    /// arm, which already makes "the tick function is skipped entirely"
+    /// and "the tick function runs but does nothing" behaviorally
+    /// identical. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Plat`/`World`/`Handle`/
+    /// `Arena`/`Thinker` stand-in -- zero errors. `test_p_activate_in_stasis_renders_exactly`.
+    #[test]
+    fn test_p_activate_in_stasis_renders_exactly() {
+        let params = field_types(&[("tag", "i32")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "P_ActivateInStasis",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ActivateInStasis(tag: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut i;
+    i = 0;
+    while i < MAXPLATS {
+        if world.activeplats[i as usize].is_some() && match thinkers.get(world.activeplats[i as usize].unwrap()) { Some(Thinker::Plat(p)) => p.tag, _ => unreachable!() } == tag && match thinkers.get(world.activeplats[i as usize].unwrap()) { Some(Thinker::Plat(p)) => p.status, _ => unreachable!() } == in_stasis {
+            if let Some(Thinker::Plat(p)) = thinkers.get_mut(world.activeplats[i as usize].unwrap()) { p.status = p.oldstatus; };
+        }
+        i += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_StopPlat` (`p_plats.c`) -- `P_ActivateInStasis`'s own sibling
+    /// (pausing rather than resuming), needing exactly one new piece:
+    /// `(activeplats[j])->tag == line->tag` is a genuine `i16`-vs-`i32`
+    /// mismatch, the same category `EV_LightTurnOn`'s own deferred
+    /// blocker is (see `docs/03_TRANSPILER.md`), but one-directional and
+    /// narrowly scoped here (a read-only comparison, never written back):
+    /// `plat_t.tag` is plain `int` (`i32`, confirmed by direct read of
+    /// `p_spec.h`), while `line_t.tag` is `i16` (`struct_fields.rs`'s own
+    /// mapping) -- a new, narrowly-scoped `Expr::Binary` arm (checked
+    /// before the generic fallback) widens `line`'s own `i16` side with
+    /// an explicit `as i32` (always lossless, matching C's own implicit
+    /// int promotion here). Everything else reuses `P_ActivateInStasis`'s
+    /// own machinery unchanged: `(activeplats[j])->status != in_stasis`
+    /// (a plain `i32`-vs-`i32` comparison, no cast), the two-field same-
+    /// handle write (`oldstatus = status`), a plain-literal-RHS write
+    /// (`status = in_stasis`), and the discarded function-pointer-null
+    /// reassignment. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Plat`/`Line`/`World`/
+    /// `Handle`/`Arena`/`Thinker` stand-in -- zero errors. `test_ev_stop_plat_renders_exactly`.
+    #[test]
+    fn test_ev_stop_plat_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "EV_StopPlat",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_StopPlat(line: &Line, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut j;
+    j = 0;
+    while j < MAXPLATS {
+        if world.activeplats[j as usize].is_some() && match thinkers.get(world.activeplats[j as usize].unwrap()) { Some(Thinker::Plat(p)) => p.status, _ => unreachable!() } != in_stasis && match thinkers.get(world.activeplats[j as usize].unwrap()) { Some(Thinker::Plat(p)) => p.tag, _ => unreachable!() } == line.tag as i32 {
+            if let Some(Thinker::Plat(p)) = thinkers.get_mut(world.activeplats[j as usize].unwrap()) { p.oldstatus = p.status; };
+            if let Some(Thinker::Plat(p)) = thinkers.get_mut(world.activeplats[j as usize].unwrap()) { p.status = in_stasis; };
+        }
+        j += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ActivateInStasisCeiling` (`p_ceilng.c`) -- `P_ActivateInStasis`'s
+    /// own exact twin, one `Thinker` variant over (`Ceiling`/`c`,
+    /// `activeceilings`), including the same `i16`-vs-`i32` `tag`
+    /// comparison `EV_StopPlat` needed (`ceiling_t.tag` is plain `int`
+    /// too, confirmed by direct read of `p_spec.h`). The whole `for`
+    /// loop's body is wrapped in its own extra (redundant, but present in
+    /// the real corpus) `{ }` block this time, needing no new rendering
+    /// at all: `render_block`'s existing `Stmt::Compound` arm already
+    /// renders a nested compound at the *same* depth its own caller
+    /// passed in, so the output is identical either way. No other new
+    /// mechanism needed. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against a hand-written `Ceiling`/`Line`/
+    /// `World`/`Handle`/`Arena`/`Thinker` stand-in -- zero errors. `test_p_activate_in_stasis_ceiling_renders_exactly`.
+    #[test]
+    fn test_p_activate_in_stasis_ceiling_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "P_ActivateInStasisCeiling",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ActivateInStasisCeiling(line: &Line, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut i;
+    i = 0;
+    while i < MAXCEILINGS {
+        if world.activeceilings[i as usize].is_some() && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.tag, _ => unreachable!() } == line.tag as i32 && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.direction, _ => unreachable!() } == 0 {
+            if let Some(Thinker::Ceiling(c)) = thinkers.get_mut(world.activeceilings[i as usize].unwrap()) { c.direction = c.olddirection; };
+        }
+        i += 1;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `EV_CeilingCrushStop` (`p_ceilng.c`) -- `EV_StopPlat`'s own
+    /// `Ceiling`-shaped twin, `int`-returning (`0`/`1`, matching a plain
+    /// `boolean`-style result the original spells as a bare `int`) via
+    /// `render_trigger_fn`'s existing `return_type` parameter, needing no
+    /// new mechanism beyond what `P_ActivateInStasisCeiling`/`EV_StopPlat`
+    /// already established: a plain `int rtn` local (unrelated to any
+    /// thinker/array machinery) assigned `0`/`1` and returned normally,
+    /// `direction != 0` (no cast -- both `i32`), and a plain-literal-RHS
+    /// same-array write (`direction = 0`) alongside the same-handle write
+    /// (`olddirection = direction`) and the discarded function-pointer-
+    /// null reassignment. Verified compiling for real (`rustc --edition
+    /// 2021 --crate-type lib`) against the same stand-ins as its sibling
+    /// -- zero errors. `test_ev_ceiling_crush_stop_renders_exactly`.
+    #[test]
+    fn test_ev_ceiling_crush_stop_renders_exactly() {
+        let params = field_types(&[("line", "&Line")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "EV_CeilingCrushStop",
+            &params,
+            &HashMap::new(),
+            None,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn EV_CeilingCrushStop(line: &Line, world: &mut World, thinkers: &mut Arena<Thinker>) -> i32 {
+    let mut i;
+    let mut rtn;
+    rtn = 0;
+    i = 0;
+    while i < MAXCEILINGS {
+        if world.activeceilings[i as usize].is_some() && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.tag, _ => unreachable!() } == line.tag as i32 && match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.direction, _ => unreachable!() } != 0 {
+            if let Some(Thinker::Ceiling(c)) = thinkers.get_mut(world.activeceilings[i as usize].unwrap()) { c.olddirection = c.direction; };
+            if let Some(Thinker::Ceiling(c)) = thinkers.get_mut(world.activeceilings[i as usize].unwrap()) { c.direction = 0; };
+            rtn = 1;
+        }
+        i += 1;
+    }
+    return rtn;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GiveBody` (`p_inter.c`) -- opens a fresh function family this
+    /// round's own task brief flagged as promising: `player_t*`-shaped
+    /// pickup/give helpers, `render_fn`/`render_bool_fn`'s existing
+    /// single-self-struct-receiver shape, just with `Player` as the
+    /// self-struct instead of every earlier caller's `Mobj` (`player_t`
+    /// still isn't struct-mapped in `struct_fields.rs`, so `self_field_
+    /// types` is hand-supplied directly, the same as `render_weapon_fn`'s
+    /// own `player_field_types`). `boolean`-returning *and* a second
+    /// plain-scalar parameter (`num`) at once needed a new, third thin
+    /// `render_fn_impl` wrapper (`render_bool_fn_with_scalar_param`),
+    /// neither `render_bool_fn` nor `render_fn_with_scalar_param` alone
+    /// covering the combination. **The real new capability**:
+    /// `player->mo->health = player->health;` writes *through* `player`'s
+    /// own bare (non-`Option`) `Handle<Thinker>` field (`mo`,
+    /// `is_self_bare_handle_field`'s own shape) -- every earlier `render_
+    /// fn`/`render_bool_fn` caller has been `Mobj`-shaped, whose own bare-
+    /// handle fields (`target`/`tracer`) are `Option`-wrapped and already
+    /// covered by `needs_target_deref`/`needs_target_write`, so `render_
+    /// fn_impl` itself never computed the plain-bare-field version at all
+    /// (only `render_weapon_fn` had, for this exact `player.mo` shape).
+    /// Two new flags (`needs_self_handle_field_deref`/`_write`) reuse
+    /// `render_weapon_fn`'s own already-generic `body_has_self_handle_
+    /// field_deref`/`body_has_self_handle_write` helpers verbatim (both
+    /// already parameterized over `self_param`/`self_field_types`, no
+    /// player-specific assumption in either), folded into the same
+    /// `thinkers_part` decision `needs_target_deref`/`_write` already
+    /// drive. Confirmed necessary, not just anticipated, by hand-tracing:
+    /// without it, the generated signature would omit `thinkers` entirely
+    /// even though the body calls straight through it. Verified compiling
+    /// for real (`rustc --edition 2021 --crate-type lib`) against a hand-
+    /// written `Player`/`Mobj`/`World`/`Handle`/`Arena`/`Thinker` stand-in
+    /// -- zero errors. `test_p_give_body_renders_exactly`.
+    #[test]
+    fn test_p_give_body_renders_exactly() {
+        let field_types = field_types(&[("health", "i32"), ("mo", "Handle<Thinker>")]);
+        let rendered = render_bool_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveBody",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveBody(player: &mut Player, num: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> bool {
+    if player.health >= MAXHEALTH {
+        return false;
+    }
+    player.health += num;
+    if player.health > MAXHEALTH {
+        player.health = MAXHEALTH;
+    }
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.health = player.health; };
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GiveArmor` (`p_inter.c`) -- `P_GiveBody`'s own plainer sibling,
+    /// touching no `Handle<Thinker>` at all (`armorpoints`/`armortype`
+    /// are both plain `i32` fields), so `thinkers` is correctly omitted
+    /// from the generated signature entirely -- confirming `needs_self_
+    /// handle_field_deref`/`_write` (just added for `P_GiveBody`) stay
+    /// `false` here rather than over-triggering. `hits` (a plain local,
+    /// unrelated to `armortype` the *field*) needed nothing new.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Player`/`World` stand-in -- zero
+    /// errors. `test_p_give_armor_renders_exactly`.
+    #[test]
+    fn test_p_give_armor_renders_exactly() {
+        let field_types = field_types(&[("armorpoints", "i32"), ("armortype", "i32")]);
+        let rendered = render_bool_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveArmor",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveArmor(player: &mut Player, armortype: i32, world: &mut World) -> bool {
+    let mut hits;
+    hits = armortype * 100;
+    if player.armorpoints >= hits {
+        return false;
+    }
+    player.armortype = armortype;
+    player.armorpoints = hits;
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GiveCard` (`p_inter.c`) -- two new small pieces, both around
+    /// `cards`, a genuine Rust `bool` array (`struct_fields.rs`'s own
+    /// mapping): (1) `if (player->cards[card]) return;` is a bare, non-
+    /// negated index into it used for truthiness -- the un-negated
+    /// sibling of `!player->cards[idx]`'s own already-correct plain-`!`
+    /// fallback (already proven via `EV_DoLockedDoor`/`EV_VerticalDoor`),
+    /// never needed bare until this first real corpus example; a new
+    /// `render_bool_expr` arm (checked before the generic `Expr::Index`
+    /// `!= 0` fallback, which would otherwise wrongly apply plain-`int`
+    /// truthiness to an already-`bool` value) renders it with no cast at
+    /// all. (2) `player->cards[card] = 1;` writes a plain `int` literal
+    /// into that same `bool` array element -- C's own `int`-as-`boolean`
+    /// idiom, the same "one value, two different real types" gap
+    /// `FixedT`'s own literal-into-field wrap already closes for
+    /// `fixed_t`, just mapping a literal `1`/`0` to `true`/`false`
+    /// instead (any other literal fails loudly, no real corpus site needs
+    /// it). `cards` also joined the by-name `as usize` index-cast list
+    /// (`powers`/`lines`'s own sibling): `card`'s own declared type is a
+    /// fixed function *parameter* (`card_t`, `i32`), not a local Rust
+    /// could freely infer as `usize` here the way `sidenum[side^1]`'s
+    /// fresh local is. `BONUSADD` (a `#define`d macro) needed nothing new,
+    /// same opaque-passthrough precedent as `MISSILERANGE`. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Player`/`World` stand-in -- zero errors.
+    /// `test_p_give_card_renders_exactly`.
+    #[test]
+    fn test_p_give_card_renders_exactly() {
+        let field_types = field_types(&[("cards", "[bool; NUMCARDS]"), ("bonuscount", "i32")]);
+        let rendered = render_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveCard",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveCard(player: &mut Player, card: i32, world: &mut World) {
+    if player.cards[card as usize] {
+        return;
+    }
+    player.bonuscount = BONUSADD;
+    player.cards[card as usize] = true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GivePower` (`p_inter.c`) -- a longer, flatter chain of `if`
+    /// blocks, each returning early, needing no new mechanism at all
+    /// beyond what `P_GiveBody`/`P_GivePower`'s own siblings already
+    /// established: `player->powers[power] = ..;` (the plain-`i32`
+    /// sibling of `cards`, already `as usize`-cast by name), `player->
+    /// mo->flags |= MF_SHADOW;` (a *compound*-assign write through the
+    /// same bare-`Handle<Thinker>` `mo` field `P_GiveBody`'s own write
+    /// arm already renders, `render_assign_op` already general over any
+    /// operator), and `P_GiveBody (player, 100);` -- a forward-referenced
+    /// call using `P_GiveBody`'s *original* two-argument C signature, the
+    /// same already-documented cross-function-wiring gap every other such
+    /// call in this module has (its real translated signature has grown
+    /// two more parameters). Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written `Player`/
+    /// `Mobj`/`World`/`Handle`/`Arena`/`Thinker` stand-in and a stub
+    /// `P_GiveBody` matching this call site's own original argument shape
+    /// -- zero errors. `test_p_give_power_renders_exactly`.
+    #[test]
+    fn test_p_give_power_renders_exactly() {
+        let field_types = field_types(&[("powers", "[i32; NUMPOWERS]"), ("mo", "Handle<Thinker>")]);
+        let rendered = render_bool_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GivePower",
+            "Player",
+            &field_types,
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GivePower(player: &mut Player, power: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> bool {
+    if power == pw_invulnerability {
+        player.powers[power as usize] = INVULNTICS;
+        return true;
+    }
+    if power == pw_invisibility {
+        player.powers[power as usize] = INVISTICS;
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.flags |= MF_SHADOW; };
+        return true;
+    }
+    if power == pw_infrared {
+        player.powers[power as usize] = INFRATICS;
+        return true;
+    }
+    if power == pw_ironfeet {
+        player.powers[power as usize] = IRONTICS;
+        return true;
+    }
+    if power == pw_strength {
+        P_GiveBody(player, 100);
+        player.powers[power as usize] = 1;
+        return true;
+    }
+    if player.powers[power as usize] != 0 {
+        return false;
+    }
+    player.powers[power as usize] = 1;
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_Thrust` (`p_user.c`) -- a genuinely *third* real parameter
+    /// (`fixed_t move`, alongside `player`/`angle_t angle`), one more than
+    /// `scalar_param_type` alone (`A_PainShootSkull`'s own single extra
+    /// parameter) supports -- a new `render_fn_impl_with_two_scalar_
+    /// params`/`render_fn_with_two_scalar_params` pair (a thin wrapper,
+    /// every earlier `render_fn_impl` caller unaffected, now itself a
+    /// thin wrapper passing `None` for the new third slot). Two more
+    /// small, real gaps surfaced fixing this up for real: (1) `move` is a
+    /// genuine Rust keyword -- every earlier scalar parameter (`angle`/
+    /// `num`/`armortype`/`power`/`card`) happened not to collide, so
+    /// `render_fn_impl`'s own signature-building path had never needed
+    /// `rust_field_name`'s escape at all (unlike `render_params`, which
+    /// already applied it to every `render_trigger_fn`/etc. parameter);
+    /// a bare body reference to `move` already escaped correctly on its
+    /// own, through `render_expr`'s unrelated generic `Expr::Ident`
+    /// fallback. (2) `angle >>= ANGLETOFINESHIFT;` reassigns its own
+    /// scalar parameter -- the identical "needs `mut`" gap `render_params`'s
+    /// own `body_reassigns_ident` check already covers elsewhere
+    /// (`P_AproxDistance`'s `dx = abs(dx);`), never needed by a `render_
+    /// fn_impl`-family scalar parameter before (confirmed safe to add
+    /// generally, not just for this one function, by re-running the full
+    /// suite -- no earlier scalar parameter is ever reassigned). `player->
+    /// mo->momx += FixedMul(move,finecosine[angle]);` needed nothing new
+    /// beyond what's already proven: `is_self_bare_handle_field`'s write
+    /// arm (`P_GiveBody`'s own `player.mo` precedent) composes with
+    /// `FixedMul`'s own already-`FixedT`-valued bare-call recognition
+    /// (`A_Tracer`'s precedent) and `finecosine`/`finesine`'s own by-name
+    /// `as usize` index cast. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written `Player`/
+    /// `Mobj`/`World`/`Handle`/`Arena`/`Thinker`/`FixedT` stand-in -- zero
+    /// errors. `test_p_thrust_renders_exactly`.
+    #[test]
+    fn test_p_thrust_renders_exactly() {
+        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let rendered = render_fn_with_two_scalar_params(
+            &corpus_dir(),
+            "p_user.c",
+            "P_Thrust",
+            "Player",
+            &field_types,
+            "u32",
+            "FixedT",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_Thrust(player: &mut Player, mut angle: u32, r#move: FixedT, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    angle >>= ANGLETOFINESHIFT;
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momx += FixedMul(r#move, finecosine[angle as usize]); };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momy += FixedMul(r#move, finesine[angle as usize]); };
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_SpawnPuff` (`p_mobj.c`) -- a plain, self-struct-free `fixed_t`-
+    /// parameter helper (`render_trigger_fn`'s existing shape), the first
+    /// one spawning its own `mobj_t*` local (`th`) without any embedded
+    /// constructor at all: `render_trigger_fn` doesn't auto-detect a
+    /// `P_SpawnMobj` local the way `render_fn_impl`'s own `collect_spawn_
+    /// mobj_locals` does, but its own `local_var_types` parameter (already
+    /// used for `EV_DoLockedDoor`'s own `p: Option<PlayerId>`) registers
+    /// `th: Handle<Thinker>` directly, letting every already-generic
+    /// `extra_cross_ref_idents`-keyed read/write arm (`A_Tracer`'s own
+    /// `th->field`, a fresh `thinkers.get`/`get_mut` call at each point of
+    /// use) apply unchanged. **The one real new gap**: `z +=
+    /// ((P_Random()-P_Random())<<10);` compound-assigns a plain raw `int`
+    /// expression into a `fixed_t`-declared *parameter* -- the existing
+    /// literal-into-field wrap only ever fires for a bare `=`, not a
+    /// compound op, and no `AddAssign<i32> for FixedT` existed yet (only
+    /// `Add<i32>`, its non-assigning sibling) -- added to `runtime/
+    /// fixed.rs`, the same "thin wrapping-arithmetic pass-through"
+    /// pattern every other operator there already follows. `attackrange`
+    /// (`p_mobj.c`'s own file-scope `extern fixed_t attackrange;`) joins
+    /// the by-name `World` global list (`viletryx`'s own category). The
+    /// original C source's own `((P_Random()-P_Random())<<10)` parens are
+    /// redundant in both languages (`-` already binds tighter than `<<`
+    /// in C and Rust alike), so the precedence-aware renderer correctly
+    /// drops them rather than preserving them verbatim.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Mobj`/`World`/`Handle`/`Arena`/
+    /// `Thinker`/`FixedT` stand-in and stub `P_Random`/`P_SpawnMobj`/
+    /// `P_SetMobjState` -- zero errors. `test_p_spawn_puff_renders_exactly`.
+    #[test]
+    fn test_p_spawn_puff_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("x".to_string(), "FixedT".to_string()),
+            ("y".to_string(), "FixedT".to_string()),
+            ("z".to_string(), "FixedT".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("th".to_string(), "Handle<Thinker>".to_string())]
+            .into_iter()
+            .collect();
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_SpawnPuff",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnPuff(x: FixedT, y: FixedT, mut z: FixedT, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut th;
+    z += P_Random() - P_Random() << 10;
+    th = P_SpawnMobj(x, y, z, MT_PUFF);
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FRACUNIT; };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 3; };
+    if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };
+    }
+    if world.attackrange == MELEERANGE {
+        P_SetMobjState(th, S_PUFF3);
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_SpawnBlood` (`p_mobj.c`) -- `P_SpawnPuff`'s own close sibling
+    /// (same `z +=`/`th = P_SpawnMobj(..)`/`tics` idioms, reusing every
+    /// piece unchanged), needing nothing new: `th->momz = FRACUNIT*2;`
+    /// (already `FixedT`-valued, `Mul<i32> for FixedT`'s existing
+    /// precedent) and a plain-`i32` `damage` parameter driving an `if`/
+    /// `else if` two-way branch (rendered as nested `else { if .. }`, this
+    /// module's own established convention, never collapsed `else if`
+    /// syntax). Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against the same stand-in as `P_SpawnPuff` --
+    /// zero errors. `test_p_spawn_blood_renders_exactly`.
+    #[test]
+    fn test_p_spawn_blood_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("x".to_string(), "FixedT".to_string()),
+            ("y".to_string(), "FixedT".to_string()),
+            ("z".to_string(), "FixedT".to_string()),
+            ("damage".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [("th".to_string(), "Handle<Thinker>".to_string())]
+            .into_iter()
+            .collect();
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_SpawnBlood",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnBlood(x: FixedT, y: FixedT, mut z: FixedT, damage: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut th;
+    z += P_Random() - P_Random() << 10;
+    th = P_SpawnMobj(x, y, z, MT_BLOOD);
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FRACUNIT * 2; };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 3; };
+    if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };
+    }
+    if damage <= 12 && damage >= 9 {
+        P_SetMobjState(th, S_BLOOD2);
+    } else {
+        if damage < 9 {
+            P_SetMobjState(th, S_BLOOD3);
+        }
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_CalcSwing` (`p_pspr.c`) -- an ordinary `Player`-shaped self-
+    /// struct function (`render_fn`), needing only one small new piece:
+    /// `swingx`/`swingy` (`p_pspr.c`'s own file-scope `fixed_t swingx;
+    /// fixed_t swingy;`) join the by-name `World` global list
+    /// (`viletryx`/`attackrange`'s own category) -- a bare *write*
+    /// (`swingx = ..;`) needed no separate mechanism at all, since
+    /// `render_expr_stmt`'s generic assignment path already renders its
+    /// own LHS through the same `render_expr` `Expr::Ident` arm a read
+    /// would use. `swing` (a genuinely `fixed_t`-declared local) and
+    /// `angle` (a plain `int` local, reused across two separate `finesine[
+    /// angle]` index shapes) are both automatically handled by already-
+    /// existing machinery (`collect_fixed_t_locals`, `finesine`'s own
+    /// blanket by-name `as usize` index cast). Both `(FINEANGLES/70*
+    /// leveltime)&FINEMASK`-shaped expressions needed no parens at all in
+    /// either language (`&`'s C/Rust precedence is lower than `*`/`/`/
+    /// `+`), confirming the precedence-aware renderer drops them
+    /// correctly, the same "redundant original parens, dropped
+    /// correctly" pattern `P_SpawnPuff`'s own entry just proved. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Player`/`World`/`FixedT` stand-in and stub
+    /// `FixedMul` -- zero errors. `test_p_calc_swing_renders_exactly`.
+    #[test]
+    fn test_p_calc_swing_renders_exactly() {
+        let field_types = field_types(&[("bob", "FixedT")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_CalcSwing",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_CalcSwing(player: &mut Player, world: &mut World) {
+    let mut swing;
+    let mut angle;
+    swing = player.bob;
+    angle = FINEANGLES / 70 * leveltime & FINEMASK;
+    world.swingx = FixedMul(swing, finesine[angle as usize]);
+    angle = FINEANGLES / 70 * leveltime + FINEANGLES / 2 & FINEMASK;
+    world.swingy = -FixedMul(world.swingx, finesine[angle as usize]);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_DropWeapon` (`p_pspr.c`) -- a one-statement `Player`-shaped
+    /// self-struct function (`render_fn`), needing no new mechanism at
+    /// all: `weaponinfo[player->readyweapon].downstate` reuses the
+    /// already-established `weaponinfo[..].field` array-of-struct access
+    /// (`A_WeaponReady`'s own precedent) unchanged, generic over
+    /// `ctx.self_param` regardless of whether the caller is `render_fn`
+    /// or `render_weapon_fn`. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written `Player`/
+    /// `World` stand-in and a stub `weaponinfo`/`P_SetPsprite` -- zero
+    /// errors. `test_p_drop_weapon_renders_exactly`.
+    #[test]
+    fn test_p_drop_weapon_renders_exactly() {
+        let field_types = field_types(&[("readyweapon", "i32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_DropWeapon",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_DropWeapon(player: &mut Player, world: &mut World) {
+    P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_BringUpWeapon` (`p_pspr.c`) translated -- the array-of-struct-
+    /// typed self field this project's previous rounds flagged as a
+    /// genuinely new mechanism (`player->psprites[ps_weapon].sy =
+    /// WEAPONBOTTOM;`, `psprites: pspdef_t[NUMPSPRITES]`, `p_pspr.h`).
+    /// Turns out to need only one small, narrow addition once actually
+    /// read against the real renderer: `psprites` joins the existing by-
+    /// name self-array-field index-cast list (`powers`/`lines`/`cards`,
+    /// `pw_strength`'s own precedent) so `ps_weapon` -- a bare `psprnum_t`
+    /// enum-constant identifier, fixed `i32` elsewhere in the generated
+    /// crate, not a fresh local Rust could infer as `usize` here -- gets
+    /// its own explicit cast; the write itself (`self.psprites[ps_weapon
+    /// as usize].sy = WEAPONBOTTOM;`) needed no new rendering code at all,
+    /// since it isn't a *direct* self field (nested through an `Index`
+    /// instead), so none of the existing self-field-write special cases
+    /// match and it falls straight through to the wholly generic
+    /// assignment fallback -- correct as-is, the same way `sides[i].
+    /// toptexture = ..;`-shaped writes already are. `WEAPONBOTTOM`
+    /// (`p_pspr.c`'s own file-scope `#define WEAPONBOTTOM 128*FRACUNIT`)
+    /// renders as a bare opaque identifier, the same `CEILSPEED` precedent
+    /// (a `#define`d alias this parser never macro-expands, `T_MoveCeiling`'s
+    /// own entry): no wrap fires for it (its RHS is neither a self-field
+    /// write nor an `Expr::IntLiteral`), so it passes through unwrapped,
+    /// correct provided the eventual generated crate gives it a real
+    /// `FixedT` type of its own, the same deferred responsibility
+    /// `CEILSPEED` already carries. Reading `player->mo` in `S_StartSound
+    /// (player->mo, sfx_sawup)` reuses the already-proven "registered
+    /// `Handle<Thinker>` self field read as a plain opaque value" case
+    /// (`A_FireShotgun2`'s own entry). Reading `weaponinfo[player->
+    /// pendingweapon].upstate` reuses `P_DropWeapon`'s own already-
+    /// established `weaponinfo[..].field` access unchanged (the index
+    /// here is itself a `Member` read, already covered generically).
+    /// The `statenum_t newstate;` local needs nothing new either -- a
+    /// locally-`typedef`'d enum name falls into the same bare-
+    /// `TypedefName`-specifier bucket every other deferred-inference
+    /// local already does. Verified compiling
+    /// for real (`rustc --edition 2021 --crate-type lib`) against a hand-
+    /// written `Player`/`World`/`Handle`/`FixedT` stand-in and a stub
+    /// `S_StartSound`/`P_SetPsprite`/`weaponinfo`/`WEAPONBOTTOM` -- zero
+    /// errors. `test_p_bring_up_weapon_renders_exactly`.
+    #[test]
+    fn test_p_bring_up_weapon_renders_exactly() {
+        let field_types = field_types(&[
+            ("pendingweapon", "i32"),
+            ("readyweapon", "i32"),
+            ("mo", "Handle<Thinker>"),
+            ("psprites", "[PlayerSpriteState; NUMPSPRITES]"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_BringUpWeapon",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_BringUpWeapon(player: &mut Player, world: &mut World) {
+    let mut newstate;
+    if player.pendingweapon == wp_nochange {
+        player.pendingweapon = player.readyweapon;
+    }
+    if player.pendingweapon == wp_chainsaw {
+        S_StartSound(player.mo, sfx_sawup);
+    }
+    newstate = weaponinfo[player.pendingweapon as usize].upstate;
+    player.pendingweapon = wp_nochange;
+    player.psprites[ps_weapon as usize].sy = WEAPONBOTTOM;
+    P_SetPsprite(player, ps_weapon, newstate);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_FireWeapon` (`p_pspr.c`) translated -- an ordinary `Player`-
+    /// shaped self-struct function, needing exactly one new piece:
+    /// `P_CheckAmmo` (this same file's own sibling, its real declared C
+    /// return type confirmed `boolean` by direct read) joins the by-name
+    /// `is_bool_returning_call` allowlist (`P_ThingHeightClip`'s own
+    /// precedent) so `if (!P_CheckAmmo(player)) return;` needs no
+    /// `!= 0`/`== 0` truthiness cast, bare or negated. Everything else
+    /// reuses wholly pre-existing machinery: `P_SetMobjState(player->mo,
+    /// S_PLAY_ATK1)` reuses the already-proven "registered `Handle
+    /// <Thinker>` self field read as a plain opaque value" case
+    /// (`A_FireShotgun2`'s own entry, `player.mo` passed by value with no
+    /// further dereference); `weaponinfo[player->readyweapon].atkstate`
+    /// reuses `P_DropWeapon`'s own already-established `weaponinfo[..]
+    /// .field` access unchanged; `P_NoiseAlert(player->mo, player->mo)`
+    /// is itself already a real translated function (`P_RecursiveSound`'s
+    /// own entry), called here as an ordinary forward reference with two
+    /// plain `Handle<Thinker>` values, needing nothing new. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Player`/`World`/`Handle` stand-in and a
+    /// stub `P_CheckAmmo`/`P_SetMobjState`/`P_SetPsprite`/`P_NoiseAlert`/
+    /// `weaponinfo` -- zero errors. `test_p_fire_weapon_renders_exactly`.
+    #[test]
+    fn test_p_fire_weapon_renders_exactly() {
+        let field_types = field_types(&[("readyweapon", "i32"), ("mo", "Handle<Thinker>")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_FireWeapon",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_FireWeapon(player: &mut Player, world: &mut World) {
+    let mut newstate;
+    if !P_CheckAmmo(player) {
+        return;
+    }
+    P_SetMobjState(player.mo, S_PLAY_ATK1);
+    newstate = weaponinfo[player.readyweapon as usize].atkstate;
+    P_SetPsprite(player, ps_weapon, newstate);
+    P_NoiseAlert(player.mo, player.mo);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_BulletSlope` (`p_pspr.c`) translated -- an ordinary `Mobj`-
+    /// shaped self-struct function, needing only one small new piece:
+    /// `bulletslope` (this file's own file-scope `fixed_t bulletslope;`)
+    /// joins the by-name `World` global list (`viletryx`/`attackrange`/
+    /// `swingx`/`swingy`'s own category) -- a bare write (`bulletslope =
+    /// ..;`) needs no separate mechanism, the same "generic assignment
+    /// fallback already renders its own LHS through the same `Expr::Ident`
+    /// arm a read would use" precedent `swingx`/`swingy` already
+    /// established. `linetarget` (`P_AimLineAttack`'s own "did we hit
+    /// anything" side channel) reuses the already-established `World`
+    /// field and negated-truthiness handling (`A_Punch`'s own precedent)
+    /// unchanged -- registering it also unconditionally adds the
+    /// `thinkers: &Arena<Thinker>` parameter `render_fn_impl` already
+    /// always supplies once a body references `linetarget` at all (even
+    /// though this one only ever checks it for truthiness, never
+    /// dereferences through it). `an += 1<<26;`/`an -= 2<<26;` need
+    /// nothing new either: `an` is a genuinely `angle_t`-declared local
+    /// (`collect_angle_t_locals`), and the existing `lhs_is_angle_t_local`
+    /// compound-assign wrap (`A_Chase`'s own precedent) already casts each
+    /// RHS shift `as u32`. `P_AimLineAttack` is an ordinary forward-
+    /// referenced call (not yet translated), passed `mo`/`an`/a
+    /// `FRACUNIT`-scaled literal argument, needing nothing new. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Mobj`/`World`/`FixedT`/`Handle`/`Arena`/
+    /// `Thinker` stand-in and a stub `P_AimLineAttack` -- zero errors.
+    /// `test_p_bullet_slope_renders_exactly`.
+    #[test]
+    fn test_p_bullet_slope_renders_exactly() {
+        let field_types = field_types(&[("angle", "u32")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_BulletSlope",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_BulletSlope(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {
+    let mut an;
+    an = mo.angle;
+    world.bulletslope = P_AimLineAttack(mo, an, 16 * 64 * FRACUNIT);
+    if world.linetarget.is_none() {
+        an += (1 << 26) as u32;
+        world.bulletslope = P_AimLineAttack(mo, an, 16 * 64 * FRACUNIT);
+        if world.linetarget.is_none() {
+            an -= (2 << 26) as u32;
+            world.bulletslope = P_AimLineAttack(mo, an, 16 * 64 * FRACUNIT);
+        }
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_SetupPsprites` (`p_pspr.c`) translated -- an ordinary `Player`-
+    /// shaped self-struct function, needing no new mechanism at all now
+    /// that `psprites` is a known by-name self-array-field (`P_BringUpWeapon`'s
+    /// own entry): `player->psprites[i].state = NULL;` needs no cast
+    /// beyond the existing `psprites`-by-name `as usize` index-cast rule
+    /// (which fires on *any* index shape into `psprites`, bare loop
+    /// counter included, not just an enum-constant one), and `Expr::Ident
+    /// ("NULL")`'s existing generic `-> None` rendering (`getNextSector`'s
+    /// own precedent) covers the write with nothing new. `player->
+    /// pendingweapon = player->readyweapon;` reuses `P_BringUpWeapon`'s
+    /// own already-proven plain self-field write. `P_BringUpWeapon
+    /// (player);` is itself already a real translated function (this same
+    /// round's own earlier entry), called here as an ordinary forward
+    /// reference. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Player`/`PlayerSpriteState`
+    /// stand-in and a stub `P_BringUpWeapon` -- zero errors.
+    /// `test_p_setup_psprites_renders_exactly`.
+    #[test]
+    fn test_p_setup_psprites_renders_exactly() {
+        let field_types = field_types(&[
+            ("psprites", "[PlayerSpriteState; NUMPSPRITES]"),
+            ("pendingweapon", "i32"),
+            ("readyweapon", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_SetupPsprites",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SetupPsprites(player: &mut Player, world: &mut World) {
+    let mut i;
+    i = 0;
+    while i < NUMPSPRITES {
+        player.psprites[i as usize].state = None;
+        i += 1;
+    }
+    player.pendingweapon = player.readyweapon;
+    P_BringUpWeapon(player);
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_MovePsprites` (`p_pspr.c`, `P_SetupPsprites`'s own sibling)
+    /// translated -- the two genuinely new mechanisms this doc had been
+    /// deferring since round 6. (1) `psp = &player->psprites[0]; for
+    /// (i=0;i<NUMPSPRITES;i++,psp++) { .. }` -- `sector_walk_alias`'s own
+    /// idiom (`is_sector_walk_priming`/`is_sector_walk_for`), but for a
+    /// self-owned, embedded-by-value array field rather than a `World`-
+    /// indexed global one: `is_psprite_walk_priming`/`is_psprite_walk_for`/
+    /// `FnBodyContext::psprite_walk_alias` resolve a bare `psp` reference
+    /// directly to `player.psprites[i as usize]` (not crossref-flagged, so
+    /// the generic `Expr::Member` fallback appends `.field` with no
+    /// `world[..]` wrap), the loop itself bounded by the fixed
+    /// `NUMPSPRITES` enum constant instead of the runtime `numsectors`
+    /// global. (2) `if ((state = psp->state))` -- C evaluates the
+    /// assignment then tests its own result, needing a new `render_
+    /// condition` arm (`Expr::Assign` as a whole condition) that hoists
+    /// the assignment as its own statement immediately before the `if`
+    /// (`state = player.psprites[i as usize].state;`) and tests the now-
+    /// plain local for `Option`-ness directly, guarded by `is_option_
+    /// valued(rhs, ctx)` recognizing `psp->state` as nullable (`pspdef_t.
+    /// state`'s own real "a NULL state means not active" comment,
+    /// `p_pspr.h`) via a new narrow `is_option_valued` arm keyed off
+    /// `psprite_walk_alias` specifically. A third, smaller gap surfaced
+    /// only once the whole body was read: `psp->state->nextstate` chains
+    /// a field read straight through that same `Option<&'static State>`
+    /// value (unlike `state_index`'s own non-`Option` `&'static State`
+    /// precedent, `A_FireCGun`'s idiom) -- a new, narrowly-scoped `Expr::
+    /// Member` arm (guarded on exactly the `psp->state->field` shape, not
+    /// the broader `is_option_valued(base, ctx)` predicate several other
+    /// already-handled shapes -- `mo->player->field`, `actor->target->
+    /// field`, ... -- also match, each with its own real, differently-
+    /// shaped rendering already ordered ahead of it regardless) inserts
+    /// the `.unwrap()` `state_t*`'s own dereference needs, always
+    /// genuinely `Some` here since the real corpus call site already
+    /// guards the whole block with the `if ((state = psp->state))` just
+    /// discussed. `player->psprites[ps_flash].sx = player->psprites
+    /// [ps_weapon].sx;` (and its `.sy` sibling) need nothing new: the
+    /// `psprites`-by-name index-cast rule (`P_BringUpWeapon`'s own
+    /// precedent) already covers a bare enum-constant index into
+    /// `psprites` regardless of which specific constant. `psp->tics--;`/
+    /// `psp->tics != -1`/`!psp->tics` all reuse wholly generic, already-
+    /// proven machinery (a plain self-array-field `Member` read/write, C
+    /// truthiness on a plain `int` field) once `psp` itself resolves
+    /// through the new alias -- no new mechanism needed for any of the
+    /// three. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against a hand-written `Player`/
+    /// `PlayerSpriteState`/`State`/`STATES` stand-in and a stub
+    /// `P_SetPsprite` -- zero errors. `test_p_move_psprites_renders_exactly`.
+    #[test]
+    fn test_p_move_psprites_renders_exactly() {
+        let field_types = field_types(&[("psprites", "[PlayerSpriteState; NUMPSPRITES]")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_MovePsprites",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_MovePsprites(player: &mut Player, world: &mut World) {
+    let mut i;
+    let mut state;
+    i = 0;
+    while i < NUMPSPRITES {
+        state = player.psprites[i as usize].state;
+        if state.is_some() {
+            if player.psprites[i as usize].tics != -1 {
+                player.psprites[i as usize].tics -= 1;
+                if player.psprites[i as usize].tics == 0 {
+                    P_SetPsprite(player, i, player.psprites[i as usize].state.unwrap().nextstate);
+                }
+            }
+        }
+        i += 1;
+    }
+    player.psprites[ps_flash as usize].sx = player.psprites[ps_weapon as usize].sx;
+    player.psprites[ps_flash as usize].sy = player.psprites[ps_weapon as usize].sy;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_PlayerInSpecialSector` (`p_spec.c`) translated, closing out the
+    /// one precisely-scoped candidate the previous round's own
+    /// investigation left open. `sector = player->mo->subsector->
+    /// sector;` needed two small, separate additions, exactly as
+    /// scoped: (1) the existing `.subsector->sector` `Expr::Member` arm
+    /// (`A_Look`'s `actor->subsector->sector`, already widened once for
+    /// `P_NoiseAlert`'s bare-`Handle<Thinker>`-parameter case) gains a
+    /// *third* base shape, `is_self_bare_handle_field(bb, ..)` -- `bb`
+    /// here is `player->mo` itself, not a bare `Ident`, so the two
+    /// existing guards (`self_param` directly, or a bare `Handle<
+    /// Thinker>` parameter) both missed it; rendering `base` recurses
+    /// straight back into the already-proven `is_self_bare_handle_field`
+    /// read arm, so only the guard needed widening, not the rendering
+    /// itself. (2) `line_sector_field_alias_type` (the pre-scan behind
+    /// `collect_line_sector_aliases`, used to register a local's real
+    /// cross-reference type from its own assignment's RHS shape) gains a
+    /// matching `.mo.subsector.sector` arm -> `"SectorId"`, so the local
+    /// `sector` itself is registered, not just the standalone expression
+    /// rendering correctly in isolation -- and `collect_line_sector_
+    /// aliases` itself needed threading into `render_fn_impl_with_two_
+    /// scalar_params` for the first time (every earlier `render_fn`
+    /// caller only ever needed `target`/`tracer`/spawned-mobj aliases,
+    /// never a sector-chain one), mirroring `render_world_fn`'s own
+    /// already-established merge of the same collector.
+    ///
+    /// Everything else in the body turned out to need *nothing* new,
+    /// each already-proven generic mechanism composing for free:
+    /// `player->mo->z != sector->floorheight` (both genuinely `FixedT`,
+    /// comparing directly); `world[sector].special` read/write through
+    /// the newly-registered alias (the write, `sector->special = 0;`,
+    /// falls straight through the generic `Expr::Assign` fallback with
+    /// no dedicated arm at all, since nothing about a plain `i16` field
+    /// write needs a cast); `render_switch`'s already-general fallthrough
+    /// (`case 16: case 4: ...`) and `default:` handling; a two-argument
+    /// `I_Error("...%i", sector->special)` call (the existing `Expr::
+    /// Call` arm already renders an arbitrary argument list generically,
+    /// `Expr::StringLiteral` already passes a format string through
+    /// verbatim -- multiple arguments needed no new plumbing at all, only
+    /// a *single* string argument had a real corpus precedent before
+    /// now); `player->powers[pw_ironfeet]` (the existing `powers`/`cards`/
+    /// `psprites` by-name index-cast rule); `!player->powers[..]`/
+    /// `!(leveltime&0x1f)` (both already-general C-truthiness negation,
+    /// the latter the exact `leveltime & N == 0` idiom `T_MoveFloor`
+    /// already established, just a different mask); `player->cheats &=
+    /// ~CF_GODMODE;` (`UnaryOp::BitNot` already renders as Rust's own
+    /// bitwise `!`, `thing->flags &= ~MF_SOLID;`'s own precedent, just
+    /// through a plain self field instead of a `Handle<Thinker>` one);
+    /// `player->secretcount++;` (the fully generic standalone `PostIncDec`
+    /// arm); `player->health <= 10`/`G_ExitLevel()` (a plain self-field
+    /// comparison and a zero-argument opaque forward-referenced call).
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against a hand-written `Player`/`World`/`Sector`/`Mobj`/
+    /// `Thinker`/`Arena`/`Handle` stand-in and stub `P_DamageMobj`/
+    /// `G_ExitLevel` -- zero errors. `test_p_player_in_special_sector_renders_exactly`.
+    #[test]
+    fn test_p_player_in_special_sector_renders_exactly() {
+        let field_types = field_types(&[
+            ("mo", "Handle<Thinker>"),
+            ("powers", "[i32; NUMPOWERS]"),
+            ("cheats", "i32"),
+            ("secretcount", "i32"),
+            ("health", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_spec.c",
+            "P_PlayerInSpecialSector",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_PlayerInSpecialSector(player: &mut Player, world: &mut World, thinkers: &Arena<Thinker>) {
+    let mut sector;
+    sector = world[match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector;
+    if match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } != world[sector].floorheight {
+        return;
+    }
+    match world[sector].special {
+        5 => {
+            if player.powers[pw_ironfeet as usize] == 0 {
+                if leveltime & 0x1f == 0 {
+                    P_DamageMobj(player.mo, None, None, 10);
+                }
+            }
+        }
+        7 => {
+            if player.powers[pw_ironfeet as usize] == 0 {
+                if leveltime & 0x1f == 0 {
+                    P_DamageMobj(player.mo, None, None, 5);
+                }
+            }
+        }
+        16 | 4 => {
+            if player.powers[pw_ironfeet as usize] == 0 || P_Random() < 5 {
+                if leveltime & 0x1f == 0 {
+                    P_DamageMobj(player.mo, None, None, 20);
+                }
+            }
+        }
+        9 => {
+            player.secretcount += 1;
+            world[sector].special = 0;
+        }
+        11 => {
+            player.cheats &= !CF_GODMODE;
+            if leveltime & 0x1f == 0 {
+                P_DamageMobj(player.mo, None, None, 20);
+            }
+            if player.health <= 10 {
+                G_ExitLevel();
+            }
+        }
+        _ => {
+            I_Error(\"P_PlayerInSpecialSector: unknown special %i\", world[sector].special);
+        }
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GunShot` (`p_pspr.c`, `A_FirePistol`'s own forward-referenced
+    /// callee) translated -- needed nothing new at all, every piece
+    /// composing from wholly pre-existing, already-proven machinery:
+    /// `render_fn_with_scalar_param` (`A_PainShootSkull`'s own precedent,
+    /// a `Mobj`-shaped self receiver plus one plain scalar parameter,
+    /// `accurate: bool` here instead of `angle: u32`) already threads
+    /// `world: &mut World` unconditionally into its signature, so
+    /// `bulletslope` (`world.bulletslope`, `P_BulletSlope`'s own by-name
+    /// global registration) just works with no `needs_world`-style flag
+    /// at all -- unlike `render_weapon_fn`'s own conditional version of
+    /// that field, never needed here since this render path always
+    /// includes `world`. The local `angle` (`angle_t angle;`, assigned
+    /// from `mo->angle`) is registered by `collect_angle_t_locals`
+    /// (already called in this same code path) the same way `A_Chase`'s
+    /// own local `angle` is, so `angle += (P_Random()-P_Random())<<18;`
+    /// reuses `A_FaceTarget`'s exact `u32`-local compound-assign-with-
+    /// `i32`-arithmetic-RHS cast verbatim (`lhs_is_angle_t_local`,
+    /// different shift amount, identical shape). `!accurate` needs no
+    /// truthiness cast at all: unlike a self-struct field or local this
+    /// module has no per-identifier `bool`-vs-`int` registry for, a
+    /// scalar *parameter*'s own Rust type is fixed by its own declared
+    /// signature (the same "a parameter's type can't be freely re-
+    /// inferred" reasoning already established for `card`/`ps_weapon`/
+    /// `side`), so a plain Rust `!` is already correct. `P_LineAttack
+    /// (mo, angle, MISSILERANGE, bulletslope, damage);` -- an opaque
+    /// forward-referenced call (`P_LineAttack` itself not yet
+    /// translated, matching this project's own established convention
+    /// for every other not-yet-translated callee) -- renders every
+    /// argument through wholly generic paths: `mo` (the bare self
+    /// receiver, `&mut Mobj`, passed straight through by name, the same
+    /// already-working "opaque pass-through" shape a bare self reference
+    /// gets everywhere else this project has needed it), `angle`/
+    /// `damage` (plain locals), `MISSILERANGE` (a bare macro-constant
+    /// identifier, passed through unchanged, `A_PainShootSkull`'s own
+    /// `P_AimLineAttack(actor, angle, MISSILERANGE)` precedent), and
+    /// `bulletslope` (`world.bulletslope`, just discussed). Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Mobj`/`World` stand-in and a stub
+    /// `P_LineAttack` -- zero errors. `test_p_gun_shot_renders_exactly`.
+    #[test]
+    fn test_p_gun_shot_renders_exactly() {
+        let field_types = field_types(&[("angle", "u32")]);
+        let rendered = render_fn_with_scalar_param(
+            &corpus_dir(),
+            "p_pspr.c",
+            "P_GunShot",
+            "Mobj",
+            &field_types,
+            "bool",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GunShot(mo: &mut Mobj, accurate: bool, world: &mut World) {
+    let mut angle;
+    let mut damage;
+    damage = 5 * (P_Random() % 3 + 1);
+    angle = mo.angle;
+    if !accurate {
+        angle += (P_Random() - P_Random() << 18) as u32;
+    }
+    P_LineAttack(mo, angle, MISSILERANGE, world.bulletslope, damage);
+}";
+        assert_eq!(rendered, expected);
     }
 }
