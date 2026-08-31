@@ -1995,9 +1995,18 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // `player->weaponowned[wp_plasma]` and its siblings (same
             // function) are the same enum-constant-index shape once
             // more, just for a different (`boolean`-typed) array.
+            // `sector->blockbox[BOXLEFT]` and its `BOXRIGHT`/`BOXBOTTOM`/
+            // `BOXTOP` siblings (`P_ChangeSector`, `p_map.c`) are the same
+            // enum-constant-index shape once more, for `Sector.blockbox:
+            // [i32; 4]` (`m_bbox.h`'s own `BOXTOP`/`BOXBOTTOM`/`BOXLEFT`/
+            // `BOXRIGHT` enum, `struct_fields.rs`'s existing `blockbox`
+            // mapping) -- reached generically through `world[sector]`
+            // (`sector`'s own bare, non-`Option` `SectorId` registration
+            // already flows through the fully generic crossref-base
+            // `Expr::Member` fallback with no new rendering code at all).
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
                 || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites" || field == "ammo" || field == "weaponowned")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites" || field == "ammo" || field == "weaponowned" || field == "blockbox")
                 || (matches!(base.as_ref(), Expr::Member { field, .. } if field == "sidenum")
                     && matches!(index.as_ref(), Expr::Ident(_)))
             {
@@ -18177,6 +18186,79 @@ pub fn P_CheckAmmo(player: &mut Player, world: &mut World) -> bool {
     }
     P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate);
     return false;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_ChangeSector` (`p_map.c`) -- found by this round's own corpus-
+    /// wide sweep once its explicit candidate list ran dry (the same
+    /// technique round 9 used): a `render_world_fn` caller whose first
+    /// parameter is a bare, non-`Option` `sector_t*` (`SectorId`) rather
+    /// than the `line_t*` (`LineId`) every earlier `render_world_fn`
+    /// caller has used -- confirmed to need genuinely nothing new once
+    /// actually read against the real renderer: a bare `SectorId`-
+    /// registered parameter already flows through the fully generic
+    /// crossref-aware `Expr::Ident`/`Expr::Member` fallback (`is_cross_
+    /// ref` already lists `SectorId`; the fallback `Expr::Member` arm
+    /// already wraps *any* crossref base in `world[..]`, not just a
+    /// hand-matched `LineId` one), so `sector->blockbox[BOXLEFT]`
+    /// resolves to `world[sector].blockbox[BOXLEFT]` with no new
+    /// rendering code at all -- just one small addition, `blockbox`
+    /// joining the by-name `as usize` index-cast list (`powers`/`cards`/
+    /// `ammo`/... above) for its own `BOXTOP`/`BOXBOTTOM`/`BOXLEFT`/
+    /// `BOXRIGHT` enum-constant indices (`m_bbox.h`), the same "hand-
+    /// match the one real array" reason every earlier entry on that list
+    /// needed it. The nested brace-less `for` loop (`for (x=..;x<=..;x++)
+    /// for (y=..;y<=..;y++) P_BlockThingsIterator(..);`) needed nothing
+    /// new either: `render_for`'s body already dispatches a bare non-
+    /// `Compound` statement straight to `render_stmt`, which already
+    /// dispatches `Stmt::For` right back into `render_for` -- the same
+    /// generic recursion `EV_TurnTagLightsOff`'s own nested loop already
+    /// exercises, just for two `for`s instead of a `for` nested in one.
+    /// `P_BlockThingsIterator`/`PIT_ChangeSector` are both already
+    /// established opaque forward-referenced calls (a not-yet-translated
+    /// callee and an already-translated one, passed as a bare function-
+    /// pointer-shaped identifier respectively -- `A_VileChase`'s own
+    /// `P_BlockThingsIterator(bx, by, PIT_VileCheck)` precedent), and
+    /// `nofit`/`crushchange` reuse `PIT_ChangeSector`'s own already-
+    /// established `World`-global registration verbatim, both as a read
+    /// (`return nofit;`) and this function's own write (`crushchange =
+    /// crunch;`, `nofit = false;`). Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written
+    /// `Sector`/`World` stand-in and a stub `P_BlockThingsIterator`/
+    /// `PIT_ChangeSector` -- zero errors.
+    #[test]
+    fn test_p_change_sector_driver_renders_exactly() {
+        let param_types: HashMap<String, String> = [
+            ("sector".to_string(), "SectorId".to_string()),
+            ("crunch".to_string(), "bool".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_map.c",
+            "P_ChangeSector",
+            &param_types,
+            Some("bool"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_ChangeSector(sector: SectorId, crunch: bool, world: &mut World) -> bool {
+    let mut x;
+    let mut y;
+    world.nofit = false;
+    world.crushchange = crunch;
+    x = world[sector].blockbox[BOXLEFT as usize];
+    while x <= world[sector].blockbox[BOXRIGHT as usize] {
+        y = world[sector].blockbox[BOXBOTTOM as usize];
+        while y <= world[sector].blockbox[BOXTOP as usize] {
+            P_BlockThingsIterator(x, y, PIT_ChangeSector);
+            y += 1;
+        }
+        x += 1;
+    }
+    return world.nofit;
 }";
         assert_eq!(rendered, expected);
     }
