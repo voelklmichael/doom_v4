@@ -2004,9 +2004,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // (`sector`'s own bare, non-`Option` `SectorId` registration
             // already flows through the fully generic crossref-base
             // `Expr::Member` fallback with no new rendering code at all).
+            // `player->maxammo[ammo]` (`P_GiveAmmo`, `p_inter.c`) is
+            // `ammo`'s own by-name-list membership reason once more, just
+            // for `Player.maxammo: [i32; NUMAMMO]` (`ammo`'s own sibling
+            // field, `d_player.h`) -- but here `ammo` is a genuine
+            // function *parameter* (`ammotype_t ammo`), not a fresh
+            // local: a parameter's Rust type is fixed by its own declared
+            // signature (`card`/`ps_weapon`'s own established reasoning
+            // for a parameter index), so it can't be freely inferred
+            // `usize` here either way. `clipammo[ammo]` (`p_inter.c`'s
+            // own file-scope `int clipammo[NUMAMMO];`) is the same
+            // parameter-index shape once more, joining the *other*
+            // (`Expr::Ident`-base) half of this cast list instead, since
+            // `clipammo` is a plain unregistered global array, not a
+            // self-struct field.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime")
-                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites" || field == "ammo" || field == "weaponowned" || field == "blockbox")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime" || n == "clipammo")
+                || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites" || field == "ammo" || field == "weaponowned" || field == "blockbox" || field == "maxammo")
                 || (matches!(base.as_ref(), Expr::Member { field, .. } if field == "sidenum")
                     && matches!(index.as_ref(), Expr::Ident(_)))
             {
@@ -2572,6 +2586,15 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // `boolean`-local truthiness check in this codebase's own corpus
         // so far only ever appeared negated).
         Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) => Ok(render_expr(cond, ctx)?.0),
+        // `if (oldammo) return true;` (`P_GiveAmmo`) -- a bare, non-
+        // negated plain `int` local used for truthiness at a condition's
+        // own top level, the `Expr::Ident` sibling of the plain-`Member`/
+        // `Expr::Index` `!= 0` fallbacks just below -- never needed until
+        // this first real corpus example (every earlier bare-`Ident`
+        // truthiness check in this codebase's own corpus so far was
+        // either `Option`-valued or a real `bool` local, both already
+        // claimed by the two arms above).
+        Expr::Ident(_) => Ok(format!("{} != 0", render_expr(cond, ctx)?.0)),
         // `if (player->powers[pw_strength])` (`A_Punch`) -- a bare array-
         // element read used for truthiness, the `Expr::Index` sibling of
         // the plain-`Member`-field arm just below: `powers` is a plain
@@ -5976,6 +5999,36 @@ pub fn render_bool_fn_with_scalar_param(
         self_field_types,
         Some("bool"),
         Some(scalar_param_type),
+    )
+}
+
+/// `render_bool_fn_with_scalar_param`'s own twin for `boolean P_GiveAmmo
+/// (player_t* player, ammotype_t ammo, int num)` (`p_inter.c`) -- both
+/// `boolean`-returning *and* takes two plain-scalar parameters at once,
+/// a combination neither `render_bool_fn_with_scalar_param` (one scalar)
+/// nor `render_fn_with_two_scalar_params` (`void`-returning) alone
+/// covers. A thin wrapper over the same shared `render_fn_impl_with_
+/// two_scalar_params`, matching this module's established "add the
+/// wrapper once a real corpus function needs the combination, not
+/// speculatively" style.
+pub fn render_bool_fn_with_two_scalar_params(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+    scalar_param_type: &str,
+    scalar_param2_type: &str,
+) -> Result<String, String> {
+    render_fn_impl_with_two_scalar_params(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        Some("bool"),
+        Some(scalar_param_type),
+        Some(scalar_param2_type),
     )
 }
 
@@ -18227,6 +18280,136 @@ pub fn P_CheckAmmo(player: &mut Player, world: &mut World) -> bool {
     /// --edition 2021 --crate-type lib`) against a hand-written
     /// `Sector`/`World` stand-in and a stub `P_BlockThingsIterator`/
     /// `PIT_ChangeSector` -- zero errors.
+    /// `P_GiveAmmo` (`p_inter.c`, this round's own corpus-wide sweep) --
+    /// `P_GiveBody`/`P_GiveArmor`'s own sibling, `boolean`-returning and
+    /// taking two plain-scalar parameters (`ammo: ammotype_t`, `num:
+    /// int`) at once -- a combination neither existing thin wrapper
+    /// covered, closed by a new `render_bool_fn_with_two_scalar_params`
+    /// (`render_fn_impl_with_two_scalar_params`'s own `boolean`-returning
+    /// twin, the identical pattern `render_bool_fn_with_scalar_param`
+    /// already established one scalar parameter earlier). Three small,
+    /// genuinely new pieces once the real body was read: (1) `maxammo`
+    /// (`Player.maxammo: [i32; NUMAMMO]`, `ammo`'s own sibling field)
+    /// and `clipammo` (`p_inter.c`'s own file-scope `int clipammo
+    /// [NUMAMMO];`) both join the by-name `as usize` index-cast list for
+    /// the same reason `ammo` itself joined it in `P_CheckAmmo` -- here
+    /// indexed by a genuine function *parameter* (`ammo`), whose Rust
+    /// type is fixed by its own declared signature (`card`/`ps_weapon`'s
+    /// own established parameter-index reasoning), not freely inferable
+    /// `usize`; (2) `if (oldammo) return true;` -- a bare, non-negated
+    /// plain `int` *local* used for truthiness at a condition's own top
+    /// level had no `render_bool_expr` arm at all (every earlier bare-
+    /// `Ident` truthiness check was either `Option`-valued or a real
+    /// `bool` local, both already claimed) -- closed by a new generic
+    /// `Expr::Ident => != 0` fallback, the direct sibling of the already-
+    /// existing `Expr::Member`/`Expr::Index` `!= 0` fallbacks. Everything
+    /// else -- the `switch(ammo) { case am_clip: .. case am_misl: ..
+    /// default: break; }` (the `am_misl`/`default` fallthrough is a true
+    /// no-op either way, since `default`'s own body is just `break;`, so
+    /// rendering each `case` as its own separate `match` arm stays
+    /// behaviorally identical without needing real fallthrough syntax), a
+    /// `mut num` parameter (reassigned in its own body, `P_AproxDistance`'s
+    /// own already-established parameter-`mut` detection), a two-argument
+    /// `I_Error` call (`P_PlayerInSpecialSector`'s own precedent), and
+    /// `gameskill`/`sk_baby`/`sk_nightmare` (bare, unregistered globals,
+    /// `A_BrainSpit`'s own established category) -- composed from wholly
+    /// pre-existing machinery with no further changes. Verified compiling
+    /// for real (`rustc --edition 2021 --crate-type lib`) against a
+    /// hand-written `Player`/`World` stand-in and a stub `I_Error`/
+    /// `clipammo` -- zero errors. `P_GiveWeapon` (this same file's own
+    /// sibling, calling `P_GiveAmmo`) was investigated too and left
+    /// deliberately deferred: `if (player == &players[consoleplayer])`
+    /// needs a real identity comparison against a specific slot of a
+    /// `players[]` global array this project has no `PlayerId`/index
+    /// model for at all (`Player` renders as a bare `&mut Player`
+    /// reference everywhere so far, never an `Arena`-indexed value the
+    /// way `Mobj` is) -- a real, not-yet-designed mechanism, not forced.
+    #[test]
+    fn test_p_give_ammo_renders_exactly() {
+        let field_types = field_types(&[
+            ("ammo", "[i32; NUMAMMO]"),
+            ("maxammo", "[i32; NUMAMMO]"),
+            ("readyweapon", "i32"),
+            ("pendingweapon", "i32"),
+            ("weaponowned", "[bool; NUMWEAPONS]"),
+        ]);
+        let rendered = render_bool_fn_with_two_scalar_params(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveAmmo",
+            "Player",
+            &field_types,
+            "i32",
+            "i32",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveAmmo(player: &mut Player, ammo: i32, mut num: i32, world: &mut World) -> bool {
+    let mut oldammo;
+    if ammo == am_noammo {
+        return false;
+    }
+    if ammo < 0 || ammo > NUMAMMO {
+        I_Error(\"P_GiveAmmo: bad type %i\", ammo);
+    }
+    if player.ammo[ammo as usize] == player.maxammo[ammo as usize] {
+        return false;
+    }
+    if num != 0 {
+        num *= clipammo[ammo as usize];
+    } else {
+        num = clipammo[ammo as usize] / 2;
+    }
+    if gameskill == sk_baby || gameskill == sk_nightmare {
+        num <<= 1;
+    }
+    oldammo = player.ammo[ammo as usize];
+    player.ammo[ammo as usize] += num;
+    if player.ammo[ammo as usize] > player.maxammo[ammo as usize] {
+        player.ammo[ammo as usize] = player.maxammo[ammo as usize];
+    }
+    if oldammo != 0 {
+        return true;
+    }
+    match ammo {
+        am_clip => {
+            if player.readyweapon == wp_fist {
+                if player.weaponowned[wp_chaingun as usize] {
+                    player.pendingweapon = wp_chaingun;
+                } else {
+                    player.pendingweapon = wp_pistol;
+                }
+            }
+        }
+        am_shell => {
+            if player.readyweapon == wp_fist || player.readyweapon == wp_pistol {
+                if player.weaponowned[wp_shotgun as usize] {
+                    player.pendingweapon = wp_shotgun;
+                }
+            }
+        }
+        am_cell => {
+            if player.readyweapon == wp_fist || player.readyweapon == wp_pistol {
+                if player.weaponowned[wp_plasma as usize] {
+                    player.pendingweapon = wp_plasma;
+                }
+            }
+        }
+        am_misl => {
+            if player.readyweapon == wp_fist {
+                if player.weaponowned[wp_missile as usize] {
+                    player.pendingweapon = wp_missile;
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
     #[test]
     fn test_p_change_sector_driver_renders_exactly() {
         let param_types: HashMap<String, String> = [
