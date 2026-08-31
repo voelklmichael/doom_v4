@@ -2017,9 +2017,18 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // parameter-index shape once more, joining the *other*
             // (`Expr::Ident`-base) half of this cast list instead, since
             // `clipammo` is a plain unregistered global array, not a
-            // self-struct field.
+            // self-struct field. `tmbox[BOXTOP]`/`[BOXBOTTOM]`/`[BOXLEFT]`/
+            // `[BOXRIGHT]` (`P_BoxOnLineSide`, `p_maputl.c`, round 11's
+            // own corpus-wide sweep) is `blockbox`'s own exact enum-
+            // constant-index shape once more, just for a bare `fixed_t*
+            // tmbox` *parameter* (`&[FixedT; 4]` here) rather than a
+            // self-struct field -- joining `clipammo` on this `Expr::
+            // Ident`-base half of the list for the identical reason: a
+            // real function parameter's own array type is fixed by its
+            // declared signature, not a fresh local free to be inferred
+            // `usize`.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime" || n == "clipammo")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime" || n == "clipammo" || n == "tmbox")
                 || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites" || field == "ammo" || field == "weaponowned" || field == "blockbox" || field == "maxammo")
                 || (matches!(base.as_ref(), Expr::Member { field, .. } if field == "sidenum")
                     && matches!(index.as_ref(), Expr::Ident(_)))
@@ -3177,6 +3186,25 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
                 // not a whole comparison/bitand result handed straight to
                 // `return`).
                 format!("({text}) as i32")
+            } else if ctx.return_type == Some("FixedT")
+                && matches!(e, Expr::IntLiteral(_))
+                && !expr_is_fixed_t_valued(e, ctx)
+            {
+                // `return 0;` (`P_InterceptVector`/`P_InterceptVector2`,
+                // `p_maputl.c`/`p_sight.c`, round 11's own corpus-wide
+                // sweep) -- both real, declared `fixed_t`-returning
+                // functions whose "parallel divlines" early-out returns a
+                // bare `0` literal, not a genuine `FixedT` value
+                // (`frac`, their own other `return`, is already `FixedT`-
+                // valued via `fixed_t_locals` and needs no wrap here --
+                // `expr_is_fixed_t_valued` guards against double-wrapping
+                // it). `render_expr`'s own `Expr::IntLiteral` arm has no
+                // way to know the function's declared return type, so
+                // this needs the same "wrap at the `return` site itself"
+                // treatment as the `i32` comparison-cast arm just above,
+                // just for the opposite direction (narrower-than-demanded
+                // vs. a bare-`int`-literal standing in for `FixedT`).
+                format!("FixedT({text})")
             } else {
                 text
             };
@@ -3448,7 +3476,47 @@ fn render_switch(
         lines.push(format!("{}}}", indent(depth + 1)));
     }
     if !has_default {
-        lines.push(format!("{}_ => {{}}", indent(depth + 1)));
+        // `switch (ld->slopetype) { case ST_HORIZONTAL: ...; case
+        // ST_VERTICAL: ...; case ST_POSITIVE: ...; case ST_NEGATIVE: ...;
+        // }` (`P_BoxOnLineSide`, `p_maputl.c`, round 11's own corpus-wide
+        // sweep) -- no `default:` in the real C source at all, and every
+        // real arm unconditionally assigns `p1`/`p2`, read right after
+        // the switch with no other guard. A bare `_ => {}` (this
+        // renderer's ordinary "no default" fallback, matching C's own
+        // "no case matched, fall through and do nothing" semantics)
+        // compiles fine in C -- `slopetype_t` is a real value, always one
+        // of its four variants, so that path is genuinely unreachable in
+        // practice -- but Rust's definite-initialization checker can't
+        // know that from a plain `i32` match (`slopetype_t` isn't a real
+        // Rust `enum` under this project's own Enums decision) and
+        // rejects `p1`/`p2` as possibly-uninitialized on that path,
+        // confirmed a real `rustc` rejection first, not assumed.
+        // `slopetype_t`'s own definition (`r_defs.h`) has *exactly* these
+        // four variants and no more -- confirmed by direct read, not
+        // assumed -- so when a switch's own case labels cover that full,
+        // closed set, `_ => unreachable!()` is a faithful translation of
+        // "this can't really happen" rather than a silent behavior
+        // change, and satisfies the initialization checker the same way
+        // a real Rust `enum`'s own exhaustiveness would have. Scoped
+        // narrowly to this one closed, corpus-verified enum rather than a
+        // blanket change to every no-default switch's own fallback (most
+        // of which are genuinely open-ended `int`s, not a small closed
+        // set, and already-shipped tests assert the plain `_ => {}` text
+        // exactly).
+        const SLOPETYPE_VARIANTS: [&str; 4] =
+            ["ST_HORIZONTAL", "ST_VERTICAL", "ST_POSITIVE", "ST_NEGATIVE"];
+        let covers_slopetype = SLOPETYPE_VARIANTS.iter().all(|v| {
+            arms.iter().any(|a| {
+                a.labels
+                    .as_ref()
+                    .is_some_and(|ls| ls.iter().any(|l| l == v))
+            })
+        });
+        if covers_slopetype {
+            lines.push(format!("{}_ => unreachable!(),", indent(depth + 1)));
+        } else {
+            lines.push(format!("{}_ => {{}}", indent(depth + 1)));
+        }
     }
     lines.push(format!("{}}}", indent(depth)));
     Ok(lines)
@@ -5322,6 +5390,21 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                     ));
                 }
             }
+        } else if lhs_is_plain_int_local
+            && *op == AssignOp::Assign
+            && return_expr_needs_i32_cast(rhs)
+        {
+            // `p1 = tmbox[BOXTOP] > ld->v1->y;` (`P_BoxOnLineSide`,
+            // `p_maputl.c`, round 11's own corpus-wide sweep) --
+            // `return_expr_needs_i32_cast`'s own two shapes (a comparison
+            // renders as a genuine Rust `bool`; a bitwise-AND read off a
+            // known-`i16` field) turn up here too, just landing in a
+            // plain `int`-declared *local* assignment instead of a
+            // `Stmt::Return` -- the same "C's own comparison-as-int
+            // idiom needs an explicit cast Rust doesn't insert for free"
+            // gap that predicate already exists to close, reused verbatim
+            // rather than duplicating its two-shape match.
+            format!("({rhs_text}) as i32")
         } else {
             rhs_text
         };
@@ -16367,6 +16450,239 @@ pub fn P_PointOnLineSide(x: FixedT, y: FixedT, line: LineId, world: &mut World) 
         return 0;
     }
     return 1;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_MakeDivline` (`p_maputl.c`) -- round 11's own corpus-wide sweep,
+    /// the first of a small `DivLine` geometry cluster (`divline_t`,
+    /// `p_local.h`: four plain `fixed_t` fields, `x`/`y`/`dx`/`dy`, no
+    /// pointers -- confirmed by direct read, not assumed; mapped via
+    /// `struct_fields.rs`'s own generic field mapping with zero new code,
+    /// `test_maps_divline_t_exactly`, `struct_fields.rs`). Needs nothing
+    /// new beyond `render_world_fn`'s already-generic machinery: `li`
+    /// (`LineId`) resolves `li->v1->x`/`li->dx` through the same `world[
+    /// ..].v1`/plain-field arms `P_PointOnLineSide` already proved (keyed
+    /// on the parameter's own registered *type*, not its name, so a
+    /// differently-named `LineId` parameter reuses them unchanged), and
+    /// `dl` (a plain, non-cross-ref-typed `&mut DivLine` reference, the
+    /// first function needing one) writes straight through via the
+    /// generic `Expr::Member` fallback's own `dl.field = ..;` shape --
+    /// `is_cross_ref("&mut DivLine")` is false (not one of `CROSS_REF_
+    /// TYPES`), so it renders as a bare Rust field write with no `world[
+    /// ..]` wrap, exactly right for a plain stack-local struct passed by
+    /// reference rather than an arena-owned handle. Verified compiling
+    /// for real (`rustc --edition 2021 --crate-type lib`) against
+    /// hand-written `FixedT`/`DivLine`/`Line`/`Vertex`/`World` stand-ins
+    /// -- zero errors.
+    #[test]
+    fn test_p_make_divline_renders_exactly() {
+        let params = field_types(&[("li", "LineId"), ("dl", "&mut DivLine")]);
+        let rendered = render_world_fn(&corpus_dir(), "p_maputl.c", "P_MakeDivline", &params, None)
+            .expect("should render cleanly");
+        let expected = "\
+pub fn P_MakeDivline(li: LineId, dl: &mut DivLine, world: &mut World) {
+    dl.x = world[world[li].v1].x;
+    dl.y = world[world[li].v1].y;
+    dl.dx = world[li].dx;
+    dl.dy = world[li].dy;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_InterceptVector` (`p_maputl.c`) -- `P_MakeDivline`'s own sibling
+    /// in the same round-11 `DivLine` cluster, and the first function
+    /// needing `render_pure_fn` with real struct-pointer parameters
+    /// (`v2`/`v1: &DivLine`) rather than bare `FixedT` scalars (`P_
+    /// AproxDistance`'s own shape): `param_types` doing the same double
+    /// duty as `extra_cross_ref_idents` still works unchanged, since
+    /// `"&DivLine"` isn't one of `CROSS_REF_TYPES` either -- `v1->dy`
+    /// renders as a bare `v1.dy` through the same generic `Expr::Member`
+    /// fallback `P_MakeDivline`'s `dl` write just proved, just read
+    /// instead of written, no `World` involved anywhere in this function
+    /// at all (its own two pointer parameters are both self-contained
+    /// stack values). One new gap, closed narrowly: `return 0;`, this
+    /// function's own real "parallel divlines" early-out, hands a bare
+    /// `Expr::IntLiteral` straight to `return` from a declared `fixed_t`-
+    /// returning (not `int`-returning) function -- `Stmt::Return`'s
+    /// existing `i32`-narrowing cast arm doesn't apply (this is the
+    /// opposite direction, a literal *narrower* than the `FixedT` the
+    /// signature demands), so a symmetric `ctx.return_type == Some(
+    /// "FixedT") && !expr_is_fixed_t_valued(e, ..)` arm wraps it in
+    /// `FixedT(..)` at the same `return`-site -- `expr_is_fixed_t_valued`
+    /// already correctly recognizes the *other* return (`return frac;`,
+    /// a `fixed_t_locals`-registered local) as already-`FixedT`, so it's
+    /// left unwrapped, avoiding a double-wrap the naive "wrap every bare
+    /// literal" version would have produced. `FixedMul`/`FixedDiv`'s own
+    /// opaque-call recognition (`expr_is_fixed_t_valued`'s `Expr::Call`
+    /// arm) needed nothing further: `den`/`num` (`FixedMul(..) -
+    /// FixedMul(..)`/`FixedMul(..) + FixedMul(..)`) already render with
+    /// no spurious wrap via the pre-existing `Sub`/`Add` recursion, and
+    /// `(v1->x - v2->x)>>8`'s own explicit C parens are dropped (Rust's
+    /// own precedence table, `binary_prec`, ranks `Sub` above `Shr` the
+    /// same relative way C does, so they were always redundant -- not a
+    /// case this renderer was ever asked to preserve verbatim). Verified
+    /// compiling for real against the same stand-ins as `P_MakeDivline`
+    /// -- zero errors.
+    #[test]
+    fn test_p_intercept_vector_renders_exactly() {
+        let params = field_types(&[("v2", "&DivLine"), ("v1", "&DivLine")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_maputl.c",
+            "P_InterceptVector",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_InterceptVector(v2: &DivLine, v1: &DivLine) -> FixedT {
+    let mut frac;
+    let mut num;
+    let mut den;
+    den = FixedMul(v1.dy >> 8, v2.dx) - FixedMul(v1.dx >> 8, v2.dy);
+    if den == FixedT(0) {
+        return FixedT(0);
+    }
+    num = FixedMul(v1.x - v2.x >> 8, v1.dy) + FixedMul(v2.y - v1.y >> 8, v1.dx);
+    frac = FixedDiv(num, den);
+    return frac;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_InterceptVector2` (`p_sight.c`) -- `P_InterceptVector`'s own
+    /// exact byte-for-byte body twin, a second, independent corpus
+    /// definition (`p_sight.c`'s own private copy for its line-of-sight
+    /// scan, confirmed by direct read to be identical, not assumed to be
+    /// from the shared name alone) rather than a call to the first --
+    /// translated as its own separate function to match, the same
+    /// "two real corpus functions, two real Rust functions" precedent
+    /// `A_FireShotgun`/`A_FireShotgun2` already established for a
+    /// near-duplicate pair. Needs nothing beyond what `P_InterceptVector`
+    /// itself just proved.
+    #[test]
+    fn test_p_intercept_vector2_renders_exactly() {
+        let params = field_types(&[("v2", "&DivLine"), ("v1", "&DivLine")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_sight.c",
+            "P_InterceptVector2",
+            &params,
+            Some("FixedT"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_InterceptVector2(v2: &DivLine, v1: &DivLine) -> FixedT {
+    let mut frac;
+    let mut num;
+    let mut den;
+    den = FixedMul(v1.dy >> 8, v2.dx) - FixedMul(v1.dx >> 8, v2.dy);
+    if den == FixedT(0) {
+        return FixedT(0);
+    }
+    num = FixedMul(v1.x - v2.x >> 8, v1.dy) + FixedMul(v2.y - v1.y >> 8, v1.dx);
+    frac = FixedDiv(num, den);
+    return frac;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_BoxOnLineSide` (`p_maputl.c`) -- round 11's own last piece,
+    /// separate from the `DivLine` cluster (a bare `fixed_t* tmbox`/
+    /// `line_t* ld` pair instead). `tmbox` (really a fixed-size `fixed_t
+    /// tmbox[4]` at every real call site, confirmed by corpus read, not
+    /// assumed) renders as `&[FixedT; 4]`, and its `BOXTOP`/`BOXBOTTOM`/
+    /// `BOXLEFT`/`BOXRIGHT` indices reuse `P_ChangeSector`'s own already-
+    /// proven `m_bbox.h` enum-constant-index cast (`tmbox[BOXTOP as
+    /// usize]`) -- every enum constant in this codebase renders `i32`
+    /// (the Enums decision), so indexing a real `[FixedT; 4]` with one
+    /// needs the same `as usize` `sector.blockbox`/`clipammo` already
+    /// established, confirmed a genuine `rustc` rejection without it
+    /// first (my own first draft here omitted the cast, since `tmbox` --
+    /// a bare parameter, not a `self`-struct field -- didn't match
+    /// `blockbox`'s own field-name-keyed arm; `clipammo`'s existing
+    /// sibling *by-identifier* arm was the fix, `tmbox` simply joining
+    /// its by-name list). `switch (ld->slopetype)` needed one new, narrowly-
+    /// scoped mechanism in `render_switch` itself: this C source has no
+    /// `default:` case at all, and every real arm unconditionally assigns
+    /// `p1`/`p2` (read right after the switch, no other guard) --
+    /// `render_switch`'s ordinary "no default" fallback (a bare `_ =>
+    /// {}`, faithfully matching C's own "no case matched, do nothing"
+    /// semantics) compiles fine in C but fails Rust's definite-
+    /// initialization check here (confirmed a real `rustc` rejection
+    /// first, not assumed) since a plain `i32` match can't prove
+    /// exhaustiveness the way a real Rust `enum` would. `slopetype_t`
+    /// (`r_defs.h`) has *exactly* four variants and no more (confirmed by
+    /// direct read) -- when a switch's own case labels cover that
+    /// specific, closed, corpus-verified set, the fallback becomes `_ =>
+    /// unreachable!()` instead, a faithful "this can't really happen"
+    /// translation rather than a silent behavior change; scoped to
+    /// exactly this one named enum rather than a blanket change to every
+    /// no-default switch (most of which are genuinely open-ended, and
+    /// every already-shipped switch test still asserts the plain `_ =>
+    /// {}` text exactly, unaffected). The two comparison-into-`p1`/`p2`
+    /// assignments (`p1 = tmbox[BOXTOP] > ld->v1->y;`) needed a second
+    /// new arm: `render_expr_stmt`'s existing `Stmt::Return`-site `as
+    /// i32` cast (`return_expr_needs_i32_cast`, `P_PointOnLineSide`'s own
+    /// gap) has a direct sibling gap for a plain `int`-declared *local*
+    /// assignment instead of a `return` -- reused verbatim (not
+    /// duplicated) as a new `lhs_is_plain_int_local && return_expr_needs_
+    /// i32_cast(rhs)` arm. `p1 ^= 1;`/`P_PointOnLineSide(..)` (an already-
+    /// translated `render_world_fn` sibling, called here the same
+    /// "forward-reference by name, original C argument list" way every
+    /// other cross-function call in this corpus already is, per this
+    /// project's own not-yet-resolved cross-function-signature-wiring
+    /// gap) needed nothing further. Verified compiling for real against
+    /// hand-written stand-ins (including the `_ => unreachable!()` arm,
+    /// confirmed to actually satisfy the initialization checker, not
+    /// just silence it by assumption) -- zero errors.
+    #[test]
+    fn test_p_box_on_line_side_renders_exactly() {
+        let params = field_types(&[("tmbox", "&[FixedT; 4]"), ("ld", "LineId")]);
+        let rendered = render_world_fn(
+            &corpus_dir(),
+            "p_maputl.c",
+            "P_BoxOnLineSide",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_BoxOnLineSide(tmbox: &[FixedT; 4], ld: LineId, world: &mut World) -> i32 {
+    let mut p1;
+    let mut p2;
+    match world[ld].slopetype {
+        ST_HORIZONTAL => {
+            p1 = (tmbox[BOXTOP as usize] > world[world[ld].v1].y) as i32;
+            p2 = (tmbox[BOXBOTTOM as usize] > world[world[ld].v1].y) as i32;
+            if world[ld].dx < FixedT(0) {
+                p1 ^= 1;
+                p2 ^= 1;
+            }
+        }
+        ST_VERTICAL => {
+            p1 = (tmbox[BOXRIGHT as usize] < world[world[ld].v1].x) as i32;
+            p2 = (tmbox[BOXLEFT as usize] < world[world[ld].v1].x) as i32;
+            if world[ld].dy < FixedT(0) {
+                p1 ^= 1;
+                p2 ^= 1;
+            }
+        }
+        ST_POSITIVE => {
+            p1 = P_PointOnLineSide(tmbox[BOXLEFT as usize], tmbox[BOXTOP as usize], ld);
+            p2 = P_PointOnLineSide(tmbox[BOXRIGHT as usize], tmbox[BOXBOTTOM as usize], ld);
+        }
+        ST_NEGATIVE => {
+            p1 = P_PointOnLineSide(tmbox[BOXRIGHT as usize], tmbox[BOXTOP as usize], ld);
+            p2 = P_PointOnLineSide(tmbox[BOXLEFT as usize], tmbox[BOXBOTTOM as usize], ld);
+        }
+        _ => unreachable!(),
+    }
+    if p1 == p2 {
+        return p1;
+    }
+    return -1;
 }";
         assert_eq!(rendered, expected);
     }

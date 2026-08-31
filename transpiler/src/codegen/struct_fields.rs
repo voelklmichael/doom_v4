@@ -704,6 +704,31 @@ mod tests {
     }
 
     #[test]
+    fn test_maps_divline_t_exactly() {
+        // p_local.h's divline_t: a plain value struct, four `fixed_t`
+        // fields (x, y, dx, dy), no pointers -- `P_MakeDivline`/
+        // `P_InterceptVector`'s own scratch geometry (round 11's own
+        // corpus-wide sweep, `transpiler/src/codegen/function_body.rs`),
+        // built fresh on the caller's own stack each time rather than
+        // arena-owned, the same "plain value struct" shape `mapthing_t`
+        // already established -- just `fixed_t` fields (-> `FixedT`)
+        // instead of `short` (-> `i16`).
+        let items = parse_rough("p_local.h");
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "divline_t").expect("divline_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("x", "FixedT"),
+                field("y", "FixedT"),
+                field("dx", "FixedT"),
+                field("dy", "FixedT"),
+            ]
+        );
+    }
+
+    #[test]
     fn test_mobj_t_maps_completely() {
         // mobj_t (p_mobj.h), the 9th and by far largest thinker subclass,
         // now maps end to end: mobjinfo_t*/state_t* as &'static references
