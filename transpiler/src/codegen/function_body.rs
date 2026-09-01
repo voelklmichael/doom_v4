@@ -4839,6 +4839,103 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
     }
 }
 
+/// `P_SetMobjState(<target>, <state>)` in statement position --
+/// `is_self_removal_call`'s own sibling for the same real corpus shape,
+/// narrowly matched by callee name (`p_local.h`'s own `boolean
+/// P_SetMobjState (mobj_t* mobj, statenum_t state);`). Returns the two
+/// real arguments split apart (`(target, state)`), letting a caller tell
+/// a self-targeted call (`target` a bare reference to `self_param`
+/// itself -- already a live `&mut Mobj`, with the identical `handle`/
+/// mutable-`Arena` companion self-removal already needs, per
+/// `P_SetMobjState`'s own real signature: `P_RemoveMobj`'s precedent plus
+/// a `state: i32`) apart from every other real target this codebase's
+/// already-shipped callers use (`player.mo`, a spawned `P_SpawnMobj`
+/// local, a `corpsehit`-shaped `extra_cross_ref_idents` alias) -- none of
+/// those have a live `&mut Mobj` already in scope, so they route through
+/// `Arena::take_out` instead of a direct call (see `render_expr_stmt`'s
+/// own new arm, round 20's retrofit of round 19's `P_SetMobjState`
+/// translation into its own already-shipped callers).
+fn as_p_set_mobj_state_call(e: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Call { callee, args } = e else {
+        return None;
+    };
+    if !matches!(callee.as_ref(), Expr::Ident(n) if n == "P_SetMobjState") {
+        return None;
+    }
+    let [target, state] = args.as_slice() else {
+        return None;
+    };
+    Some((target, state))
+}
+
+/// Scans `items` (recursively, including nested `for` loops --
+/// `A_VileChase`'s own doubly-nested block-iteration scan is the one real
+/// corpus example needing that, the same gap `body_has_target_write`'s own
+/// doc comment already flagged and fixed for the identical reason) for
+/// every real `P_SetMobjState` call, setting `*self_found` if any targets
+/// `self_param` itself and `*other_found` if any targets anything else.
+/// Mirrors `body_has_self_removal`'s own recursive statement shape.
+fn scan_set_mobj_state_calls(
+    items: &[BlockItem],
+    self_param: &str,
+    self_found: &mut bool,
+    other_found: &mut bool,
+) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            scan_set_mobj_state_calls_stmt(s, self_param, self_found, other_found);
+        }
+    }
+}
+
+fn scan_set_mobj_state_calls_stmt(
+    s: &Stmt,
+    self_param: &str,
+    self_found: &mut bool,
+    other_found: &mut bool,
+) {
+    if let Stmt::Expr(Some(e)) = s
+        && let Some((target, _)) = as_p_set_mobj_state_call(e)
+    {
+        if matches!(target, Expr::Ident(n) if n == self_param) {
+            *self_found = true;
+        } else {
+            *other_found = true;
+        }
+    }
+    match s {
+        Stmt::Compound(c) => {
+            scan_set_mobj_state_calls(&c.items, self_param, self_found, other_found)
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            scan_set_mobj_state_calls_stmt(then_branch, self_param, self_found, other_found);
+            if let Some(eb) = else_branch {
+                scan_set_mobj_state_calls_stmt(eb, self_param, self_found, other_found);
+            }
+        }
+        Stmt::Switch { body, .. } => {
+            scan_set_mobj_state_calls_stmt(body, self_param, self_found, other_found)
+        }
+        Stmt::Case { stmt, .. } => {
+            scan_set_mobj_state_calls_stmt(stmt, self_param, self_found, other_found)
+        }
+        Stmt::Default(stmt) => {
+            scan_set_mobj_state_calls_stmt(stmt, self_param, self_found, other_found)
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            scan_set_mobj_state_calls_stmt(body, self_param, self_found, other_found)
+        }
+        Stmt::For { body, .. } => {
+            scan_set_mobj_state_calls_stmt(body, self_param, self_found, other_found)
+        }
+        _ => {}
+    }
+}
+
 /// Whether `e` is built entirely from a known real `FixedT` source
 /// (`FRACUNIT`, or a self-struct/`Handle<Thinker>`-local field
 /// registered `"FixedT"` -- both share `ctx.self_field_types`, since a
@@ -5084,6 +5181,56 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     // caller supplies them by hand.
     if is_self_removal_call(e, ctx.self_param) {
         return Ok(format!("{}.remove(handle)", ctx.self_removal_ident));
+    }
+    // `P_SetMobjState(actor, actor->info->seestate);` -- round 20's own
+    // retrofit of round 19's real `P_SetMobjState` translation into its
+    // already-shipped callers (`docs/03_TRANSPILER.md`'s round 19 entry
+    // flagged this as real, measured, NOT-yet-attempted follow-up work).
+    // A self-targeted call (`target` a bare reference to `self_param`
+    // itself, e.g. `A_Chase`'s own `P_SetMobjState (actor, ..)`) already
+    // has a live `&mut Mobj` in scope (`self_param` itself) plus the exact
+    // `handle`/mutable-`Arena` companion self-removal already established
+    // (`needs_self_set_mobj_state_call` is folded into the identical
+    // signature-decision arithmetic as `needs_self_removal` throughout
+    // `render_fn_impl`/`render_weapon_fn`), so it renders as a direct call
+    // reusing those same three names. Every other real target
+    // (`player.mo`, a spawned `P_SpawnMobj` local, a `corpsehit`-shaped
+    // `extra_cross_ref_idents` alias) has no live `&mut Mobj` already in
+    // scope for it -- only a `Handle<Thinker>` *value* -- so it routes
+    // through `Arena::take_out` instead (round 19's own tool, built and
+    // tested but "not used by any shipped caller yet"; this is that
+    // caller), destructuring the `&mut Thinker` it hands back into the one
+    // real `Mobj`-shaped variant `P_SetMobjState` itself needs -- silently
+    // a no-op if it somehow isn't (never happens for any real corpus
+    // target here, the same "arena invariant, not guessed" trust every
+    // other `Handle<Thinker>` write site already extends). `thinkers` is
+    // hardcoded, not `ctx.self_removal_ident`, since every renderer this
+    // reaches names its own *separately-tracked* mutable `Arena<Thinker>`
+    // parameter `thinkers` whenever one exists apart from the exclusive
+    // self-removal-only `arena` shape -- and `needs_other_set_mobj_state_
+    // call` always forces that separate `thinkers` parameter into
+    // existence wherever this arm can fire (see each renderer's own
+    // signature-decision update). A target already `Option<Handle
+    // <Thinker>>`-typed (`is_option_valued`, `corpsehit`'s own shape)
+    // needs an explicit `.unwrap()` first -- `take_out` itself only takes
+    // a bare `Handle<T>`.
+    if let Some((target, state)) = as_p_set_mobj_state_call(e) {
+        let (state_text, _) = render_expr(state, ctx)?;
+        if matches!(target, Expr::Ident(n) if n == ctx.self_param) {
+            return Ok(format!(
+                "P_SetMobjState({}, {state_text}, world, handle, {})",
+                ctx.self_param, ctx.self_removal_ident
+            ));
+        }
+        let (target_text, _) = render_expr(target, ctx)?;
+        let target_text = if is_option_valued(target, ctx) {
+            format!("{target_text}.unwrap()")
+        } else {
+            target_text
+        };
+        return Ok(format!(
+            "thinkers.take_out({target_text}, |t, h, a| {{ if let Thinker::Mobj(m) = t {{ P_SetMobjState(m, {state_text}, world, h, a); }} }})"
+        ));
     }
     if let Expr::Assign { op, lhs, rhs } = e {
         // `door->field = expr;`, inside `render_existing_thinker_mutation`'s
@@ -6946,7 +7093,30 @@ fn render_fn_impl_with_two_scalar_params(
             "{fn_name}: needs both self-removal and a spawned mobj's own handle value -- not yet designed (see render_fn's own extra_params comment), fix by hand rather than guessing"
         ));
     }
-    let composed_self_removal = needs_self_removal && (needs_target_deref || needs_spawn_mut);
+    // `P_SetMobjState(actor, ..)`/`P_SetMobjState(corpsehit, ..)` (round
+    // 20's own retrofit of round 19's real `P_SetMobjState` translation
+    // into its already-shipped callers, `docs/03_TRANSPILER.md`'s round 19
+    // entry) -- see `as_p_set_mobj_state_call`'s own doc comment for why a
+    // self-targeted call needs exactly the same `handle`/mutable-`Arena`
+    // shape self-removal already established (`needs_self_set_mobj_state_
+    // call` is folded into `needs_handle_and_mut_arena` below, the same
+    // signature-decision arithmetic `needs_self_removal` alone used to
+    // drive by itself), while any other target only ever needs a real
+    // mutable `Arena` lookup (`needs_other_set_mobj_state_call`, folded
+    // into `composed_self_removal`'s own "does a separately-named
+    // `thinkers` parameter already exist" condition and into `thinkers_
+    // part`'s own mutable-arm trigger list below), never `handle` itself.
+    let mut needs_self_set_mobj_state_call = false;
+    let mut needs_other_set_mobj_state_call = false;
+    scan_set_mobj_state_calls(
+        &f.body.items,
+        &param_name,
+        &mut needs_self_set_mobj_state_call,
+        &mut needs_other_set_mobj_state_call,
+    );
+    let needs_handle_and_mut_arena = needs_self_removal || needs_self_set_mobj_state_call;
+    let composed_self_removal = needs_handle_and_mut_arena
+        && (needs_target_deref || needs_spawn_mut || needs_other_set_mobj_state_call);
     let self_removal_ident = if composed_self_removal {
         "thinkers"
     } else {
@@ -6979,9 +7149,12 @@ fn render_fn_impl_with_two_scalar_params(
         return_type: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
-    let handle_part = if needs_self_removal && !composed_self_removal {
+    let handle_part = if needs_handle_and_mut_arena && !composed_self_removal {
         ", handle: Handle<Thinker>, arena: &mut Arena<Thinker>"
-    } else if needs_self_removal || needs_self_handle_value || needs_self_identity_comparison {
+    } else if needs_handle_and_mut_arena
+        || needs_self_handle_value
+        || needs_self_identity_comparison
+    {
         ", handle: Handle<Thinker>"
     } else {
         ""
@@ -6991,12 +7164,13 @@ fn render_fn_impl_with_two_scalar_params(
     } else {
         ""
     };
-    let thinkers_part = if needs_self_removal && !composed_self_removal {
+    let thinkers_part = if needs_handle_and_mut_arena && !composed_self_removal {
         ""
     } else if needs_spawn_mut
         || composed_self_removal
         || needs_target_write
         || needs_self_handle_field_write
+        || needs_other_set_mobj_state_call
     {
         ", thinkers: &mut Arena<Thinker>"
     } else if needs_target_deref
@@ -7162,13 +7336,36 @@ pub fn render_weapon_fn(
     // by-name `World` global reached from a weapon action gets the same
     // treatment with no further signature-shape change needed.
     let needs_bulletslope = body_has_any_ident_ref(&f.body.items, &["bulletslope"]);
-    let needs_world = needs_linetarget || needs_bulletslope;
+    // `P_SetMobjState(player->mo, S_PLAY_ATK2)` (`A_GunFlash`/`A_FirePistol`/
+    // `A_FireShotgun`/`A_FireShotgun2`/`A_FireCGun`/`A_WeaponReady`, round
+    // 20's own retrofit of round 19's real `P_SetMobjState` translation
+    // into its already-shipped callers) -- `player.mo` is never
+    // `player_param` itself (a weapon action's own receiver is `player`,
+    // never a `mobj_t*`), so every real call site here is `as_p_set_mobj_
+    // state_call`'s "other target" shape: no live `&mut Mobj` for
+    // `player.mo`, so it needs both a real `world: &mut World` (an actual
+    // parameter argument, not just a global it happens to read) and a real
+    // *mutable* `Arena` lookup (`Arena::take_out`, `render_expr_stmt`'s own
+    // new arm), the same "measure, don't add speculatively" upgrade every
+    // other flag here already follows. `self_found`/`other_found` share
+    // one scan (`scan_set_mobj_state_calls`); only `other_found` is ever
+    // real here, but nothing here assumes that in case a future weapon
+    // action's own body somehow changes that.
+    let mut needs_self_set_mobj_state_call = false;
+    let mut needs_set_mobj_state_call = false;
+    scan_set_mobj_state_calls(
+        &f.body.items,
+        &player_param,
+        &mut needs_self_set_mobj_state_call,
+        &mut needs_set_mobj_state_call,
+    );
+    let needs_world = needs_linetarget || needs_bulletslope || needs_set_mobj_state_call;
     let world_part = if needs_world {
         ", world: &mut World"
     } else {
         ""
     };
-    let thinkers_part = if needs_self_handle_write {
+    let thinkers_part = if needs_self_handle_write || needs_set_mobj_state_call {
         ", thinkers: &mut Arena<Thinker>"
     } else if needs_self_handle_deref || needs_linetarget {
         ", thinkers: &Arena<Thinker>"
@@ -9956,13 +10153,13 @@ pub fn T_Glow(g: &mut Glow, world: &mut World) {
         .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_CPosRefire(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_CPosRefire(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
              A_FaceTarget(actor);\n    \
              if P_Random() < 40 {\n        \
              return;\n    \
              }\n    \
              if actor.target.is_none() || match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 || !P_CheckSight(actor, actor.target) {\n        \
-             P_SetMobjState(actor, actor.info.seestate);\n    \
+             P_SetMobjState(actor, actor.info.seestate, world, handle, thinkers);\n    \
              }\n\
              }"
         );
@@ -9985,13 +10182,13 @@ pub fn T_Glow(g: &mut Glow, world: &mut World) {
         .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_SpidRefire(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_SpidRefire(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
              A_FaceTarget(actor);\n    \
              if P_Random() < 10 {\n        \
              return;\n    \
              }\n    \
              if actor.target.is_none() || match thinkers.get(actor.target.unwrap()) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 || !P_CheckSight(actor, actor.target) {\n        \
-             P_SetMobjState(actor, actor.info.seestate);\n    \
+             P_SetMobjState(actor, actor.info.seestate, world, handle, thinkers);\n    \
              }\n\
              }"
         );
@@ -13518,7 +13715,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              z = 128 + P_Random() * 2 * FRACUNIT;\n    \
              th = P_SpawnMobj(x, y, z, MT_ROCKET);\n    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FixedT(P_Random() * 512); };\n    \
-             P_SetMobjState(th, S_BRAINEXPLODE1);\n    \
+             thinkers.take_out(th, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_BRAINEXPLODE1, world, h, a); } });\n    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 7; };\n    \
              if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {\n        \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };\n    \
@@ -13763,8 +13960,8 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_GunFlash(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
-             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+            "pub fn A_GunFlash(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n\
              }"
         );
@@ -13833,9 +14030,9 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_FirePistol(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+            "pub fn A_FirePistol(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              S_StartSound(player.mo, sfx_pistol);\n    \
-             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
              P_BulletSlope(player.mo);\n    \
@@ -13942,10 +14139,10 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
                 .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_FireShotgun(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+            "pub fn A_FireShotgun(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              let mut i;\n    \
              S_StartSound(player.mo, sfx_shotgn);\n    \
-             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
              P_BulletSlope(player.mo);\n    \
@@ -14019,12 +14216,12 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_FireShotgun2(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_FireShotgun2(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              let mut i;\n    \
              let mut angle;\n    \
              let mut damage;\n    \
              S_StartSound(player.mo, sfx_dshtgn);\n    \
-             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 2;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
              P_BulletSlope(player.mo);\n    \
@@ -14074,7 +14271,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              z = 128 + P_Random() * 2 * FRACUNIT;\n        \
              th = P_SpawnMobj(x, y, z, MT_ROCKET);\n        \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = FixedT(P_Random() * 512); };\n        \
-             P_SetMobjState(th, S_BRAINEXPLODE1);\n        \
+             thinkers.take_out(th, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_BRAINEXPLODE1, world, h, a); } });\n        \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics -= P_Random() & 7; };\n        \
              if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {\n            \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };\n        \
@@ -14402,7 +14599,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }\n    \
              newmobj = P_SpawnMobj(match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() }, r#type);\n    \
              if P_LookForPlayers(newmobj, true) {\n        \
-             P_SetMobjState(newmobj, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.seestate);\n    \
+             thinkers.take_out(newmobj, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.seestate, world, h, a); } });\n    \
              }\n    \
              P_TeleportMove(newmobj, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
              thinkers.remove(handle);\n\
@@ -14825,7 +15022,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_Look(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_Look(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
              'seeyou: {\n        \
              let mut targ;\n        \
              actor.threshold = 0;\n        \
@@ -14863,7 +15060,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              S_StartSound(actor, sound);\n        \
              }\n    \
              }\n    \
-             P_SetMobjState(actor, actor.info.seestate);\n\
+             P_SetMobjState(actor, actor.info.seestate, world, handle, thinkers);\n\
              }"
         );
     }
@@ -14965,12 +15162,12 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_FireCGun(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+            "pub fn A_FireCGun(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              S_StartSound(player.mo, sfx_pistol);\n    \
              if player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] == 0 {\n        \
              return;\n    \
              }\n    \
-             P_SetMobjState(player.mo, S_PLAY_ATK2);\n    \
+             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + state_index(psp.state) - S_CHAIN1);\n    \
              P_BulletSlope(player.mo);\n    \
@@ -15486,10 +15683,10 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              actor.target = world.corpsehit;\n                    \
              A_FaceTarget(actor);\n                    \
              actor.target = temp;\n                    \
-             P_SetMobjState(actor, S_VILE_HEAL1);\n                    \
+             P_SetMobjState(actor, S_VILE_HEAL1, world, handle, thinkers);\n                    \
              S_StartSound(world.corpsehit, sfx_slop);\n                    \
              info = match thinkers.get(world.corpsehit.unwrap()) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() };\n                    \
-             P_SetMobjState(world.corpsehit, info.raisestate);\n                    \
+             thinkers.take_out(world.corpsehit.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, info.raisestate, world, h, a); } });\n                    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.height <<= 2; };\n                    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.flags = info.flags; };\n                    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world.corpsehit.unwrap()) { m.health = info.spawnhealth; };\n                    \
@@ -15556,11 +15753,11 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_WeaponReady(player: &mut Player, psp: &mut PlayerSpriteState, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_WeaponReady(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              let mut newstate;\n    \
              let mut angle;\n    \
              if state_index(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK1 || state_index(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK2 {\n        \
-             P_SetMobjState(player.mo, S_PLAY);\n    \
+             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY, world, h, a); } });\n    \
              }\n    \
              if player.readyweapon == wp_chainsaw && state_index(psp.state) == S_SAW {\n        \
              S_StartSound(player.mo, sfx_sawidl);\n    \
@@ -15670,7 +15867,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_Chase(actor: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) {\n    \
+            "pub fn A_Chase(actor: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
              'nomissile: {\n        \
              let mut delta;\n        \
              if actor.reactiontime != 0 {\n            \
@@ -15698,7 +15895,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if P_LookForPlayers(actor, true) {\n                \
              return;\n            \
              }\n            \
-             P_SetMobjState(actor, actor.info.spawnstate);\n            \
+             P_SetMobjState(actor, actor.info.spawnstate, world, handle, thinkers);\n            \
              return;\n        \
              }\n        \
              if (actor.flags & MF_JUSTATTACKED) != 0 {\n            \
@@ -15712,7 +15909,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if actor.info.attacksound != 0 {\n                \
              S_StartSound(actor, actor.info.attacksound);\n            \
              }\n            \
-             P_SetMobjState(actor, actor.info.meleestate);\n            \
+             P_SetMobjState(actor, actor.info.meleestate, world, handle, thinkers);\n            \
              return;\n        \
              }\n        \
              if actor.info.missilestate != 0 {\n            \
@@ -15722,7 +15919,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if !P_CheckMissileRange(actor) {\n                \
              break 'nomissile;\n            \
              }\n            \
-             P_SetMobjState(actor, actor.info.missilestate);\n            \
+             P_SetMobjState(actor, actor.info.missilestate, world, handle, thinkers);\n            \
              actor.flags |= MF_JUSTATTACKED;\n            \
              return;\n        \
              }\n    \
@@ -15858,11 +16055,11 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
         .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn P_ExplodeMissile(mo: &mut Mobj, world: &mut World) {\n    \
+            "pub fn P_ExplodeMissile(mo: &mut Mobj, world: &mut World, handle: Handle<Thinker>, arena: &mut Arena<Thinker>) {\n    \
              mo.momz = FixedT(0);\n    \
              mo.momy = mo.momz;\n    \
              mo.momx = mo.momy;\n    \
-             P_SetMobjState(mo, MOBJINFO[mo.r#type as usize].deathstate);\n    \
+             P_SetMobjState(mo, MOBJINFO[mo.r#type as usize].deathstate, world, handle, arena);\n    \
              mo.tics -= P_Random() & 3;\n    \
              if mo.tics < 1 {\n        \
              mo.tics = 1;\n    \
@@ -17416,7 +17613,7 @@ pub fn PIT_ChangeSector(thing: &mut Mobj, world: &mut World, thinkers: &mut Aren
         return true;
     }
     if thing.health <= 0 {
-        P_SetMobjState(thing, S_GIBS);
+        P_SetMobjState(thing, S_GIBS, world, handle, thinkers);
         thing.flags &= !MF_SOLID;
         thing.height = FixedT(0);
         thing.radius = FixedT(0);
@@ -18492,7 +18689,7 @@ pub fn P_SpawnPuff(x: FixedT, y: FixedT, mut z: FixedT, world: &mut World, think
         if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };
     }
     if world.attackrange == MELEERANGE {
-        P_SetMobjState(th, S_PUFF3);
+        thinkers.take_out(th, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PUFF3, world, h, a); } });
     }
 }";
         assert_eq!(rendered, expected);
@@ -18542,10 +18739,10 @@ pub fn P_SpawnBlood(x: FixedT, y: FixedT, mut z: FixedT, damage: i32, world: &mu
         if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.tics = 1; };
     }
     if damage <= 12 && damage >= 9 {
-        P_SetMobjState(th, S_BLOOD2);
+        thinkers.take_out(th, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_BLOOD2, world, h, a); } });
     } else {
         if damage < 9 {
-            P_SetMobjState(th, S_BLOOD3);
+            thinkers.take_out(th, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_BLOOD3, world, h, a); } });
         }
     }
 }";
@@ -18730,12 +18927,12 @@ pub fn P_BringUpWeapon(player: &mut Player, world: &mut World) {
         )
         .expect("should render cleanly");
         let expected = "\
-pub fn P_FireWeapon(player: &mut Player, world: &mut World) {
+pub fn P_FireWeapon(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) {
     let mut newstate;
     if !P_CheckAmmo(player) {
         return;
     }
-    P_SetMobjState(player.mo, S_PLAY_ATK1);
+    thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK1, world, h, a); } });
     newstate = weaponinfo[player.readyweapon as usize].atkstate;
     P_SetPsprite(player, ps_weapon, newstate);
     P_NoiseAlert(player.mo, player.mo);
