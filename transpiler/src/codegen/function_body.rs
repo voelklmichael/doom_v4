@@ -413,6 +413,30 @@ struct FnBodyContext<'a> {
     /// everywhere else, including every isolated-fragment test below that
     /// doesn't exercise a `for` loop at all.
     active_for_continue_step: Option<&'a str>,
+    /// A `break;` reached directly inside the current `switch`'s own arms
+    /// targets *this* label (`render_switch`'s own choice, only when at
+    /// least one arm's body actually contains a real, "surviving"
+    /// `Stmt::Break` -- see its own doc comment for why every earlier
+    /// corpus switch never needed this at all: a `break;` written as the
+    /// very last statement of a `case` is C's own fallthrough-prevention
+    /// idiom, already consumed and dropped by `collect_case_labels`'s own
+    /// arm-splitting before `render_stmt` ever sees it; only a `break`
+    /// reached from *inside* a nested construct within a case body (e.g.
+    /// `P_TouchSpecialThing`'s own `if (!netgame) break;`, `p_inter.c`) is
+    /// a real mid-case early exit that needs Rust help, since a bare
+    /// `break;` inside a `match` arm doesn't compile at all -- `match`
+    /// isn't a loop). Rust's own `break 'label;` on a labeled block is the
+    /// direct equivalent: `render_switch` wraps the whole `match` in
+    /// `'label: { .. }` only when this is needed, so every already-shipped
+    /// switch (never needing it) renders identically to before. Reset to
+    /// `None` while rendering a nested loop's own body (`render_for`/
+    /// `render_while`) -- the same "an inner construct's own `break`
+    /// shadows an outer one" reasoning `active_for_continue_step` already
+    /// gets for `continue`, just for `break`/`switch` instead of
+    /// `continue`/`for`. Left untouched while recursing into a nested `if`/
+    /// `case`/`default` within the same switch arm (no construct of its
+    /// own to shadow it with).
+    switch_break_label: Option<&'a str>,
     /// This function's own declared Rust return type (`render_pure_fn`/
     /// `render_world_fn`'s own `return_type` parameter, threaded through
     /// verbatim), needed for exactly one purpose so far: `Stmt::Return`
@@ -678,6 +702,24 @@ fn is_self_bare_handle_field(
             && self_field_types.get(field.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
 }
 
+/// `player->mo` where `player` is a *local*/parameter registered
+/// `Option<PlayerId>` in `extra_cross_ref_idents` (not `self`) --
+/// `is_self_bare_handle_field`'s own sibling for `render_trigger_fn`'s
+/// shape, needed by `P_TouchSpecialThing`'s own `player->mo->health =
+/// player->health;` (`player = toucher->player;`, `p_inter.c`).
+/// `Player.mo`'s own real declared type is a bare (non-`Option`)
+/// `Handle<Thinker>` (the same "no real call site ever null-checks this"
+/// reasoning `is_self_bare_handle_field`'s own doc comment already
+/// established), so this chain-through arm needs no further `.unwrap()`
+/// beyond the one `player`'s own `Option<PlayerId>` base already gets
+/// (`world[player.unwrap()].mo`, via the pre-existing generic
+/// `Option<PlayerId>`/`Option<SectorId>` `Member` read arm).
+fn is_option_player_mo_field(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Member { base, field, .. }
+        if field == "mo"
+            && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")))
+}
+
 /// Renders `e`, returning `(text, is_unresolved_cross_ref)` -- the second
 /// element is only ever `true` for a `Member` result naming a direct
 /// cross-reference field of `self_param` (see module docs); every other
@@ -922,6 +964,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // `== 0` int-truthiness cast a plain `int` global would need).
             if name == "onground" {
                 return Ok(("world.onground".to_string(), false));
+            }
+            // `netgame` (`doomstat.h`'s own `extern boolean netgame;`,
+            // defined `g_game.c`, "only true if packets are broadcast") --
+            // `onground`/`crushchange`/`nofit`'s own category, genuinely
+            // `bool`-typed. Unlike `onground` (whose one reference is
+            // nested inside a `&&`, reached only through `render_expr`'s
+            // already-correct generic `Unary::Not` fallback),
+            // `P_TouchSpecialThing`'s `if (!netgame) break;` is a bare
+            // *top-level* condition, going through `render_bool_expr`
+            // instead -- that function's own generic `Unary::Not` arm
+            // renders `x == 0`, which doesn't compile against a real
+            // `bool` (no `PartialEq<i32>`), so `render_bool_expr` also
+            // gets a `name == "netgame"` special case right below,
+            // matching the existing `ctx.bool_locals`-keyed arms' own
+            // "already bool, no cast" treatment.
+            if name == "netgame" {
+                return Ok(("world.netgame".to_string(), false));
             }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
@@ -1307,6 +1366,21 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `player->mo->field` -- `is_option_player_mo_field`'s own read
+        // arm, the `render_trigger_fn`-shaped (`player` a local, not
+        // `self`) sibling of the arm just above. `P_TouchSpecialThing`'s
+        // own `player->mo->health = player->health;` (`p_inter.c`) is the
+        // real corpus example.
+        Expr::Member { base, field, .. } if is_option_player_mo_field(base, ctx) => {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!(
+                    "match thinkers.get({base_text}) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
+                    rust_field_name(field)?
+                ),
+                false,
+            ))
+        }
         // `(activeplats[i])->status = (activeplats[i])->oldstatus;`
         // (`P_ActivateInStasis`) -- the RHS reads a *different* field of
         // the exact *same* handle the LHS write's own `get_mut` already
@@ -1658,6 +1732,45 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             };
             Ok((
                 format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
+        // `player == &players[consoleplayer]` (`P_TouchSpecialThing`,
+        // `p_inter.c`) -- the `render_trigger_fn`-shaped sibling of the
+        // `ctx.self_param` arm just above: here `player` is a *local*
+        // registered `Option<PlayerId>` (`player = toucher->player;`),
+        // not a self-struct receiver, so there's no `player_id` parameter
+        // to substitute in -- the local's own value already carries its
+        // identity, needing only the same `.unwrap()` every other real
+        // dereference of it in this function already gets (every one of
+        // this function's own ~30 switch arms already assumes `player`
+        // non-`None` by construction, the same corpus-matching discipline
+        // as those). No new signature extension needed, unlike the
+        // `body_has_player_console_identity` mechanism above.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (matches!(lhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>"))
+                    || matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")))
+                && (is_player_console_identity_rhs(lhs) || is_player_console_identity_rhs(rhs)) =>
+        {
+            let is_option_player = |e: &Expr| matches!(e, Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>"));
+            let side_text = |e: &Expr| -> Result<String, String> {
+                if is_option_player(e) {
+                    let Expr::Ident(n) = e else {
+                        unreachable!("guarded above")
+                    };
+                    Ok(format!("{n}.unwrap()"))
+                } else {
+                    Ok("world.consoleplayer".to_string())
+                }
+            };
+            Ok((
+                format!(
+                    "{} {} {}",
+                    side_text(lhs)?,
+                    render_binop(*op),
+                    side_text(rhs)?
+                ),
                 false,
             ))
         }
@@ -2532,7 +2645,15 @@ fn render_binary_operand(
 /// being folded in here.
 fn is_bool_returning_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { callee, .. }
-        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move" || n == "P_ThingHeightClip" || n == "P_CheckAmmo"))
+        if matches!(callee.as_ref(), Expr::Ident(n) if n == "P_CheckMeleeRange" || n == "P_CheckSight" || n == "P_LookForPlayers" || n == "P_TryMove" || n == "P_BlockThingsIterator" || n == "P_CheckPosition" || n == "P_CheckMissileRange" || n == "P_Move" || n == "P_ThingHeightClip" || n == "P_CheckAmmo"
+            // `P_Give{Armor,Body,Power,Ammo,Weapon}` (`p_inter.c`, all
+            // corpus-verified `boolean`-returning) -- `P_TouchSpecialThing`'s
+            // own item-pickup dispatcher calls every one of these as
+            // `if (!P_GiveArmor(..)) return;`, the same "already `bool`,
+            // no cast" shape this list already exists for. `P_GiveCard`
+            // is deliberately excluded -- corpus-verified `void`-returning,
+            // never appears negated as a condition.
+            || n == "P_GiveArmor" || n == "P_GiveBody" || n == "P_GivePower" || n == "P_GiveAmmo" || n == "P_GiveWeapon"))
 }
 
 fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
@@ -2633,10 +2754,19 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // `bool` by the time this reads it -- `bool == 0` doesn't even
         // compile, so this can't fall through to the generic `int`-
         // truthiness arm below.
+        // `if (!netgame) break;` (`P_TouchSpecialThing`, `p_inter.c`) --
+        // the by-name-`World`-global sibling of the `bool_locals` arm just
+        // above: `netgame` isn't a local at all (`doomstat.h`'s own
+        // `extern boolean netgame;`, resolved to `world.netgame` by the
+        // by-name arm in `render_expr`'s `Expr::Ident` match), but it's
+        // already genuinely `bool`-valued the same way, so the same "no
+        // `== 0` cast" treatment applies -- checked by name since it isn't
+        // in `ctx.bool_locals` (that set is built only from real local
+        // declarations, `collect_bool_locals`'s own doc comment).
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
-        } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.bool_locals.contains(n.as_str())) => {
+        } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) || n == "netgame") => {
             Ok(format!("!{}", render_expr(expr, ctx)?.0))
         }
         // `if (!line->dx)` (`P_PointOnLineSide`, `p_maputl.c`) -- a self-
@@ -2654,6 +2784,41 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             expr,
         } if is_self_fixed_t_field(expr, ctx) || is_line_dx_dy_field(expr, ctx) => {
             Ok(format!("{} == FixedT(0)", render_expr(expr, ctx)?.0))
+        }
+        // `if (!player->cards[it_bluecard]) player->message = ..;`
+        // (`P_TouchSpecialThing`, `p_inter.c`) -- a *bare top-level*
+        // negated index into `cards`/`weaponowned` (real Rust `bool`
+        // arrays, `struct_fields.rs`), the `render_bool_expr` sibling of
+        // the already-shipped bare (non-negated) `Expr::Index` arm below
+        // (`EV_DoLockedDoor`'s own `!p->cards[..]` only ever appeared
+        // *nested* inside `&&`, reached through `render_expr`'s already-
+        // correct generic `!` fallback instead of this function -- this is
+        // the first real corpus example negating one as a whole
+        // condition's own top level). Checked before the generic
+        // `Unary::Not` `== 0` fallback just below, which would otherwise
+        // wrongly apply plain-`int` truthiness to an already-`bool` value.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards" || field == "weaponowned")) => {
+            Ok(format!("!{}", render_expr(expr, ctx)?.0))
+        }
+        // `if (!player->backpack) { .. player->backpack = true; }`
+        // (`P_TouchSpecialThing`, `p_inter.c`) -- `Player.backpack`'s own
+        // real declared type is `boolean` (`d_player.h`), a genuine Rust
+        // `bool` field (the same `boolean` -> `bool` mapping `cards`/
+        // `weaponowned` already get), so a bare top-level negation needs
+        // no `== 0` cast, the `Expr::Member` (scalar field) sibling of the
+        // `cards`/`weaponowned` `Expr::Index` (array-element) arm just
+        // above. Hand-matched by name, the same "no general Player-field-
+        // type registry" reasoning `cards`/`weaponowned` already
+        // established (`player_t` isn't struct-mapped in `struct_fields.rs`
+        // the way every other corpus struct is).
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Member { field, .. } if field == "backpack") => {
+            Ok(format!("!{}", render_expr(expr, ctx)?.0))
         }
         Expr::Unary {
             op: UnaryOp::Not,
@@ -3447,7 +3612,15 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // from the switch-case-delimiter `break` `render_switch` consumes
         // itself while splitting arms apart (that one is peeled off
         // before individual statements ever reach `render_stmt` at all).
-        Stmt::Break => Ok(vec![format!("{}break;", indent(depth))]),
+        // A `break` that *does* survive to here from inside a `switch`
+        // arm (`ctx.switch_break_label`, `FnBodyContext`'s own doc
+        // comment -- `P_TouchSpecialThing`'s own `if (!netgame) break;`)
+        // needs the labeled form instead, since a bare `break;` inside a
+        // `match` arm doesn't compile.
+        Stmt::Break => match ctx.switch_break_label {
+            Some(label) => Ok(vec![format!("{}break '{label};", indent(depth))]),
+            None => Ok(vec![format!("{}break;", indent(depth))]),
+        },
         // A forward `goto` reaching a common tail (`A_Look`'s own `goto
         // seeyou;`) -- only ever rendered inside the labeled block
         // `render_compound_items`'s own goto-to-common-label transform
@@ -3509,6 +3682,45 @@ struct RawArm<'a> {
     labels: Option<Vec<String>>,
     own_stmts: Vec<&'a Stmt>,
     falls_through: bool,
+}
+
+/// Whether `stmt` contains a `break` that would still target *this*
+/// switch by the time `render_stmt` sees it -- i.e. reached from inside a
+/// nested `if`/`Compound`/`Case`/`Default`, but not from inside a further
+/// nested loop or switch of its own (`FnBodyContext::switch_break_label`'s
+/// own doc comment explains why: C's `break` always targets the nearest
+/// enclosing loop *or* switch, so a `break` inside a loop/switch nested
+/// within this arm belongs to *that* construct, not this one, and must
+/// not be counted here). Used once, up front, by `render_switch` to decide
+/// whether it needs to wrap its own `match` in a labeled block at all --
+/// every arm whose own trailing `break;` was already consumed by
+/// `collect_case_labels`'s own arm-splitting (every switch this project
+/// has translated before `P_TouchSpecialThing`) has nothing left for this
+/// to find, so this stays a no-op for them.
+fn stmt_contains_switch_level_break(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break => true,
+        Stmt::Compound(c) => c.items.iter().any(|item| match item {
+            BlockItem::Stmt(s) => stmt_contains_switch_level_break(s),
+            BlockItem::Decl(_) => false,
+        }),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_contains_switch_level_break(then_branch)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(stmt_contains_switch_level_break)
+        }
+        Stmt::Case { stmt, .. } => stmt_contains_switch_level_break(stmt),
+        Stmt::Default(stmt) => stmt_contains_switch_level_break(stmt),
+        // A nested loop's or switch's own `break` belongs to *it*, not
+        // this outer switch -- do not recurse into either.
+        Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::Switch { .. } => false,
+        _ => false,
+    }
 }
 
 fn render_switch(
@@ -3621,18 +3833,49 @@ fn render_switch(
         resolved[k] = body_stmts;
     }
 
-    let mut lines = vec![format!("{}match {cond_text} {{", indent(depth))];
+    // `if (!netgame) break;` (`P_TouchSpecialThing`, `p_inter.c`) -- a
+    // `break` reached *inside* one of this switch's own arms (past
+    // fallthrough-folding, so still a real statement `render_stmt` will
+    // see), not the trailing case-delimiter `break` already consumed
+    // above. A bare Rust `break;` doesn't compile inside a `match` arm
+    // (`match` isn't a loop) -- see `FnBodyContext::switch_break_label`'s
+    // own doc comment for the full reasoning. Detected once, up front,
+    // so every already-shipped switch (none of which has ever needed
+    // this) renders through exactly the same unlabeled `match { .. }`
+    // text as before -- this is purely additive.
+    let needs_break_label = resolved
+        .iter()
+        .flatten()
+        .any(|s| stmt_contains_switch_level_break(s));
+    let switch_label = format!("switch{depth}");
+    let arm_ctx = if needs_break_label {
+        FnBodyContext {
+            switch_break_label: Some(switch_label.as_str()),
+            ..*ctx
+        }
+    } else {
+        *ctx
+    };
+    let match_depth = if needs_break_label { depth + 1 } else { depth };
+    let mut lines = if needs_break_label {
+        vec![
+            format!("{}'{switch_label}: {{", indent(depth)),
+            format!("{}match {cond_text} {{", indent(match_depth)),
+        ]
+    } else {
+        vec![format!("{}match {cond_text} {{", indent(match_depth))]
+    };
     for (k, arm) in arms.iter().enumerate() {
         let pattern = arm
             .labels
             .as_ref()
             .map(|ls| ls.join(" | "))
             .unwrap_or_else(|| "_".to_string());
-        lines.push(format!("{}{pattern} => {{", indent(depth + 1)));
+        lines.push(format!("{}{pattern} => {{", indent(match_depth + 1)));
         for s in &resolved[k] {
-            lines.extend(render_stmt(s, ctx, depth + 2)?);
+            lines.extend(render_stmt(s, &arm_ctx, match_depth + 2)?);
         }
-        lines.push(format!("{}}}", indent(depth + 1)));
+        lines.push(format!("{}}}", indent(match_depth + 1)));
     }
     if !has_default {
         // `switch (ld->slopetype) { case ST_HORIZONTAL: ...; case
@@ -3672,12 +3915,15 @@ fn render_switch(
             })
         });
         if covers_slopetype {
-            lines.push(format!("{}_ => unreachable!(),", indent(depth + 1)));
+            lines.push(format!("{}_ => unreachable!(),", indent(match_depth + 1)));
         } else {
-            lines.push(format!("{}_ => {{}}", indent(depth + 1)));
+            lines.push(format!("{}_ => {{}}", indent(match_depth + 1)));
         }
     }
-    lines.push(format!("{}}}", indent(depth)));
+    lines.push(format!("{}}}", indent(match_depth)));
+    if needs_break_label {
+        lines.push(format!("{}}}", indent(depth)));
+    }
     Ok(lines)
 }
 
@@ -3732,6 +3978,7 @@ fn render_while(
     // body anyway).
     let body_ctx = FnBodyContext {
         active_for_continue_step: None,
+        switch_break_label: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
         ..*ctx
@@ -3778,6 +4025,7 @@ fn render_do_while(
 ) -> Result<Vec<String>, String> {
     let body_ctx = FnBodyContext {
         active_for_continue_step: None,
+        switch_break_label: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
         ..*ctx
@@ -4354,6 +4602,7 @@ fn render_thinker_list_scan(
         thinker_scan_alias: Some((var, "m")),
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
         ..*ctx
@@ -4447,6 +4696,7 @@ fn render_thinker_list_scan_for(
         thinker_scan_handle_alias: Some((bind_var, "handle")),
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         ..*ctx
     };
     let mut lines = vec![format!(
@@ -4504,6 +4754,16 @@ fn render_for(
     let step_text = render_for_step(step, ctx)?;
     let body_ctx = FnBodyContext {
         active_for_continue_step: Some(step_text.as_str()),
+        // A `break` reached inside this `for`'s own body targets this
+        // loop, not some outer `switch` it happens to be nested in --
+        // rendered as Rust's own plain `break;` against the `while` this
+        // becomes, which already does the right thing here, so any
+        // `switch_break_label` an enclosing `match` set (`P_TouchSpecial
+        // Thing`'s own `SPR_BPAK` case, whose `for` loops sit alongside,
+        // not around, its own `if (!netgame) break;`) must not leak in --
+        // the mirror of `active_for_continue_step`'s own reset in
+        // `render_while` just above.
+        switch_break_label: None,
         ..*ctx
     };
 
@@ -5079,6 +5339,46 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 ..*ctx
             };
             let rhs_text = render_expr(rhs, &rhs_ctx)?.0;
+            return Ok(format!(
+                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} {rhs_text}; }}",
+                render_assign_op(*op)
+            ));
+        }
+        // `player->mo->health = player->health;` (`P_TouchSpecialThing`,
+        // `p_inter.c`) -- `is_option_player_mo_field`'s own write arm, the
+        // `render_trigger_fn`-shaped (`player` a local registered
+        // `Option<PlayerId>`, not `self`) sibling of the arm just above.
+        // No real corpus RHS reached through this shape ever reads back
+        // through the same `player->mo` handle (each of the three real
+        // call sites' own RHS is a different field, `player->health`, not
+        // itself `Handle<Thinker>`-mediated) -- so unlike the arm above,
+        // this never needs a `same_handle_write`-keyed `rhs_ctx` shortcut,
+        // just the same `expr_has_other_target_deref`-guarded hoist for
+        // soundness if a future corpus example ever does mix in another
+        // live `thinkers` borrow.
+        if let Expr::Member {
+            base,
+            field: lhs_field,
+            ..
+        } = lhs.as_ref()
+            && is_option_player_mo_field(base, ctx)
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            let field = rust_field_name(lhs_field)?;
+            if expr_has_other_target_deref(
+                rhs,
+                ctx.self_param,
+                ctx.self_field_types,
+                ctx.extra_cross_ref_idents,
+                None,
+            ) {
+                let rhs_text = render_expr(rhs, ctx)?.0;
+                return Ok(format!(
+                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} __rhs; }}",
+                    render_assign_op(*op)
+                ));
+            }
+            let rhs_text = render_expr(rhs, ctx)?.0;
             return Ok(format!(
                 "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} {rhs_text}; }}",
                 render_assign_op(*op)
@@ -6675,6 +6975,7 @@ fn render_fn_impl_with_two_scalar_params(
         psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         return_type: None,
     };
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -6832,6 +7133,7 @@ pub fn render_weapon_fn(
         psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
@@ -8831,6 +9133,7 @@ pub fn render_spawn_fn(
         psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
@@ -9197,6 +9500,7 @@ pub fn render_trigger_fn(
         psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
@@ -9261,6 +9565,7 @@ pub fn render_pure_fn(
         psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         return_type,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
@@ -9369,6 +9674,7 @@ pub fn render_world_fn(
         psprite_walk_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
+        switch_break_label: None,
         return_type,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
@@ -10101,6 +10407,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -10200,6 +10507,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -10259,6 +10567,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -10339,6 +10648,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -10506,6 +10816,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -11702,6 +12013,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -11777,6 +12089,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -11878,6 +12191,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -11959,6 +12273,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -12041,6 +12356,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -12128,6 +12444,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -13593,6 +13910,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -14367,6 +14685,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             psprite_walk_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
+            switch_break_label: None,
             return_type: None,
             static_locals: &HashMap::new(),
             bool_locals: &HashSet::new(),
@@ -15325,6 +15644,16 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
     /// `actor` reuses surfaced that `A_VileChase`'s own single-`P_
     /// SetMobjState`-reuse compile check never exercised) -- zero errors.
     /// `test_a_chase_renders_exactly`. 399/399 tests passing.
+    ///
+    /// **A real, latent gap in this test's own expected string, found and
+    /// fixed in round 17 while adding `netgame`'s own by-name `World`-bool
+    /// resolution for `P_TouchSpecialThing`**: `if (netgame && ...)` here
+    /// rendered as a bare, unresolved opaque `netgame` identifier -- correct
+    /// only against a stand-in with a free-floating `netgame: bool` in
+    /// scope, not the real, now-by-name-resolved `world.netgame`
+    /// (`doomstat.h`'s own `extern boolean netgame;`, the same category
+    /// `onground`/`crushchange`/`nofit` already established). Fixed to
+    /// `world.netgame`, not left in place.
     #[test]
     fn test_a_chase_renders_exactly() {
         let field_types = field_types(&[
@@ -15398,7 +15727,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              return;\n        \
              }\n    \
              }\n    \
-             if netgame && actor.threshold == 0 && !P_CheckSight(actor, actor.target) {\n        \
+             if world.netgame && actor.threshold == 0 && !P_CheckSight(actor, actor.target) {\n        \
              if P_LookForPlayers(actor, true) {\n            \
              return;\n        \
              }\n    \
@@ -19110,6 +19439,18 @@ pub fn P_GiveAmmo(player: &mut Player, ammo: i32, mut num: i32, world: &mut Worl
     /// for real (`rustc --edition 2021 --crate-type lib`) against a
     /// hand-written `Player`/`World`/`PlayerId` stand-in and stub
     /// `P_GiveAmmo`/`S_StartSound`/`weaponinfo` -- zero errors.
+    ///
+    /// **A real, latent gap in this test's own expected string, found and
+    /// fixed in round 17 while adding `netgame`'s own by-name `World`-bool
+    /// resolution for `P_TouchSpecialThing`**: the doc comment above's own
+    /// "bare, unregistered `boolean` global" description of `netgame` was
+    /// only ever correct against a stand-in with a free-floating
+    /// `netgame: bool` in scope -- the real, now-by-name-resolved shape is
+    /// `world.netgame` (`onground`/`crushchange`/`nofit`'s own category).
+    /// Fixed to `world.netgame` (`deathmatch` is unaffected -- corpus-
+    /// verified there is no by-name `World` field for it, so it stays the
+    /// genuinely bare, unregistered opaque identifier this doc comment
+    /// describes).
     #[test]
     fn test_p_give_weapon_renders_exactly() {
         let field_types = field_types(&[
@@ -19131,7 +19472,7 @@ pub fn P_GiveAmmo(player: &mut Player, ammo: i32, mut num: i32, world: &mut Worl
 pub fn P_GiveWeapon(player: &mut Player, weapon: i32, dropped: bool, world: &mut World, player_id: PlayerId) -> bool {
     let mut gaveammo;
     let mut gaveweapon;
-    if netgame && deathmatch != 2 && !dropped {
+    if world.netgame && deathmatch != 2 && !dropped {
         if player.weaponowned[weapon as usize] {
             return false;
         }
@@ -19484,6 +19825,440 @@ pub fn P_DivlineSide(x: FixedT, y: FixedT, node: &DivLine) -> i32 {
     }
     return 1;
 }";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_TouchSpecialThing` (`p_inter.c`) -- round 16's own item-pickup
+    /// dispatcher, picked back up: both gaps it flagged, plus several more
+    /// surfaced only once the full ~30-arm switch was traced against the
+    /// real corpus body (not guessed at), all needed before this compiles.
+    /// **(1) `netgame` (`doomstat.h`'s own `extern boolean netgame;`,
+    /// `g_game.c`)** joins the by-name `World` bool global list
+    /// (`onground`/`crushchange`/`nofit`'s own category) -- but unlike
+    /// `onground` (whose one reference sits *inside* a `&&`, reached only
+    /// through `render_expr`'s already-correct generic `!` fallback),
+    /// `if (!netgame) break;` is a bare *top-level* condition here, going
+    /// through `render_bool_expr` instead -- that function's generic
+    /// `Unary::Not` arm renders `x == 0`, which doesn't compile against a
+    /// real `bool`, so it gains a `name == "netgame"` special case too.
+    /// **(2) `gamemode != commercial`** needed nothing at all -- corpus-
+    /// verified already covered by the existing bare-opaque-identifier
+    /// pass-through this project uses for `gameskill`/`sk_baby` (proven by
+    /// `A_PlayerScream`'s/`P_CheckAmmo`'s own already-shipped tests), since
+    /// this appears only as an ordinary comparison, never bare truthiness.
+    /// **(3) `player->mo->health = player->health;`** (`SPR_BON1`/`SOUL`/
+    /// `MEGA`) -- `player` here is a *local* `Option<PlayerId>`
+    /// (`toucher->player`), not `self`, so the existing `player->mo->field`
+    /// machinery (`is_self_bare_handle_field`, keyed to `self_param`) can't
+    /// reach it -- `is_option_player_mo_field` is its `extra_cross_ref_
+    /// idents`-keyed sibling, with matching read (`match thinkers.get(..)`)
+    /// and write (`thinkers.get_mut(..)`, `expr_has_other_target_deref`-
+    /// guarded the same way) arms. **(4) `player == &players[consoleplayer]`**
+    /// at the very end -- `body_has_player_console_identity`'s existing
+    /// mechanism only fires for a `self_param` receiver (adding a fresh
+    /// `player_id` parameter); here `player` already *is* an `Option<
+    /// PlayerId>` local, so a narrower `render_expr` arm just unwraps it
+    /// directly against `world.consoleplayer`, no new parameter needed.
+    /// **(5) `!player->cards[it_bluecard]`/`!player->backpack`** used bare
+    /// at a condition's own top level -- `render_bool_expr`'s existing
+    /// `cards`/`weaponowned` truthiness arm only ever fired *nested* inside
+    /// `&&` before (`EV_DoLockedDoor`), reached through `render_expr`'s
+    /// plain-`!` fallback; two new top-level arms cover the negated-bare
+    /// case for both (`backpack` hand-matched by name the same way, since
+    /// `player_t` isn't struct-mapped in `struct_fields.rs`). **(6)
+    /// `P_Give{Armor,Body,Power,Ammo,Weapon}` join `is_bool_returning_call`**
+    /// (all five corpus-verified `boolean`-returning; `P_GiveCard` excluded,
+    /// `void`). **(7) The real, structural blocker: `if (!netgame) break;`
+    /// nested inside a `case` body.** Every switch this project has
+    /// translated before now only ever used `break` as a case's own
+    /// trailing fallthrough-preventer, already consumed by `collect_case_
+    /// labels` before `render_stmt` ever sees it. This `break` is a genuine
+    /// mid-case early exit (skip to the switch's own epilogue, vs. `return`
+    /// falling all the way out of the function) -- a bare Rust `break;`
+    /// inside a `match` arm doesn't compile at all (`match` isn't a loop).
+    /// `render_switch` now detects (`stmt_contains_switch_level_break`,
+    /// stopping at any nested loop/switch of its own, whose `break` targets
+    /// *it*) whether any arm still has a real surviving `break` after
+    /// fallthrough-folding, and only then wraps the whole `match` in a
+    /// `'switchN: { .. }` labeled block, threading a new `FnBodyContext::
+    /// switch_break_label` through so `Stmt::Break` renders `break
+    /// 'switchN;` instead -- reset to `None` inside a nested `for`/`while`
+    /// body (`render_for`/`render_while`, the same "inner construct shadows
+    /// outer" reasoning `active_for_continue_step` already has for
+    /// `continue`/`for`) so `SPR_BPAK`'s own two `for` loops, which sit
+    /// *beside* the key cases' `break`, aren't affected. Purely additive:
+    /// every already-shipped switch has no surviving `break`, so renders
+    /// through the identical unlabeled `match` text as before -- confirmed
+    /// by the full suite staying green. Every other shape in this ~30-arm
+    /// switch (health/armor caps, `special->flags & MF_DROPPED` ammo/weapon
+    /// dropped-flag checks, the `SPR_BPAK` backpack-doubling loop, `default:
+    /// I_Error(..)`) reuses wholly pre-existing machinery with no further
+    /// changes. **One real, pre-existing gap surfaced, not fixed here**:
+    /// `P_GiveWeapon`'s own `dropped` argument is passed both a bare `bool`
+    /// literal (`false`) and a plain `i32` expression (`special->flags &
+    /// MF_DROPPED`) across different call sites in this same function --
+    /// C's `boolean` is really just an `int`-valued enum, so both are valid
+    /// C, but neither a `bool`- nor an `i32`-typed real Rust parameter can
+    /// accept both without a cast. The same already-documented "forward-
+    /// referenced call, original C argument shape" cross-function-signature
+    /// gap every other `P_Give*` call in this project already carries (see
+    /// `P_GivePower`'s own doc comment) -- not new, not fixed, left for
+    /// whichever round actually translates `P_GiveWeapon` itself. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`) against
+    /// a hand-written `Player`/`World`/`Mobj`/`Thinker`/`Handle`/`Arena`
+    /// stand-in (`Handle`'s own hand-written `Clone`/`Copy`/`PartialEq`,
+    /// not derived, matching the real runtime's own reasoning) and stub
+    /// `P_Give*`/`P_RemoveMobj`/`S_StartSound`/`I_Error` -- zero errors
+    /// (the `P_GiveWeapon` argument-shape gap above was isolated by
+    /// verifying its two call-site shapes independently, each against a
+    /// plausible real callee type, not papered over).
+    #[test]
+    fn test_p_touch_special_thing_renders_exactly() {
+        let params: HashMap<String, String> = [
+            ("special".to_string(), "Handle<Thinker>".to_string()),
+            ("toucher".to_string(), "Handle<Thinker>".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let locals: HashMap<String, String> = [
+            ("player".to_string(), "Option<PlayerId>".to_string()),
+            ("i".to_string(), "i32".to_string()),
+            ("delta".to_string(), "FixedT".to_string()),
+            ("sound".to_string(), "i32".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_TouchSpecialThing",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_TouchSpecialThing(special: Handle<Thinker>, toucher: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut player;
+    let mut i;
+    let mut delta;
+    let mut sound;
+    delta = match thinkers.get(special) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } - match thinkers.get(toucher) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() };
+    if delta > match thinkers.get(toucher) { Some(Thinker::Mobj(m)) => m.height, _ => unreachable!() } || delta < -8 * FRACUNIT {
+        return;
+    }
+    sound = sfx_itemup;
+    player = match thinkers.get(toucher) { Some(Thinker::Mobj(m)) => m.player, _ => None };
+    if match thinkers.get(toucher) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 {
+        return;
+    }
+    'switch1: {
+        match match thinkers.get(special) { Some(Thinker::Mobj(m)) => m.sprite, _ => unreachable!() } {
+            SPR_ARM1 => {
+                if !P_GiveArmor(player, 1) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTARMOR);
+            }
+            SPR_ARM2 => {
+                if !P_GiveArmor(player, 2) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTMEGA);
+            }
+            SPR_BON1 => {
+                world[player.unwrap()].health += 1;
+                if world[player.unwrap()].health > 200 {
+                    world[player.unwrap()].health = 200;
+                }
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo) { m.health = world[player.unwrap()].health; };
+                world[player.unwrap()].message = Some(GOTHTHBONUS);
+            }
+            SPR_BON2 => {
+                world[player.unwrap()].armorpoints += 1;
+                if world[player.unwrap()].armorpoints > 200 {
+                    world[player.unwrap()].armorpoints = 200;
+                }
+                if world[player.unwrap()].armortype == 0 {
+                    world[player.unwrap()].armortype = 1;
+                }
+                world[player.unwrap()].message = Some(GOTARMBONUS);
+            }
+            SPR_SOUL => {
+                world[player.unwrap()].health += 100;
+                if world[player.unwrap()].health > 200 {
+                    world[player.unwrap()].health = 200;
+                }
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo) { m.health = world[player.unwrap()].health; };
+                world[player.unwrap()].message = Some(GOTSUPER);
+                sound = sfx_getpow;
+            }
+            SPR_MEGA => {
+                if gamemode != commercial {
+                    return;
+                }
+                world[player.unwrap()].health = 200;
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo) { m.health = world[player.unwrap()].health; };
+                P_GiveArmor(player, 2);
+                world[player.unwrap()].message = Some(GOTMSPHERE);
+                sound = sfx_getpow;
+            }
+            SPR_BKEY => {
+                if !world[player.unwrap()].cards[it_bluecard as usize] {
+                    world[player.unwrap()].message = Some(GOTBLUECARD);
+                }
+                P_GiveCard(player, it_bluecard);
+                if !world.netgame {
+                    break 'switch1;
+                }
+                return;
+            }
+            SPR_YKEY => {
+                if !world[player.unwrap()].cards[it_yellowcard as usize] {
+                    world[player.unwrap()].message = Some(GOTYELWCARD);
+                }
+                P_GiveCard(player, it_yellowcard);
+                if !world.netgame {
+                    break 'switch1;
+                }
+                return;
+            }
+            SPR_RKEY => {
+                if !world[player.unwrap()].cards[it_redcard as usize] {
+                    world[player.unwrap()].message = Some(GOTREDCARD);
+                }
+                P_GiveCard(player, it_redcard);
+                if !world.netgame {
+                    break 'switch1;
+                }
+                return;
+            }
+            SPR_BSKU => {
+                if !world[player.unwrap()].cards[it_blueskull as usize] {
+                    world[player.unwrap()].message = Some(GOTBLUESKUL);
+                }
+                P_GiveCard(player, it_blueskull);
+                if !world.netgame {
+                    break 'switch1;
+                }
+                return;
+            }
+            SPR_YSKU => {
+                if !world[player.unwrap()].cards[it_yellowskull as usize] {
+                    world[player.unwrap()].message = Some(GOTYELWSKUL);
+                }
+                P_GiveCard(player, it_yellowskull);
+                if !world.netgame {
+                    break 'switch1;
+                }
+                return;
+            }
+            SPR_RSKU => {
+                if !world[player.unwrap()].cards[it_redskull as usize] {
+                    world[player.unwrap()].message = Some(GOTREDSKULL);
+                }
+                P_GiveCard(player, it_redskull);
+                if !world.netgame {
+                    break 'switch1;
+                }
+                return;
+            }
+            SPR_STIM => {
+                if !P_GiveBody(player, 10) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTSTIM);
+            }
+            SPR_MEDI => {
+                if !P_GiveBody(player, 25) {
+                    return;
+                }
+                if world[player.unwrap()].health < 25 {
+                    world[player.unwrap()].message = Some(GOTMEDINEED);
+                } else {
+                    world[player.unwrap()].message = Some(GOTMEDIKIT);
+                }
+            }
+            SPR_PINV => {
+                if !P_GivePower(player, pw_invulnerability) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTINVUL);
+                sound = sfx_getpow;
+            }
+            SPR_PSTR => {
+                if !P_GivePower(player, pw_strength) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTBERSERK);
+                if world[player.unwrap()].readyweapon != wp_fist {
+                    world[player.unwrap()].pendingweapon = wp_fist;
+                }
+                sound = sfx_getpow;
+            }
+            SPR_PINS => {
+                if !P_GivePower(player, pw_invisibility) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTINVIS);
+                sound = sfx_getpow;
+            }
+            SPR_SUIT => {
+                if !P_GivePower(player, pw_ironfeet) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTSUIT);
+                sound = sfx_getpow;
+            }
+            SPR_PMAP => {
+                if !P_GivePower(player, pw_allmap) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTMAP);
+                sound = sfx_getpow;
+            }
+            SPR_PVIS => {
+                if !P_GivePower(player, pw_infrared) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTVISOR);
+                sound = sfx_getpow;
+            }
+            SPR_CLIP => {
+                if (match thinkers.get(special) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_DROPPED) != 0 {
+                    if !P_GiveAmmo(player, am_clip, 0) {
+                        return;
+                    }
+                } else {
+                    if !P_GiveAmmo(player, am_clip, 1) {
+                        return;
+                    }
+                }
+                world[player.unwrap()].message = Some(GOTCLIP);
+            }
+            SPR_AMMO => {
+                if !P_GiveAmmo(player, am_clip, 5) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTCLIPBOX);
+            }
+            SPR_ROCK => {
+                if !P_GiveAmmo(player, am_misl, 1) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTROCKET);
+            }
+            SPR_BROK => {
+                if !P_GiveAmmo(player, am_misl, 5) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTROCKBOX);
+            }
+            SPR_CELL => {
+                if !P_GiveAmmo(player, am_cell, 1) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTCELL);
+            }
+            SPR_CELP => {
+                if !P_GiveAmmo(player, am_cell, 5) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTCELLBOX);
+            }
+            SPR_SHEL => {
+                if !P_GiveAmmo(player, am_shell, 1) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTSHELLS);
+            }
+            SPR_SBOX => {
+                if !P_GiveAmmo(player, am_shell, 5) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTSHELLBOX);
+            }
+            SPR_BPAK => {
+                if !world[player.unwrap()].backpack {
+                    i = 0;
+                    while i < NUMAMMO {
+                        world[player.unwrap()].maxammo[i as usize] *= 2;
+                        i += 1;
+                    }
+                    world[player.unwrap()].backpack = true;
+                }
+                i = 0;
+                while i < NUMAMMO {
+                    P_GiveAmmo(player, i, 1);
+                    i += 1;
+                }
+                world[player.unwrap()].message = Some(GOTBACKPACK);
+            }
+            SPR_BFUG => {
+                if !P_GiveWeapon(player, wp_bfg, false) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTBFG9000);
+                sound = sfx_wpnup;
+            }
+            SPR_MGUN => {
+                if !P_GiveWeapon(player, wp_chaingun, match thinkers.get(special) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_DROPPED) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTCHAINGUN);
+                sound = sfx_wpnup;
+            }
+            SPR_CSAW => {
+                if !P_GiveWeapon(player, wp_chainsaw, false) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTCHAINSAW);
+                sound = sfx_wpnup;
+            }
+            SPR_LAUN => {
+                if !P_GiveWeapon(player, wp_missile, false) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTLAUNCHER);
+                sound = sfx_wpnup;
+            }
+            SPR_PLAS => {
+                if !P_GiveWeapon(player, wp_plasma, false) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTPLASMA);
+                sound = sfx_wpnup;
+            }
+            SPR_SHOT => {
+                if !P_GiveWeapon(player, wp_shotgun, match thinkers.get(special) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_DROPPED) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTSHOTGUN);
+                sound = sfx_wpnup;
+            }
+            SPR_SGN2 => {
+                if !P_GiveWeapon(player, wp_supershotgun, match thinkers.get(special) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_DROPPED) {
+                    return;
+                }
+                world[player.unwrap()].message = Some(GOTSHOTGUN2);
+                sound = sfx_wpnup;
+            }
+            _ => {
+                I_Error(\"P_SpecialThing: Unknown gettable thing\");
+            }
+        }
+    }
+    if (match thinkers.get(special) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_COUNTITEM) != 0 {
+        world[player.unwrap()].itemcount += 1;
+    }
+    P_RemoveMobj(special);
+    world[player.unwrap()].bonuscount += BONUSADD;
+    if player.unwrap() == world.consoleplayer {
+        S_StartSound(None, sound);
+    }
+}";
+
         assert_eq!(rendered, expected);
     }
 }
