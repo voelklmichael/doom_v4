@@ -1842,6 +1842,49 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `(line->dy ^ line->dx ^ dx ^ dy) & 0x80000000` / `(line->dy ^
+        // dx) & 0x80000000` (`P_PointOnDivlineSide`, `p_maputl.c`) -- the
+        // sign-bit fast-path check's own `& 0x80000000`, a bare `i32`
+        // literal `&`-ed against a definitely-`FixedT`-valued expression
+        // (`expr_is_fixed_t_valued`, now `BitXor`/`BitAnd`-aware, see its
+        // own doc comment). The literal side is never ambiguous (the same
+        // "a bare `Expr::IntLiteral` can never itself be genuinely
+        // `FixedT`-valued" reasoning `P_InterceptVector`'s own `return 0;`
+        // wrap already established), so this wraps it in `FixedT(..)`
+        // right here. `0x80000000` itself needs one further wrinkle none
+        // of this module's earlier bare-literal wraps needed: it doesn't
+        // fit in `i32` at all (`FixedT`'s own representation type), so a
+        // plain `FixedT(0x80000000)` is a real `rustc` "literal out of
+        // range for `i32`" rejection -- confirmed directly, not assumed --
+        // needing a `0x80000000u32 as i32` reinterpret-cast instead
+        // (matching what the bit pattern means to C's own `int`, which
+        // silently wraps around instead of range-checking). Hand-matched
+        // to exactly this one real corpus literal, this module's usual
+        // "no general large-literal handling, name the one real case"
+        // discipline -- every other literal this arm might ever see
+        // (a plain `0`) fits `i32` natively and needs no such rewrite.
+        Expr::Binary {
+            op: BinaryOp::BitAnd,
+            lhs,
+            rhs,
+        } if matches!(rhs.as_ref(), Expr::IntLiteral(_)) && expr_is_fixed_t_valued(lhs, ctx) => {
+            let lhs_text = render_binary_operand(
+                lhs,
+                BinaryOp::BitAnd,
+                binary_prec(BinaryOp::BitAnd),
+                false,
+                ctx,
+            )?;
+            let Expr::IntLiteral(s) = rhs.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let rhs_text = if s == "0x80000000" {
+                format!("FixedT({s}u32 as i32)")
+            } else {
+                format!("FixedT({s})")
+            };
+            Ok((format!("{lhs_text} & {rhs_text}"), false))
+        }
         Expr::Binary { op, lhs, rhs } => {
             let prec = binary_prec(*op);
             let lhs_text = render_binary_operand(lhs, *op, prec, false, ctx)?;
@@ -2734,6 +2777,22 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // already claims every `==`/`<`/`&&`/`||`/etc. shape, so this only
         // ever fires for a genuinely non-bool-valued `Binary` result
         // (`&`, `|`, `+`, ...) needing the ordinary `!= 0` cast.
+        // `if ( (line->dy ^ line->dx ^ dx ^ dy)&0x80000000 )` (`P_PointOnDivlineSide`)
+        // -- the `FixedT`-valued sibling of the generic non-comparison-
+        // `Binary` truthiness arm just below: the sign-bit fast-path's own
+        // masked chain (`expr_is_fixed_t_valued`, `BitXor`/`BitAnd`-aware)
+        // is a real `FixedT` result, not a plain `int`, so the ordinary
+        // `!= 0` fallback doesn't compile against it (no `PartialEq<i32>`,
+        // confirmed the same way every other `FixedT`-truthiness gap in
+        // this module was) -- needs `!= FixedT(0)` instead. Checked before
+        // the generic arm so a genuinely non-`FixedT` bitwise/arithmetic
+        // truthiness check (`actor->target->flags & MF_SHADOW`) still
+        // falls through unchanged.
+        Expr::Binary { op, .. }
+            if !is_comparison_or_logical(*op) && expr_is_fixed_t_valued(cond, ctx) =>
+        {
+            Ok(format!("({}) != FixedT(0)", render_expr(cond, ctx)?.0))
+        }
         Expr::Binary { op, .. } if !is_comparison_or_logical(*op) => {
             Ok(format!("({}) != 0", render_expr(cond, ctx)?.0))
         }
@@ -3282,6 +3341,29 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
                 // just for the opposite direction (narrower-than-demanded
                 // vs. a bare-`int`-literal standing in for `FixedT`).
                 format!("FixedT({text})")
+            } else if ctx.return_type == Some("bool")
+                && matches!(e, Expr::IntLiteral(s) if s == "0" || s == "1")
+            {
+                // `return 1;`/`return 0;` (`P_PointOnDivlineSide`,
+                // `p_maputl.c`) -- the sign-bit fast-path's own two early-
+                // outs, and the function's final "front side"/"back side"
+                // returns: bare `int`-literal stand-ins for the two
+                // possible `boolean` results, from a function whose real
+                // C return type is `int` but whose every `return` is
+                // genuinely 0-or-1-shaped (`P_PointOnLineSide`'s own
+                // `divline_t` sibling, rendered here with `bool` as its
+                // Rust return type rather than `i32`, unlike its own
+                // sibling `P_DivlineSide`, which returns a genuine third
+                // value, `2`, and stays `i32`). `render_expr`'s own
+                // `Expr::IntLiteral` arm has no way to know the function's
+                // declared return type, so this needs the same
+                // "translate at the `return` site itself" treatment as
+                // the `FixedT`-literal-wrap arm just above.
+                match e {
+                    Expr::IntLiteral(s) if s == "1" => "true".to_string(),
+                    Expr::IntLiteral(s) if s == "0" => "false".to_string(),
+                    _ => unreachable!("guarded above"),
+                }
             } else {
                 text
             };
@@ -4552,10 +4634,19 @@ fn is_self_fixed_t_field(e: &Expr, ctx: &FnBodyContext) -> bool {
 /// base -- not a general "any field of a cross-reference-typed parameter"
 /// check, which would need a real per-struct field-type registry this
 /// module doesn't have yet.
+///
+/// `line->dx`/`node->dx`/`.dy` also turns up on a plain `&DivLine`
+/// parameter (`P_PointOnDivlineSide`/`P_DivlineSide`, `p_maputl.c`/
+/// `p_sight.c` -- `P_PointOnLineSide`'s own `divline_t` siblings, round
+/// 11's own survey), the exact identical shape (`DivLine.dx`/`.dy` are
+/// also both `FixedT`, `struct_fields.rs`) just on a plain stack-value
+/// parameter instead of a `LineId` cross-reference -- extended here
+/// rather than duplicated, since the check itself (field name, then
+/// registered base type) is otherwise identical.
 fn is_line_dx_dy_field(e: &Expr, ctx: &FnBodyContext) -> bool {
     matches!(e, Expr::Member { base, field, .. }
         if (field == "dx" || field == "dy")
-            && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("LineId")))
+            && matches!(base.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("LineId") | Some("&DivLine"))))
 }
 
 /// Whether a bare identifier is genuinely `i32`-valued in a way this
@@ -4651,11 +4742,30 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
             // local-vs-plain-`int` comparison-wrap arm above, double-
             // wrapping an already-genuine `FixedT` value in `FixedT(..)` a
             // second time.
-            matches!(field.as_str(), "floorheight" | "ceilingheight")
+            if matches!(field.as_str(), "floorheight" | "ceilingheight")
                 && matches!(base.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("SectorId") | Some("Option<SectorId>")))
+            {
+                return true;
+            }
+            // `line->dy`/`node->dx` (`P_PointOnDivlineSide`/
+            // `P_DivlineSide`) -- a `LineId`/`&DivLine`-typed base's own
+            // `dx`/`dy` field, the same real `FixedT` source `is_line_dx_
+            // dy_field` already recognizes for the negated-truthiness and
+            // literal-comparison-wrap arms; needed here too so the sign-
+            // bit fast-path's `line->dy ^ line->dx ^ dx ^ dy` chain (see
+            // the `Binary` `BitXor`/`BitAnd` arm just below) correctly
+            // propagates "definitely `FixedT`" through a `Member` leaf,
+            // not just a self-struct field.
+            is_line_dx_dy_field(e, ctx)
         }
         Expr::Binary {
-            op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+            op:
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::BitXor
+                | BinaryOp::BitAnd,
             lhs,
             rhs,
         } => expr_is_fixed_t_valued(lhs, ctx) || expr_is_fixed_t_valued(rhs, ctx),
@@ -19147,6 +19257,171 @@ pub fn P_CalcHeight(player: &mut Player, world: &mut World, thinkers: &Arena<Thi
     if player.viewz > match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
         player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_PointOnDivlineSide` (`p_maputl.c`) -- round 13's own explicitly
+    /// re-scoped target, `P_PointOnLineSide`'s `divline_t` sibling
+    /// (compares a point against a plain `&DivLine` rather than a
+    /// `LineId`-indexed `Line`). Three genuinely new mechanisms, all
+    /// exactly as round 13 scoped them: (1) `FixedT` gains `BitXor`/
+    /// `BitAnd` (`runtime/fixed.rs`) for the sign-bit fast-path's own
+    /// `line->dy ^ line->dx ^ dx ^ dy` chain and `& 0x80000000` mask --
+    /// raw representation bitwise ops, the same "thin wrapping-arithmetic
+    /// pass-through" idea every other `FixedT` operator already models.
+    /// (2) the literal `0x80000000` itself doesn't fit `i32` (`FixedT`'s
+    /// own representation type) -- confirmed a real `rustc` "literal out
+    /// of range" rejection with a naive `FixedT(0x80000000)`, not assumed
+    /// -- so the new `Expr::Binary` `BitAnd`-against-a-`FixedT`-valued-lhs
+    /// arm in `render_expr` reinterprets it via `0x80000000u32 as i32`
+    /// instead, hand-matched to exactly this one real corpus literal.
+    /// (3) this function's own declared C return type is `int`, but every
+    /// `return` is genuinely 0-or-1-shaped (unlike its sibling `P_DivlineSide`
+    /// just below, which returns a real third value) -- rendered with
+    /// `bool` as the Rust return type (`render_pure_fn`'s existing
+    /// `return_type` parameter already generic enough to take it, no new
+    /// wrapper function needed beyond what it already had), needing a new
+    /// `Stmt::Return` arm mapping a bare `0`/`1` literal to `false`/`true`
+    /// for exactly that return-type case, the same "translate at the
+    /// `return` site itself" idiom `P_InterceptVector`'s own `FixedT(0)`
+    /// wrap already established. `is_line_dx_dy_field` (`P_PointOnLineSide`'s
+    /// own `LineId`-typed-base predicate) is generalized to also accept a
+    /// plain `&DivLine`-typed base -- the identical field shape
+    /// (`DivLine.dx`/`.dy: FixedT`, `struct_fields.rs`), just a different
+    /// registered parameter type -- closing both the negated-truthiness
+    /// (`!line->dx`) and literal-comparison-wrap (`line->dy > 0`) gaps for
+    /// a `&DivLine` parameter the same way it already did for `LineId`.
+    /// `expr_is_fixed_t_valued` is extended in step with it (a new
+    /// `Member` arm delegating to `is_line_dx_dy_field`, and `BitXor`/
+    /// `BitAnd` added to its existing `Binary` arm) so the sign-bit
+    /// chain's own truthiness check (`render_bool_expr`'s new `FixedT`-
+    /// valued non-comparison-`Binary` arm, `!= FixedT(0)` instead of the
+    /// generic `!= 0`) and the `& 0x80000000` literal-wrap arm both
+    /// correctly recognize it as definitely-`FixedT` through a `Member`
+    /// leaf, not just a self-struct field. Verified compiling for real
+    /// (`rustc --edition 2021 --crate-type lib`) against hand-written
+    /// `FixedT`/`DivLine` stand-ins and a stub `FixedMul` -- zero errors.
+    #[test]
+    fn test_p_point_on_divline_side_renders_exactly() {
+        let params = field_types(&[("x", "FixedT"), ("y", "FixedT"), ("line", "&DivLine")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_maputl.c",
+            "P_PointOnDivlineSide",
+            &params,
+            Some("bool"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_PointOnDivlineSide(x: FixedT, y: FixedT, line: &DivLine) -> bool {
+    let mut dx;
+    let mut dy;
+    let mut left;
+    let mut right;
+    if line.dx == FixedT(0) {
+        if x <= line.x {
+            return line.dy > FixedT(0);
+        }
+        return line.dy < FixedT(0);
+    }
+    if line.dy == FixedT(0) {
+        if y <= line.y {
+            return line.dx < FixedT(0);
+        }
+        return line.dx > FixedT(0);
+    }
+    dx = x - line.x;
+    dy = y - line.y;
+    if ((line.dy ^ line.dx ^ dx ^ dy) & FixedT(0x80000000u32 as i32)) != FixedT(0) {
+        if ((line.dy ^ dx) & FixedT(0x80000000u32 as i32)) != FixedT(0) {
+            return true;
+        }
+        return false;
+    }
+    left = FixedMul(line.dy >> 8, dx >> 8);
+    right = FixedMul(dy >> 8, line.dx >> 8);
+    if right < left {
+        return false;
+    }
+    return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_DivlineSide` (`p_sight.c`) -- `P_PointOnDivlineSide`'s own
+    /// direct sibling in `P_CheckSight`'s private BSP-side-test copy
+    /// (round 11's own survey; confirmed a real, independent corpus
+    /// definition by direct read, not assumed from the shared shape).
+    /// Reuses every mechanism `P_PointOnDivlineSide` just proved for a
+    /// `&DivLine`-typed parameter's own `dx`/`dy` fields (`is_line_dx_dy_
+    /// field`'s generalization, `expr_is_fixed_t_valued`'s new `Member`
+    /// arm) with no further change needed there. One genuinely new
+    /// mechanism, exactly the second gap round 13 flagged: this function
+    /// skips the sign-bit fast path entirely and always falls through to
+    /// a plain (non-`FixedMul`) integer multiply of two pre-shifted
+    /// `fixed_t` operands (`(node->dy>>FRACBITS) * (dx>>FRACBITS)`),
+    /// deliberately abusing C's "`fixed_t` really is just `int`" idiom in
+    /// a way none of `FixedT`'s existing `Mul` impls (`Mul<i32>`/
+    /// `Mul<FixedT> for i32`, both mixed-type) covered -- a new same-type
+    /// `impl Mul for FixedT` (`runtime/fixed.rs`) closes it, rendered with
+    /// no further renderer-side change (the generic `Expr::Binary`
+    /// fallback already handles a same-type multiply once the trait
+    /// exists). Unlike `P_PointOnDivlineSide`, this function's own real
+    /// third return value (`return 2;`, the "on the line" case) means it
+    /// genuinely isn't `bool`-shaped -- rendered with `i32` as its Rust
+    /// return type instead, reusing `P_PointOnLineSide`'s own already-
+    /// proven `Stmt::Return`-site `as i32` wrap
+    /// (`return_expr_needs_i32_cast`) for its own bare-comparison returns
+    /// unchanged. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type lib`) against the same hand-written stand-ins as
+    /// `P_PointOnDivlineSide` -- zero errors.
+    #[test]
+    fn test_p_divline_side_renders_exactly() {
+        let params = field_types(&[("x", "FixedT"), ("y", "FixedT"), ("node", "&DivLine")]);
+        let rendered = render_pure_fn(
+            &corpus_dir(),
+            "p_sight.c",
+            "P_DivlineSide",
+            &params,
+            Some("i32"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_DivlineSide(x: FixedT, y: FixedT, node: &DivLine) -> i32 {
+    let mut dx;
+    let mut dy;
+    let mut left;
+    let mut right;
+    if node.dx == FixedT(0) {
+        if x == node.x {
+            return 2;
+        }
+        if x <= node.x {
+            return (node.dy > FixedT(0)) as i32;
+        }
+        return (node.dy < FixedT(0)) as i32;
+    }
+    if node.dy == FixedT(0) {
+        if x == node.y {
+            return 2;
+        }
+        if y <= node.y {
+            return (node.dx < FixedT(0)) as i32;
+        }
+        return (node.dx > FixedT(0)) as i32;
+    }
+    dx = x - node.x;
+    dy = y - node.y;
+    left = (node.dy >> FRACBITS) * (dx >> FRACBITS);
+    right = (dy >> FRACBITS) * (node.dx >> FRACBITS);
+    if right < left {
+        return 0;
+    }
+    if left == right {
+        return 2;
+    }
+    return 1;
 }";
         assert_eq!(rendered, expected);
     }
