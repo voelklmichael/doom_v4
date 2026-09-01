@@ -134,6 +134,26 @@ impl<T> Arena<T> {
         }
     }
 
+    /// Whether the handle currently mid-`run`/`take_out` has already
+    /// called `remove` on itself, checked from *inside* that same closure
+    /// -- `P_MobjThinker`'s (`p_mobj.c`) own "did a nested call already
+    /// remove me" idiom (`mobj->thinker.function.acv == (actionf_v)(-1)`,
+    /// checked right after a nested call like `P_XYMovement`/`P_ZMovement`
+    /// that might itself have called `P_RemoveMobj`, before touching the
+    /// mobj any further). `self_removed` already tracks exactly this
+    /// (`remove`'s own doc comment, set only when its target *is*
+    /// `currently_processing`, saved/restored around both `run` and
+    /// `take_out` so a reentrant call sees its own, not an enclosing
+    /// caller's, flag) -- round 13 identified the gap, round 21 confirmed
+    /// it's still genuinely unsolved even after `ActionFn`/`P_SetMobjState`
+    /// landed (rounds 19-20): the field itself was already correct,
+    /// private, with no way to read it back from generated code. This is
+    /// that accessor -- small and purely additive, no change to `remove`/
+    /// `run`/`take_out`'s own existing behavior.
+    pub fn was_self_removed(&self) -> bool {
+        self.self_removed
+    }
+
     pub fn get(&self, handle: Handle<T>) -> Option<&T> {
         self.slots.get(handle.index as usize)?.as_ref()
     }
@@ -311,6 +331,50 @@ mod tests {
         let mut seen = Vec::new();
         arena.run(|v, _, _| seen.push(*v));
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn test_was_self_removed_true_after_remove_during_own_tick() {
+        // `P_MobjThinker`'s own "did a nested call already remove me"
+        // check, exercised directly: `remove(handle)` mid-`run`, then
+        // `was_self_removed()` read back from inside that same closure.
+        let mut arena: Arena<i32> = Arena::new();
+        arena.insert(1);
+        let mut observed = false;
+        arena.run(|_, handle, world| {
+            world.remove(handle);
+            observed = world.was_self_removed();
+        });
+        assert!(observed);
+    }
+
+    #[test]
+    fn test_was_self_removed_false_when_not_removed() {
+        let mut arena: Arena<i32> = Arena::new();
+        arena.insert(1);
+        let mut observed = true;
+        arena.run(|_, _, world| {
+            observed = world.was_self_removed();
+        });
+        assert!(!observed);
+    }
+
+    #[test]
+    fn test_was_self_removed_false_when_a_different_handle_is_removed() {
+        // Removing some *other* live handle mid-tick must not be mistaken
+        // for self-removal -- `self_removed` is only set when `remove`'s
+        // target is the handle currently being processed.
+        let mut arena: Arena<i32> = Arena::new();
+        let a = arena.insert(1);
+        let b = arena.insert(2);
+        let mut observed = true;
+        arena.run(|_, handle, world| {
+            if handle == a {
+                world.remove(b);
+                observed = world.was_self_removed();
+            }
+        });
+        assert!(!observed);
     }
 
     #[test]
