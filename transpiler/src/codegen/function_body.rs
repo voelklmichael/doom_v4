@@ -1043,6 +1043,17 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "automapactive" {
                 return Ok(("world.automapactive".to_string(), false));
             }
+            // `respawnmonsters` (`doomstat.h`'s own `extern boolean
+            // respawnmonsters;`, `P_MobjThinker`'s own "-respawn" mode
+            // check, `p_mobj.c`) -- the same `netgame`/`onground`/
+            // `crushchange`/`nofit`/`automapactive` category, genuinely
+            // `bool`-typed. Its one real reference (`if (!respawnmonsters)
+            // return;`) is a bare top-level negated condition, `netgame`'s
+            // own exact shape, so `render_bool_expr` gets the identical
+            // `name == "respawnmonsters"` special case right below.
+            if name == "respawnmonsters" {
+                return Ok(("world.respawnmonsters".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -1941,6 +1952,17 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // `state_index`'s own Sub arm above already uses, since both
         // operands are plain `Member`/`Index` reads with no shape-level
         // way to tell a state field from any other reference otherwise.
+        // `mobj->thinker.function.acv == (actionf_v) (-1)` (`P_MobjThinker`)
+        // -- see `is_self_removed_check`'s own doc comment. `self_removal_
+        // ident` is always in scope by the time this can fire (`needs_was_
+        // self_removed_check` folds into the same `needs_handle_and_mut_
+        // arena` decision `needs_self_removal` itself drives), matching
+        // `is_self_removal_call`'s own sibling `.remove(handle)` rendering
+        // just above in `render_expr_stmt`.
+        e if is_self_removed_check(e, ctx.self_param) => Ok((
+            format!("{}.was_self_removed()", ctx.self_removal_ident),
+            false,
+        )),
         Expr::Binary {
             op: BinaryOp::Eq,
             lhs: eq_lhs,
@@ -3187,6 +3209,39 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             op: UnaryOp::Not,
             expr,
         } if is_option_valued(expr, ctx) => Ok(format!("{}.is_none()", render_expr(expr, ctx)?.0)),
+        // `if (!P_SetMobjState(mobj, mobj->state->nextstate)) return;`
+        // (`P_MobjThinker`, the corpus's only real negated-condition use of
+        // `P_SetMobjState` anywhere -- confirmed by grepping the whole
+        // corpus, not assumed) -- `P_SetMobjState` isn't in `is_bool_
+        // returning_call`'s own list (every other real call site uses it
+        // in bare statement position, `render_expr_stmt`'s own dedicated
+        // `as_p_set_mobj_state_call` arm), and adding it there wouldn't
+        // have been enough anyway: the generic `Expr::Call` fallback this
+        // arm's own sibling would otherwise reach renders only the two
+        // original C arguments, missing the `world, handle, {self_removal_
+        // ident}` extension every real self-targeted `P_SetMobjState` call
+        // needs (confirmed a real `rustc` "wrong number of arguments"
+        // rejection by tracing the naive translation through by hand).
+        // Scoped to a self-targeted call only (`as_p_set_mobj_state_call`'s
+        // own `target` bound to `self_param`) -- the one real corpus shape;
+        // an other-targeted call negated this way has no real corpus
+        // example to design the (genuinely different, `take_out`-mediated)
+        // rendering against yet.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(as_p_set_mobj_state_call(expr), Some((target, _))
+            if matches!(target, Expr::Ident(n) if n == ctx.self_param)) =>
+        {
+            let Some((_, state)) = as_p_set_mobj_state_call(expr) else {
+                unreachable!("guarded above")
+            };
+            let (state_text, _) = render_expr(state, ctx)?;
+            Ok(format!(
+                "!P_SetMobjState({}, {state_text}, world, handle, {})",
+                ctx.self_param, ctx.self_removal_ident
+            ))
+        }
         // `! P_CheckSight (actor, actor->target)` (`P_CheckMeleeRange`) --
         // unlike a plain `int`-valued operand (the generic `== 0` arm just
         // below), a call to a real `boolean`-returning corpus function is
@@ -3218,7 +3273,7 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
-        } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) || n == "netgame") => {
+        } if matches!(expr.as_ref(), Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) || n == "netgame" || n == "respawnmonsters") => {
             Ok(format!("!{}", render_expr(expr, ctx)?.0))
         }
         // `if (!line->dx)` (`P_PointOnLineSide`, `p_maputl.c`) -- a self-
@@ -5388,10 +5443,32 @@ fn scan_set_mobj_state_calls_stmt(
             scan_set_mobj_state_calls(&c.items, self_param, self_found, other_found)
         }
         Stmt::If {
+            cond,
             then_branch,
             else_branch,
-            ..
         } => {
+            // `if (!P_SetMobjState(mobj, ..)) return;` (`P_MobjThinker`) --
+            // unlike every other real corpus call site (a bare statement,
+            // the arm just above), this one appears *inside* the `if`'s
+            // own condition (bare or `!`-negated) -- needed so `needs_
+            // self_set_mobj_state_call` still fires correctly even for a
+            // function that happens not to also trip `needs_was_self_
+            // removed_check` (`P_MobjThinker` itself trips both, but this
+            // scanner shouldn't rely on that coincidence).
+            let cond_call = match cond {
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr,
+                } => as_p_set_mobj_state_call(expr),
+                other => as_p_set_mobj_state_call(other),
+            };
+            if let Some((target, _)) = cond_call {
+                if matches!(target, Expr::Ident(n) if n == self_param) {
+                    *self_found = true;
+                } else {
+                    *other_found = true;
+                }
+            }
             scan_set_mobj_state_calls_stmt(then_branch, self_param, self_found, other_found);
             if let Some(eb) = else_branch {
                 scan_set_mobj_state_calls_stmt(eb, self_param, self_found, other_found);
@@ -7707,7 +7784,18 @@ fn render_fn_impl_with_two_scalar_params(
         &mut needs_self_set_mobj_state_call,
         &mut needs_other_set_mobj_state_call,
     );
-    let needs_handle_and_mut_arena = needs_self_removal || needs_self_set_mobj_state_call;
+    // `mobj->thinker.function.acv == (actionf_v)(-1)` (`P_MobjThinker`) --
+    // checking whether a *nested* call (`P_XYMovement`/`P_ZMovement`)
+    // already removed this same receiver needs the identical `handle`/
+    // mutable-`Arena` shape `needs_self_removal` itself needs to *perform*
+    // a removal -- `Arena::was_self_removed(&self)` only takes `&self`,
+    // but folding it into the same `needs_handle_and_mut_arena` decision
+    // (rather than a separate, narrower one) keeps this function on the
+    // same already-proven `self_removal_ident`/`composed_self_removal`
+    // machinery instead of inventing a second parallel one.
+    let needs_was_self_removed_check = body_has_self_removed_check(&f.body.items, &param_name);
+    let needs_handle_and_mut_arena =
+        needs_self_removal || needs_self_set_mobj_state_call || needs_was_self_removed_check;
     let composed_self_removal = needs_handle_and_mut_arena
         && (needs_target_deref || needs_spawn_mut || needs_other_set_mobj_state_call);
     let self_removal_ident = if composed_self_removal {
@@ -7969,6 +8057,76 @@ pub fn render_weapon_fn(
         "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState{world_part}{thinkers_part}) {{\n{}\n}}",
         body_lines.join("\n")
     ))
+}
+
+/// `mobj->thinker.function.acv == (actionf_v) (-1)` (`P_MobjThinker`'s own
+/// twice-repeated "did a nested call already remove me" idiom, `p_mobj.c`)
+/// -- `mobj_t`'s own embedded `thinker_t thinker;` header field is dropped
+/// entirely under this project's own memory model (no real `Mobj` field
+/// backs `.thinker.function.acv` at all), so this isn't rendered as a
+/// field read -- it's the one C-level idiom `Arena::was_self_removed`
+/// (`runtime/arena.rs`, round 22) exists specifically to replace wholesale.
+/// Corpus-verified the only two real occurrences in this whole file are
+/// both inside `P_MobjThinker` itself, both this exact shape (`grep -n
+/// "actionf_v) (-1)" p_mobj.c`) -- narrowly hand-matched, not a general
+/// `thinker.function.acv` field-read mechanism.
+fn is_self_removed_check(e: &Expr, self_param: &str) -> bool {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        lhs,
+        rhs,
+    } = e
+    else {
+        return false;
+    };
+    let is_acv_field = matches!(lhs.as_ref(), Expr::Member { base: f1, field: f1_name, .. }
+        if f1_name == "acv"
+            && matches!(f1.as_ref(), Expr::Member { base: f2, field: f2_name, .. }
+                if f2_name == "function"
+                    && matches!(f2.as_ref(), Expr::Member { base: f3, field: f3_name, .. }
+                        if f3_name == "thinker" && matches!(f3.as_ref(), Expr::Ident(n) if n == self_param))));
+    if !is_acv_field {
+        return false;
+    }
+    matches!(rhs.as_ref(), Expr::Cast { expr, .. }
+        if matches!(expr.as_ref(), Expr::Unary { op: UnaryOp::Minus, expr }
+            if matches!(expr.as_ref(), Expr::IntLiteral(s) if s == "1")))
+}
+
+/// Whether `is_self_removed_check` fires anywhere in `items` -- scans an
+/// `if`'s own condition specifically (the only real corpus position it
+/// ever appears in), the same shape `body_has_target_deref`'s family
+/// already scans expressions in, not just statement position.
+fn body_has_self_removed_check(items: &[BlockItem], self_param: &str) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_self_removed_check(s, self_param),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn stmt_has_self_removed_check(s: &Stmt, self_param: &str) -> bool {
+    match s {
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            is_self_removed_check(cond, self_param)
+                || stmt_has_self_removed_check(then_branch, self_param)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_self_removed_check(eb, self_param))
+        }
+        Stmt::Compound(c) => body_has_self_removed_check(&c.items, self_param),
+        Stmt::Switch { body, .. } => stmt_has_self_removed_check(body, self_param),
+        Stmt::Case { stmt, .. } => stmt_has_self_removed_check(stmt, self_param),
+        Stmt::Default(stmt) => stmt_has_self_removed_check(stmt, self_param),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            stmt_has_self_removed_check(body, self_param)
+        }
+        Stmt::For { body, .. } => stmt_has_self_removed_check(body, self_param),
+        _ => false,
+    }
 }
 
 fn body_has_self_removal(items: &[BlockItem], self_param: &str) -> bool {
@@ -19076,6 +19234,105 @@ pub fn P_XYMovement(mo: &mut Mobj, world: &mut World, thinkers: &mut Arena<Think
              }\n    \
              if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.reactiontime = 18; };\n    \
              thinkers.remove(handle);\n\
+             }"
+        );
+    }
+
+    #[test]
+    fn test_p_mobj_thinker_renders_exactly() {
+        // `P_MobjThinker` (`p_mobj.c`) -- the tick dispatcher rounds 13-25
+        // have been building every dependency toward. Two new pieces
+        // beyond what was already in place. (1) `mobj->thinker.function.
+        // acv == (actionf_v)(-1)` (twice, after `P_XYMovement`/
+        // `P_ZMovement`, each a nested-call-may-have-removed-me check) --
+        // `is_self_removed_check`, a narrowly-scoped new predicate
+        // rendering straight to `Arena::was_self_removed()` (round 22's
+        // own small additive runtime method, never wired into `function_
+        // body.rs` until now). (2) `!P_SetMobjState(mobj, mobj->state->
+        // nextstate)` used as a negated *condition* rather than a bare
+        // statement -- the corpus's only real occurrence of that shape
+        // (confirmed by grep), needing its own new `render_bool_expr` arm
+        // since `is_bool_returning_call`'s list alone would still render
+        // only the original two C arguments, missing the `world, handle,
+        // {self_removal_ident}` extension a self-targeted `P_SetMobjState`
+        // call needs. `respawnmonsters` (`doomstat.h`) joins the by-name
+        // `World` bool global list (`netgame`/`onground`/`crushchange`/
+        // `nofit`/`automapactive`'s own category). Every other piece
+        // (`P_XYMovement`/`P_ZMovement`/`P_NightmareRespawn` called as
+        // opaque forward references with the original C argument shape,
+        // matching this module's already-documented cross-function-
+        // signature gap; bare `FixedT`/non-comparison-`Binary` truthiness
+        // in a `||` chain; `leveltime`/`P_Random()`) needed no new code at
+        // all -- traced through the existing generic machinery by hand,
+        // not assumed, before writing this test. Since this function
+        // never directly calls a self-removal function itself (only
+        // *checks* whether a nested call already did), `composed_self_
+        // removal` stays `false` here even though `needs_handle_and_mut_
+        // arena` is `true` -- so `self_removal_ident` is `"arena"`, not
+        // `"thinkers"` (unlike every earlier self-removing function this
+        // module has translated, none of which called a *checked* nested
+        // self-removal without also needing `target`/spawn/`thinkers`
+        // access for some other reason).
+        let field_types = field_types(&[
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("z", "FixedT"),
+            ("floorz", "FixedT"),
+            ("flags", "i32"),
+            ("tics", "i32"),
+            ("state", "&'static State"),
+            ("movecount", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_MobjThinker",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_MobjThinker(mobj: &mut Mobj, world: &mut World, handle: Handle<Thinker>, arena: &mut Arena<Thinker>) {\n    \
+             if mobj.momx != FixedT(0) || mobj.momy != FixedT(0) || (mobj.flags & MF_SKULLFLY) != 0 {\n        \
+             P_XYMovement(mobj);\n        \
+             if arena.was_self_removed() {\n            \
+             return;\n        \
+             }\n    \
+             }\n    \
+             if mobj.z != mobj.floorz || mobj.momz != FixedT(0) {\n        \
+             P_ZMovement(mobj);\n        \
+             if arena.was_self_removed() {\n            \
+             return;\n        \
+             }\n    \
+             }\n    \
+             if mobj.tics != -1 {\n        \
+             mobj.tics -= 1;\n        \
+             if mobj.tics == 0 {\n            \
+             if !P_SetMobjState(mobj, mobj.state.nextstate, world, handle, arena) {\n                \
+             return;\n            \
+             }\n        \
+             }\n    \
+             } else {\n        \
+             if mobj.flags & MF_COUNTKILL == 0 {\n            \
+             return;\n        \
+             }\n        \
+             if !world.respawnmonsters {\n            \
+             return;\n        \
+             }\n        \
+             mobj.movecount += 1;\n        \
+             if mobj.movecount < 12 * 35 {\n            \
+             return;\n        \
+             }\n        \
+             if (leveltime & 31) != 0 {\n            \
+             return;\n        \
+             }\n        \
+             if P_Random() > 4 {\n            \
+             return;\n        \
+             }\n        \
+             P_NightmareRespawn(mobj);\n    \
+             }\n\
              }"
         );
     }
