@@ -1016,6 +1016,19 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "netgame" {
                 return Ok(("world.netgame".to_string(), false));
             }
+            // `automapactive` (`doomstat.h`'s own `extern boolean
+            // automapactive;`, `P_KillMobj`'s own "don't die in auto map,
+            // switch view prior to dying" check, `p_inter.c`) -- the same
+            // `netgame`/`onground`/`crushchange`/`nofit` category, genuinely
+            // `bool`-typed; its one real reference (`&& automapactive`) is a
+            // bare, non-negated `&&` operand, already correctly rendered by
+            // `render_binary_operand`'s own generic fallback once this
+            // identifier resolves to a real Rust `bool` (no extra
+            // `render_bool_expr` routing needed, unlike `netgame`'s own
+            // negated-top-level-condition case).
+            if name == "automapactive" {
+                return Ok(("world.automapactive".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -1086,17 +1099,95 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // `.player` field at all -- hand-matched narrowly, the same "no
         // general lookup ahead of evidence" reasoning as `sides[i].
         // sector`, rather than a general enum-variant-field mechanism no
-        // second caller has needed yet.
+        // second caller has needed yet. **Round 23 widening**: also
+        // accepts a base registered `Option<Handle<Thinker>>` (`P_KillMobj`'s
+        // own `source` parameter, `p_inter.c` -- genuinely nullable, unlike
+        // every earlier caller of this arm, which passed a bare live
+        // `Handle<Thinker>`), unwrapping it first -- every real call site
+        // reaching this arm with an `Option`-typed base has already proven
+        // it live by the time it's dereferenced (`if (source && source->
+        // player)`'s own short-circuit `&&`, C's evaluation order carried
+        // straight through to Rust's identical short-circuit `&&`), the
+        // same "known live within this function's own body" discipline
+        // `is_self_bare_handle_field`/`is_option_player_mo_field` already
+        // established for `mo`/`attacker`.
         Expr::Member { base, field, .. }
             if field == "player"
-                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>")) =>
+                && matches!(base.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("Handle<Thinker>") | Some("Option<Handle<Thinker>>"))) =>
         {
             let Expr::Ident(name) = base.as_ref() else {
                 unreachable!("guarded above")
             };
+            let is_opt = ctx
+                .extra_cross_ref_idents
+                .get(name.as_str())
+                .map(String::as_str)
+                == Some("Option<Handle<Thinker>>");
+            let handle_text = if is_opt {
+                format!("{name}.unwrap()")
+            } else {
+                name.clone()
+            };
             Ok((
                 format!(
-                    "match thinkers.get({name}) {{ Some(Thinker::Mobj(m)) => m.player, _ => None }}"
+                    "match thinkers.get({handle_text}) {{ Some(Thinker::Mobj(m)) => m.player, _ => None }}"
+                ),
+                false,
+            ))
+        }
+        // `target->player->playerstate`/`.frags`/`.killcount` (`P_KillMobj`,
+        // `p_inter.c`) -- a `Player` field reached through a `Handle<
+        // Thinker>`-typed value's own `.player` cross-reference with *no*
+        // local variable bound in between, unlike every earlier `Option<
+        // PlayerId>`-chaining precedent (`is_option_player_mo_field`'s own
+        // `player = toucher->player;` idiom, `P_TouchSpecialThing`) --
+        // genuinely new (round 23), not just another instance of an
+        // existing shape. Renders through `world[..]`, a real place
+        // expression (`World: IndexMut<PlayerId>`, `world.rs`), reusing
+        // the `X->player` value arm just above for the middle step -- this
+        // also transparently unlocks every existing generic write path
+        // (`render_expr_stmt`'s own `Expr::Assign` fallback, the generic
+        // `PostIncDec`/`PreIncDec` arm) with no separate write-specific
+        // arm needed, since `world[..]` is assignable the same way
+        // `world[sec].specialdata` already is anywhere else in this
+        // module. Checked before the fully generic `Expr::Member` fallback
+        // further below, which would otherwise wrongly try to chain
+        // `.field` straight onto the `Option<PlayerId>` value itself (no
+        // such field exists -- confirmed a real `rustc` rejection, not
+        // just extra caution, by rendering the naive fallback-only version
+        // first).
+        Expr::Member { base, field, .. }
+            if field != "player"
+                && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                    if bf == "player"
+                        && matches!(bb.as_ref(), Expr::Ident(n) if matches!(ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str), Some("Handle<Thinker>") | Some("Option<Handle<Thinker>>")))) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!("world[{base_text}.unwrap()].{}", rust_field_name(field)?),
+                false,
+            ))
+        }
+        // `players[0].killcount` (`P_KillMobj`'s own "count all monster
+        // deaths, even those caused by other monsters" idiom, `p_inter.c`)
+        // -- indexing the fixed-size `players[]` global array by a literal,
+        // not `consoleplayer` (`is_player_console_identity_rhs`'s own
+        // exclusive shape, an address-of comparison target, not a plain
+        // value read) -- `World::players`'s own `Index`/`IndexMut<PlayerId>`
+        // impl (`world.rs`) makes this a plain, real, assignable place
+        // expression once wrapped, the same `world[PlayerId(..)]` shape
+        // `player == &players[consoleplayer]`'s own translation already
+        // establishes for a different real index.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Index { base: pbase, .. } if matches!(pbase.as_ref(), Expr::Ident(n) if n == "players")) =>
+        {
+            let Expr::Index { index, .. } = base.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((
+                format!(
+                    "world[PlayerId({index_text} as u32)].{}",
+                    rust_field_name(field)?
                 ),
                 false,
             ))
@@ -1813,6 +1904,61 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 ),
                 false,
             ))
+        }
+        // `target->player == &players[consoleplayer]` (`P_KillMobj`,
+        // `p_inter.c`) -- the arm just above's own sibling for an `Option<
+        // PlayerId>`-*valued* expression that isn't a bare `Ident` (here,
+        // `target->player`, round 23's own no-intermediate-local chain --
+        // `is_option_valued`'s blanket `field == "player"` case already
+        // covers this shape, alongside every bare-local case the arm above
+        // already handles). Kept as its own separate arm rather than
+        // widening the one above's guard: that one's `side_text` closure is
+        // written specifically against a bare `Expr::Ident`, and changing
+        // it to accept an arbitrary expression would risk silently
+        // reordering which arm a bare-`Ident` case matches first -- not
+        // worth the risk for a one-line-different rendering.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (is_option_valued(lhs, ctx) || is_option_valued(rhs, ctx))
+                && (is_player_console_identity_rhs(lhs) || is_player_console_identity_rhs(rhs)) =>
+        {
+            let side_text = |e: &Expr| -> Result<String, String> {
+                if is_player_console_identity_rhs(e) {
+                    Ok("world.consoleplayer".to_string())
+                } else {
+                    Ok(format!("{}.unwrap()", render_expr(e, ctx)?.0))
+                }
+            };
+            Ok((
+                format!(
+                    "{} {} {}",
+                    side_text(lhs)?,
+                    render_binop(*op),
+                    side_text(rhs)?
+                ),
+                false,
+            ))
+        }
+        // `target->player-players` (`P_KillMobj`'s own "recover this
+        // player's array index from a `player_t*`" idiom, `p_inter.c`) --
+        // real C pointer subtraction, computing `target->player`'s own
+        // index into `players[]`. `PlayerId` (`runtime/player.rs`) already
+        // *is* that index, wrapped -- `.unwrap().0` recovers the raw `u32`
+        // (every real call site reaches this only once the value's own
+        // liveness is already established by an enclosing `if`, the same
+        // `.unwrap()`-at-point-of-use discipline this module's whole
+        // `Option<PlayerId>`/`Option<Handle<Thinker>>` family already
+        // follows), cast `as usize` to match `frags[..]`'s own real
+        // indexing requirement (`Player.frags: [i32; MAXPLAYERS]`).
+        Expr::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } if matches!(rhs.as_ref(), Expr::Ident(n) if n == "players")
+            && is_option_valued(lhs, ctx) =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            Ok((format!("{lhs_text}.unwrap().0 as usize"), false))
         }
         // `dist > 14*64`/`dist < 196`/`P_Random() < dist` (`P_CheckMissile
         // Range`) -- a comparison between a genuinely `fixed_t`-declared
@@ -5255,8 +5401,8 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     // needs an explicit `.unwrap()` first -- `take_out` itself only takes
     // a bare `Handle<T>`.
     if let Some((target, state)) = as_p_set_mobj_state_call(e) {
-        let (state_text, _) = render_expr(state, ctx)?;
         if matches!(target, Expr::Ident(n) if n == ctx.self_param) {
+            let (state_text, _) = render_expr(state, ctx)?;
             return Ok(format!(
                 "P_SetMobjState({}, {state_text}, world, handle, {})",
                 ctx.self_param, ctx.self_removal_ident
@@ -5268,6 +5414,43 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         } else {
             target_text
         };
+        // `target->info->xdeathstate`/`.deathstate` (`P_KillMobj`,
+        // `p_inter.c`, round 23) -- the state expression can itself
+        // dereference the very same `target` being `take_out`'d, needing a
+        // `thinkers.get(target)`-shaped read *inside* the closure `take_out`
+        // hands it to. That's a genuine second, conflicting mutable borrow
+        // of `thinkers` while `take_out`'s own call already holds it for the
+        // closure's whole lifetime -- confirmed a real `rustc` E0502, not
+        // assumed, by compiling the naive (pre-fix) version first in
+        // isolation. **A real, pre-existing bug in this exact already-
+        // shipped shape**: `A_BrainSpit`'s own `newmobj->info->seestate`
+        // (`test_a_brain_spit_renders_exactly`) hits the identical pattern
+        // -- latent since round 14ish, never triggered by `rustc` before
+        // because no whole-suite compile-verification scratch file has ever
+        // actually exercised this one specific `take_out`-closure body
+        // against a real `Arena` implementation with `take_out`'s real
+        // borrow shape, only checked in isolation against simplified stand-
+        // ins. Fixed generally, not just for `P_KillMobj`: `target` (or its
+        // siblings' own alias, e.g. `newmobj`) is always a bare `Expr::Ident`
+        // in every real corpus call site (never a nested chain), so `state`
+        // renders instead with `same_handle_write` pointed at that same
+        // name -- any `target->field` reference inside it then resolves to
+        // the closure's own already-bound `m` (identical reuse to
+        // `A_FatAttack1`'s own write-side `mo->momx = FixedMul(mo->info->
+        // speed, ..)`) rather than a second `Arena` lookup, correct since
+        // `m` *is* `target`'s own live data for the whole closure body --
+        // and harmless when `state` doesn't reference `target` at all (the
+        // overwhelming majority of real corpus states, a bare state-
+        // constant identifier, unaffected either way).
+        let state_ctx = if let Expr::Ident(target_name) = target {
+            FnBodyContext {
+                same_handle_write: Some(target_name.as_str()),
+                ..*ctx
+            }
+        } else {
+            *ctx
+        };
+        let (state_text, _) = render_expr(state, &state_ctx)?;
         return Ok(format!(
             "thinkers.take_out({target_text}, |t, h, a| {{ if let Thinker::Mobj(m) = t {{ P_SetMobjState(m, {state_text}, world, h, a); }} }})"
         ));
@@ -14596,6 +14779,28 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// Arena<Thinker>, handle: Handle<Thinker>` signature and rendering as
     /// `thinkers.remove(handle)`, not the self-removal-alone shape's own
     /// separately-named `arena` parameter.
+    ///
+    /// **Round 23 fix, expected text updated**: `newmobj->info->seestate`
+    /// (the `P_SetMobjState` call's own state argument) used to render as
+    /// `match thinkers.get(newmobj) { .. }.info.seestate` -- a genuine,
+    /// real `rustc` E0502 (confirmed by compiling in isolation, not
+    /// assumed), since that `thinkers.get(newmobj)` sits *inside* the very
+    /// `thinkers.take_out(newmobj, |t, h, a| { .. })` closure that already
+    /// holds `thinkers` mutably borrowed for the call's whole duration --
+    /// a second, conflicting borrow of the same variable from inside its
+    /// own closure. Latent since this function first shipped (round
+    /// unspecified pre-23): no whole-suite compile-verification scratch
+    /// file had ever actually compiled this one closure body against a
+    /// real `Arena::take_out` implementation, only checked in isolation
+    /// against simplified stand-ins that didn't reproduce the borrow.
+    /// Surfaced and fixed generally (`render_expr_stmt`'s own `as_p_set_
+    /// mobj_state_call` handling, not a special case here) while landing
+    /// `P_KillMobj`'s own identical-shaped `target->info->xdeathstate`:
+    /// the state expression now renders with `same_handle_write` pointed
+    /// at the target's own name, so `newmobj->info` resolves to the
+    /// closure's already-bound `m` (`m.info.seestate`) instead of a second
+    /// `Arena` lookup -- correct since `m` *is* `newmobj`'s own live data
+    /// for the whole closure body.
     #[test]
     fn test_a_spawn_fly_renders_exactly() {
         let field_types = field_types(&[("target", "Option<Handle<Thinker>>")]);
@@ -14666,7 +14871,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }\n    \
              newmobj = P_SpawnMobj(match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(targ.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() }, r#type);\n    \
              if P_LookForPlayers(newmobj, true) {\n        \
-             thinkers.take_out(newmobj, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.seestate, world, h, a); } });\n    \
+             thinkers.take_out(newmobj, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, m.info.seestate, world, h, a); } });\n    \
              }\n    \
              P_TeleportMove(newmobj, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(newmobj) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
              thinkers.remove(handle);\n\
@@ -20526,6 +20731,132 @@ pub fn P_TouchSpecialThing(special: Handle<Thinker>, toucher: Handle<Thinker>, w
     }
 }";
 
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_KillMobj` (`p_inter.c`) -- round 21/22's own flagged secondary
+    /// target, landed: the new `Handle<Thinker> -> Option<PlayerId> ->
+    /// Player`-field chain mechanism (`target->player->playerstate`/
+    /// `.frags`/`.killcount`, `source->player->killcount`, with *no* local
+    /// variable bound to the `Option<PlayerId>` step in between -- every
+    /// earlier precedent, `is_option_player_mo_field` included, required
+    /// one), plus `players[0].killcount` (a literal, non-`consoleplayer`
+    /// index into the fixed-size global array) and `target->player-players`
+    /// (real C pointer-arithmetic recovering a `player_t*`'s own array
+    /// index, `PlayerId.0` under this project's own index-newtype model).
+    /// `source`/`target` are corpus-verified genuinely asymmetric: `target`
+    /// is dereferenced unconditionally throughout (never null-checked,
+    /// confirmed by its own sole caller, `P_DamageMobj`'s `target->health
+    /// <= 0` top-of-function check with no earlier guard) so it's a bare
+    /// `Handle<Thinker>`, while `source` is real corpus-verified nullable
+    /// (`P_DamageMobj`'s own `!source || !source->player || ..` check,
+    /// reachable from environmental damage with no attacker) so it's
+    /// `Option<Handle<Thinker>>` -- `render_trigger_fn`'s existing `self_
+    /// param: ""` two-independent-parameter shape, the same one `P_Touch
+    /// SpecialThing`'s `special`/`toucher` already proved, needed no
+    /// changes at all for this asymmetry, just the right two registrations.
+    /// `target->info->spawnhealth`/`.xdeathstate`/`.deathstate` needed no
+    /// new code either: `target->info` already resolves through the
+    /// existing generic single-level `Handle<Thinker>` field arm, and the
+    /// fully generic `Expr::Member` fallback (the one every self-struct
+    /// `.info.field` chain already goes through) correctly chains one level
+    /// further since `MobjInfo` is a plain `&'static` reference, not an
+    /// index needing its own `world[..]` wrap -- confirmed by tracing the
+    /// fallback's own logic, not assumed. `AM_Stop()` (round 13/21's other
+    /// flagged gap) is corpus-verified (`am_map.h`) a genuine bare zero-
+    /// argument `void` function -- renders through the ordinary opaque-
+    /// forward-reference `Expr::Call` fallback with no special handling,
+    /// confirming round 21's own "likely a non-issue" assessment for real.
+    /// `P_DropWeapon(target->player)` reuses the already-shipped
+    /// translation by name, passing the original C argument shape verbatim
+    /// -- the same already-documented cross-function-signature gap (real
+    /// signature `&mut Player`, not `Option<PlayerId>`) every other
+    /// forward-referenced call in this module carries, not fixed here.
+    /// `automapactive` (`doomstat.h`) joins the by-name `World` bool global
+    /// list (`netgame`/`onground`/`crushchange`/`nofit`'s own category).
+    /// Compile-verified for real (`rustc --edition 2021 --crate-type bin`)
+    /// against a hand-written `Player`/`Mobj`/`World`/`Handle`/`Arena`/
+    /// `Thinker`/`MobjInfo`/`PlayerId` stand-in covering every new shape
+    /// this function needs (the no-local three-level chain read *and*
+    /// write, `players[0]` by-literal-index, the pointer-arithmetic index
+    /// recovery, the `Option<PlayerId>`-valued non-`Ident` console-identity
+    /// comparison) -- zero errors.
+    #[test]
+    fn test_p_kill_mobj_renders_exactly() {
+        let params = field_types(&[
+            ("source", "Option<Handle<Thinker>>"),
+            ("target", "Handle<Thinker>"),
+        ]);
+        let locals = field_types(&[("item", "i32"), ("mo", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_KillMobj",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_KillMobj(source: Option<Handle<Thinker>>, target: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut item;
+    let mut mo;
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.flags &= !(MF_SHOOTABLE | MF_FLOAT | MF_SKULLFLY); };
+    if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.r#type, _ => unreachable!() } != MT_SKULL {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.flags &= !MF_NOGRAVITY; };
+    }
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.flags |= MF_CORPSE | MF_DROPOFF; };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.height >>= 2; };
+    if source.is_some() && match thinkers.get(source.unwrap()) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_some() {
+        if (match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_COUNTKILL) != 0 {
+            world[match thinkers.get(source.unwrap()) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap()].killcount += 1;
+        }
+        if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_some() {
+            world[match thinkers.get(source.unwrap()) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap()].frags[match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap().0 as usize] += 1;
+        }
+    } else {
+        if !world.netgame && (match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_COUNTKILL) != 0 {
+            world[PlayerId(0 as u32)].killcount += 1;
+        }
+    }
+    if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_some() {
+        if source.is_none() {
+            world[match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap()].frags[match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap().0 as usize] += 1;
+        }
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.flags &= !MF_SOLID; };
+        world[match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap()].playerstate = PST_DEAD;
+        P_DropWeapon(match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None });
+        if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap() == world.consoleplayer && world.automapactive {
+            AM_Stop();
+        }
+    }
+    if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } < -match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.spawnhealth && match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.xdeathstate != 0 {
+        thinkers.take_out(target, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, m.info.xdeathstate, world, h, a); } });
+    } else {
+        thinkers.take_out(target, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, m.info.deathstate, world, h, a); } });
+    }
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.tics -= P_Random() & 3; };
+    if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.tics, _ => unreachable!() } < 1 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.tics = 1; };
+    }
+    match match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.r#type, _ => unreachable!() } {
+        MT_WOLFSS | MT_POSSESSED => {
+            item = MT_CLIP;
+        }
+        MT_SHOTGUY => {
+            item = MT_SHOTGUN;
+        }
+        MT_CHAINGUY => {
+            item = MT_CHAINGUN;
+        }
+        _ => {
+            return;
+        }
+    }
+    mo = P_SpawnMobj(match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, ONFLOORZ, item);
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.flags |= MF_DROPPED; };
+}";
         assert_eq!(rendered, expected);
     }
 }
