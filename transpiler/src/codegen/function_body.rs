@@ -1619,6 +1619,48 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `player == &players[consoleplayer]` (`P_GiveWeapon`'s own "is
+        // this the local console player" check, round 14) -- the
+        // `PlayerId` sibling of `thing == tmthing` just above: a self-
+        // struct-shaped function's own receiver (`ctx.self_param`, which
+        // renders as a bare `&mut Player`, carrying no identity of its
+        // own) compared against one specific slot of the `players[]`
+        // global array. `is_player_console_identity_rhs` matches that
+        // exact `&players[consoleplayer]` shape (never any other index --
+        // corpus-verified, every real reference to this idiom in
+        // `p_inter.c` indexes by `consoleplayer` specifically, never a
+        // loop variable); `body_has_player_console_identity`'s own
+        // signature extension supplies a real `player_id: PlayerId`
+        // parameter whenever this shape is found, mirroring `handle:
+        // Handle<Thinker>` above, so the self-side substitutes that fixed
+        // name and the other side becomes `world.consoleplayer` (`world`
+        // is already an unconditional parameter of every function this
+        // renders through) rather than a real array index/dereference --
+        // `PlayerId` is a plain `Copy`/`PartialEq` newtype, so comparing
+        // two of them needs no `std::ptr::eq`/arena lookup at all, unlike
+        // `Handle<Thinker>`'s own generation-aware identity.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (matches!(lhs.as_ref(), Expr::Ident(n) if n == ctx.self_param)
+                    || matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param))
+                && (is_player_console_identity_rhs(lhs) || is_player_console_identity_rhs(rhs)) =>
+        {
+            let is_self = |e: &Expr| matches!(e, Expr::Ident(n) if n == ctx.self_param);
+            let lhs_text = if is_self(lhs) {
+                "player_id".to_string()
+            } else {
+                "world.consoleplayer".to_string()
+            };
+            let rhs_text = if is_self(rhs) {
+                "player_id".to_string()
+            } else {
+                "world.consoleplayer".to_string()
+            };
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
         // `dist > 14*64`/`dist < 196`/`P_Random() < dist` (`P_CheckMissile
         // Range`) -- a comparison between a genuinely `fixed_t`-declared
         // local (`FnBodyContext::fixed_t_locals`) and a plain `int`-valued
@@ -2040,9 +2082,17 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             // Ident`-base half of the list for the identical reason: a
             // real function parameter's own array type is fixed by its
             // declared signature, not a fresh local free to be inferred
-            // `usize`.
+            // `usize`. `weaponinfo[weapon]` (`P_GiveWeapon`, `p_inter.c`,
+            // round 14) is the same parameter-index shape once more:
+            // every earlier `weaponinfo[..]` reference in this codebase
+            // happened to be indexed by `player->readyweapon`/
+            // `pendingweapon` (an `Expr::Member`, already covered by the
+            // generic rule just above), so `weaponinfo` itself never
+            // needed to join this by-name list until a bare-`Ident`-
+            // parameter index (`weapon`, an `i32 weapontype_t`) showed up
+            // for the first time.
             let index_text = if matches!(index.as_ref(), Expr::Member { .. })
-                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime" || n == "clipammo" || n == "tmbox")
+                || matches!(base.as_ref(), Expr::Ident(n) if n == "finecosine" || n == "finesine" || n == "mobjinfo" || n == "braintargets" || n == "activeplats" || n == "activeceilings" || n == "itemrespawnque" || n == "itemrespawntime" || n == "clipammo" || n == "tmbox" || n == "weaponinfo")
                 || matches!(base.as_ref(), Expr::Member { field, .. } if field == "powers" || field == "cards" || field == "psprites" || field == "ammo" || field == "weaponowned" || field == "blockbox" || field == "maxammo")
                 || (matches!(base.as_ref(), Expr::Member { field, .. } if field == "sidenum")
                     && matches!(index.as_ref(), Expr::Ident(_)))
@@ -6411,6 +6461,16 @@ fn render_fn_impl_with_two_scalar_params(
     // reason, so it's its own flag rather than folded into that one.
     let needs_self_identity_comparison =
         body_has_self_identity_comparison(&f.body.items, &param_name, &extra_cross_ref_idents);
+    // `player == &players[consoleplayer]` (`P_GiveWeapon`, round 14) --
+    // `needs_self_identity_comparison`'s own `PlayerId` sibling (see
+    // `body_has_player_console_identity`'s own doc comment); drives a
+    // separate `player_id: PlayerId` parameter rather than reusing
+    // `handle`, since a caller may need both a `Handle<Thinker>` and a
+    // `PlayerId` identity at once (no real corpus example yet, but
+    // nothing here assumes they're mutually exclusive the way `handle`'s
+    // own two triggers already coexist).
+    let needs_player_console_identity =
+        body_has_player_console_identity(&f.body.items, &param_name);
     // `A_SpawnFly`'s own idiom (self-removal *and* target-alias
     // dereferencing/spawned-mobj writes in the same body) is the first
     // real function needing both at once -- previously rejected outright.
@@ -6469,6 +6529,11 @@ fn render_fn_impl_with_two_scalar_params(
     } else {
         ""
     };
+    let player_id_part = if needs_player_console_identity {
+        ", player_id: PlayerId"
+    } else {
+        ""
+    };
     let thinkers_part = if needs_self_removal && !composed_self_removal {
         ""
     } else if needs_spawn_mut
@@ -6487,7 +6552,7 @@ fn render_fn_impl_with_two_scalar_params(
     } else {
         ""
     };
-    let extra_params = format!("{thinkers_part}{handle_part}");
+    let extra_params = format!("{thinkers_part}{handle_part}{player_id_part}");
     let return_arrow = return_type.map(|t| format!(" -> {t}")).unwrap_or_default();
     // `P_Thrust`'s own second scalar parameter is literally named `move`
     // -- a real Rust keyword (used for closures), needing the same raw-
@@ -7541,6 +7606,76 @@ fn stmt_has_self_identity_comparison(
         Stmt::While { cond, body } => {
             expr_has_self_identity_comparison(cond, self_param, extra_cross_ref_idents)
                 || stmt_has_self_identity_comparison(body, self_param, extra_cross_ref_idents)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` is exactly `&players[consoleplayer]` (`p_inter.c`'s own
+/// "is this the local console player" idiom) -- corpus-verified as the
+/// *only* real index this array is ever compared by identity against
+/// (never a loop variable), so scoped narrowly by name like every other
+/// hand-matched shape in this module, rather than any `&players[..]`
+/// expression. Shared between the detection pass below (`body_has_
+/// player_console_identity`) and `render_expr`'s own rendering arm for
+/// this exact comparison, so both agree on precisely what shape counts.
+fn is_player_console_identity_rhs(e: &Expr) -> bool {
+    matches!(e, Expr::Unary { op: UnaryOp::AddrOf, expr }
+        if matches!(expr.as_ref(), Expr::Index { base, index }
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "players")
+                && matches!(index.as_ref(), Expr::Ident(n) if n == "consoleplayer")))
+}
+
+/// `player == &players[consoleplayer]` (`P_GiveWeapon`) -- the `PlayerId`
+/// sibling of `body_has_self_identity_comparison`'s own `Handle<Thinker>`
+/// detection just above, same traversal shape, different comparison
+/// target. Kept as its own separate pass (not folded into that one)
+/// since the two need genuinely different signature extensions
+/// (`player_id: PlayerId` vs `handle: Handle<Thinker>`) driven by
+/// independent flags in `render_fn_impl_with_two_scalar_params`.
+fn body_has_player_console_identity(items: &[BlockItem], self_param: &str) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_has_player_console_identity(s, self_param),
+        BlockItem::Decl(_) => false,
+    })
+}
+
+fn expr_has_player_console_identity(e: &Expr, self_param: &str) -> bool {
+    let Expr::Binary { op, lhs, rhs } = e else {
+        return false;
+    };
+    if !matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+        return false;
+    }
+    let is_self = |x: &Expr| matches!(x, Expr::Ident(n) if n == self_param);
+    (is_self(lhs) && is_player_console_identity_rhs(rhs))
+        || (is_self(rhs) && is_player_console_identity_rhs(lhs))
+}
+
+fn stmt_has_player_console_identity(s: &Stmt, self_param: &str) -> bool {
+    match s {
+        Stmt::Expr(Some(e)) => expr_has_player_console_identity(e, self_param),
+        Stmt::Compound(c) => body_has_player_console_identity(&c.items, self_param),
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_player_console_identity(cond, self_param)
+                || stmt_has_player_console_identity(then_branch, self_param)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| stmt_has_player_console_identity(eb, self_param))
+        }
+        Stmt::Switch { cond, body } => {
+            expr_has_player_console_identity(cond, self_param)
+                || stmt_has_player_console_identity(body, self_param)
+        }
+        Stmt::Case { stmt, .. } => stmt_has_player_console_identity(stmt, self_param),
+        Stmt::Default(stmt) => stmt_has_player_console_identity(stmt, self_param),
+        Stmt::While { cond, body } => {
+            expr_has_player_console_identity(cond, self_param)
+                || stmt_has_player_console_identity(body, self_param)
         }
         _ => false,
     }
@@ -18749,6 +18884,116 @@ pub fn P_GiveAmmo(player: &mut Player, ammo: i32, mut num: i32, world: &mut Worl
         }
     }
     return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_GiveWeapon` (`p_inter.c`, round 14) -- the function round 13
+    /// left deliberately deferred (see `test_p_give_ammo_renders_exactly`'s
+    /// own doc comment) is now translated, closing the `players[]`/
+    /// `PlayerId`-identity gap that blocked it. Corpus-verified first
+    /// (`doomstat.h`): `players` is `player_t players[MAXPLAYERS]`
+    /// (`g_game.c`), already `World.players`/`PlayerId`-indexed
+    /// (`world.rs`'s own memory-model decision, `runtime/player.rs`'s
+    /// `PlayerId(pub u32)`); `consoleplayer` is a separate file-scope
+    /// `extern boolean netgame;`/`extern boolean deathmatch;`'s own
+    /// sibling `int consoleplayer;` (`d_net.c`) -- the local machine's
+    /// own player slot, never itself an array index computation, so it
+    /// joins `World` as a new plain `consoleplayer: PlayerId` field
+    /// (`world.rs`, this round). One new mechanism: `player == &players
+    /// [consoleplayer]` -- the function's own `&mut Player` receiver
+    /// carries no identity by itself (`Handle<Thinker>`'s already-solved
+    /// "thing == tmthing" shape's own direct analog, `body_has_self_
+    /// identity_comparison`'s new `PlayerId` sibling, `body_has_player_
+    /// console_identity`) -- extends the signature with a `player_id:
+    /// PlayerId` parameter (mirroring `handle: Handle<Thinker>`) and
+    /// renders the comparison as `player_id == world.consoleplayer`,
+    /// plain `PlayerId` value equality (`#[derive(PartialEq)]`), not
+    /// `std::ptr::eq` -- `players[]` being a fixed-size array with no
+    /// per-slot identity beyond its own index means no arena/generation
+    /// machinery is needed the way `Handle<Thinker>` needs, confirming
+    /// the round-13 hypothesis that a plain index newtype suffices.
+    /// `weaponinfo[weapon]` (indexed by the genuine `weapon: i32`
+    /// parameter, not a self-struct-field the way every earlier
+    /// `weaponinfo[player->readyweapon]` reference already was) is a new
+    /// by-name `as usize` index-cast list member (`weaponinfo` itself,
+    /// the `Expr::Ident`-base half of the list, `clipammo`/`tmbox`'s own
+    /// precedent) -- every earlier reference happened to have an
+    /// `Expr::Member` index (`player->readyweapon`, already covered by
+    /// the generic index-shape rule), so `weaponinfo` by name never
+    /// needed to join until this first bare-parameter-indexed reference.
+    /// Everything else -- `netgame`/`deathmatch` (bare, unregistered
+    /// `boolean` globals, `deathmatch != 2`'s own real corpus wrinkle:
+    /// declared `boolean` but genuinely compared against `2`, so its
+    /// bare top-level `if (deathmatch)` correctly falls through to the
+    /// generic `Expr::Ident => != 0` fallback `P_GiveAmmo`'s own
+    /// `oldammo` already established, while its `&&`-chain operand use
+    /// renders bare/uncast, matching `netgame`'s own already-proven
+    /// `A_VileChase` precedent -- both readings compose correctly for
+    /// the same global with no new mechanism), `weaponowned`'s own
+    /// already-`bool`-typed by-name truthiness (`P_CheckAmmo`'s own
+    /// precedent), a bare `dropped: bool` scalar parameter's own `!`/
+    /// truthiness handling (`P_GunShot`'s own `accurate` precedent), and
+    /// three plain calls to the already-translated `P_GiveAmmo` -- is
+    /// composed from wholly pre-existing machinery. Verified compiling
+    /// for real (`rustc --edition 2021 --crate-type lib`) against a
+    /// hand-written `Player`/`World`/`PlayerId` stand-in and stub
+    /// `P_GiveAmmo`/`S_StartSound`/`weaponinfo` -- zero errors.
+    #[test]
+    fn test_p_give_weapon_renders_exactly() {
+        let field_types = field_types(&[
+            ("weaponowned", "[bool; NUMWEAPONS]"),
+            ("bonuscount", "i32"),
+            ("pendingweapon", "i32"),
+        ]);
+        let rendered = render_bool_fn_with_two_scalar_params(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_GiveWeapon",
+            "Player",
+            &field_types,
+            "i32",
+            "bool",
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_GiveWeapon(player: &mut Player, weapon: i32, dropped: bool, world: &mut World, player_id: PlayerId) -> bool {
+    let mut gaveammo;
+    let mut gaveweapon;
+    if netgame && deathmatch != 2 && !dropped {
+        if player.weaponowned[weapon as usize] {
+            return false;
+        }
+        player.bonuscount += BONUSADD;
+        player.weaponowned[weapon as usize] = true;
+        if deathmatch != 0 {
+            P_GiveAmmo(player, weaponinfo[weapon as usize].ammo, 5);
+        } else {
+            P_GiveAmmo(player, weaponinfo[weapon as usize].ammo, 2);
+        }
+        player.pendingweapon = weapon;
+        if player_id == world.consoleplayer {
+            S_StartSound(None, sfx_wpnup);
+        }
+        return false;
+    }
+    if weaponinfo[weapon as usize].ammo != am_noammo {
+        if dropped {
+            gaveammo = P_GiveAmmo(player, weaponinfo[weapon as usize].ammo, 1);
+        } else {
+            gaveammo = P_GiveAmmo(player, weaponinfo[weapon as usize].ammo, 2);
+        }
+    } else {
+        gaveammo = false;
+    }
+    if player.weaponowned[weapon as usize] {
+        gaveweapon = false;
+    } else {
+        gaveweapon = true;
+        player.weaponowned[weapon as usize] = true;
+        player.pendingweapon = weapon;
+    }
+    return gaveweapon || gaveammo;
 }";
         assert_eq!(rendered, expected);
     }
