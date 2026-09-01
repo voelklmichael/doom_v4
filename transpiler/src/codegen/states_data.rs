@@ -12,18 +12,46 @@
 //! assumed: `NULL` stays `Expr::Ident("NULL")` (no macro expansion), never
 //! folded to a literal.
 //!
-//! **Resolving which `ActionFn` variant a name needs**: `info.c`'s own
+//! **Round 19 -- `ActionFn` became a name-tagged closed enum, not a
+//! 2-variant `fn`-pointer wrapper**: `docs/03_TRANSPILER.md`'s Round 18
+//! entry found the old `Mobj(fn(&mut Mobj))`/`Weapon(fn(&mut Player, &mut
+//! PlayerSpriteState))` design provably wrong -- a real Rust `fn` pointer
+//! type is monomorphic, but the corpus's real `A_*` bodies need at least
+//! 8 distinct concrete parameter lists (`action_fn.rs`'s own doc comment
+//! has the full breakdown), so no single `fn(&mut Mobj)` type could ever
+//! hold `A_Chase` (needs `world`/`thinkers` too). `render_action_field`
+//! now just tags each `states[]` entry's `action` with its own bare enum
+//! variant (`Some(ActionFn::AChase)`, no payload) -- the *dispatcher*
+//! (`P_SetMobjState`, `function_body.rs`) does the real work, a
+//! hand-written `match` calling each real function by name with
+//! whatever args *that* function's own already-shipped signature needs,
+//! drawn from the dispatcher's own scope. This also means a tagged
+//! variant needs no cross-module `use` import at the `states[]`-table
+//! level any more (the old `Mobj(A_Chase)` literal needed `A_Chase`'s
+//! real value in scope right there; a bare `ActionFn::AChase` tag
+//! doesn't) -- imports for actions specifically are gone from this
+//! module's own `StatesTable::imports` output; only the dispatcher's own
+//! module needs those.
+//!
+//! **Resolving which name needs a variant at all**: `info.c`'s own
 //! forward declarations of the 132 action functions (`void A_Foo();`) use
-//! C89's "unspecified arguments" `()` shape, which can't tell arity apart
-//! -- so `build_action_function_index` reads the *real* definitions in
-//! `p_enemy.c`/`p_pspr.c` instead, via `parse_full` (both parse cleanly
-//! standalone, same as `info.c` did for `mobjinfo_data.rs`). Confirmed
-//! empirically, not assumed from file location: a function's home file
-//! doesn't predict its shape -- `A_OpenShotgun2`/`A_LoadShotgun2`/
-//! `A_CloseShotgun2` are defined in `p_enemy.c` but are genuinely
-//! `fn(player_t*, pspdef_t*)`-shaped (the double-barrel shotgun's weapon
-//! state chain), so shape is decided per-function by its own real
-//! parameter count, not by which file happened to define it.
+//! C89's "unspecified arguments" `()` shape, which can't even confirm a
+//! name is real -- so `build_action_function_index` reads the *real*
+//! definitions in `p_enemy.c`/`p_pspr.c` instead, via `parse_full` (both
+//! parse cleanly standalone, same as `info.c` did for `mobjinfo_data.rs`).
+//! Not every one of those 132 real definitions is actually a variant
+//! `ActionFn` needs, though: `A_PainShootSkull` is a plain *helper*,
+//! called directly from `A_PainAttack`/`A_PainDie`'s own bodies with an
+//! extra `angle` argument no `state_t.action` slot could ever supply --
+//! it never appears as a `states[]` entry's own `{A_PainShootSkull}`
+//! value, confirmed by direct grep of `info.c`, not assumed from its
+//! `p_enemy.c` file location. So `render_states_table` derives the
+//! exhaustive variant set from `states[]` itself (74 distinct names
+//! actually referenced, out of 132 real definitions), not from the
+//! action-function index directly -- `StatesTable::action_names`, which
+//! `action_fn.rs`'s own `render_action_fn_enum` reuses rather than
+//! re-scanning, so there's exactly one true computation of "which names
+//! need a variant."
 
 use crate::codegen::mobjinfo_data::{build_constant_index, render_value_expr, rough_scan};
 use crate::codegen::struct_fields::{
@@ -71,14 +99,24 @@ fn build_action_function_index(corpus_dir: &Path) -> HashMap<String, (String, us
     out
 }
 
+/// `A_Chase` -> `AChase` -- `ActionFn`'s own variant-naming rule (this
+/// module's doc comment, and `action_fn.rs`'s): every real action
+/// function name starts with the single `A_` prefix, so stripping just
+/// that one underscore (not every underscore -- none of these 74 names
+/// have a second one) gives a valid, collision-free Rust identifier
+/// directly, no further casing needed.
+pub fn action_variant_name(c_name: &str) -> String {
+    c_name.replacen('_', "", 1)
+}
+
 /// Renders `state_t.action`'s own nested union-initializer value
-/// (`{NULL}`/`{A_Function}`) as an `Option<ActionFn>` literal, tracking
-/// any cross-module import it needs.
+/// (`{NULL}`/`{A_Function}`) as an `Option<ActionFn>` tag literal (no
+/// cross-module import needed for it any more -- see module docs),
+/// recording the real name into `referenced` whenever it resolves to one.
 fn render_action_field(
     init: &Initializer,
-    home_module: &str,
     actions: &HashMap<String, (String, usize)>,
-    imports: &mut BTreeMap<String, BTreeSet<String>>,
+    referenced: &mut BTreeSet<String>,
 ) -> Option<String> {
     let Initializer::List(items) = init else {
         return None;
@@ -90,29 +128,24 @@ fn render_action_field(
         Expr::Ident(name) if name == "NULL" => Some("None".to_string()),
         Expr::IntLiteral(text) if text == "0" => Some("None".to_string()),
         Expr::Ident(name) => {
-            let (module, param_count) = actions.get(name)?;
-            if module != home_module {
-                imports
-                    .entry(module.clone())
-                    .or_default()
-                    .insert(name.clone());
-            }
-            let variant = match param_count {
-                1 => "Mobj",
-                2 => "Weapon",
-                _ => return None,
-            };
-            Some(format!("Some(ActionFn::{variant}({name}))"))
+            actions.get(name)?;
+            referenced.insert(name.clone());
+            Some(format!("Some(ActionFn::{})", action_variant_name(name)))
         }
         _ => None,
     }
 }
 
-/// `states[]`'s rendered Rust text, plus the cross-module `use` imports it
-/// needs.
+/// `states[]`'s rendered Rust text, the cross-module `use` imports it
+/// needs (no longer includes action-function names -- see module docs),
+/// and the exhaustive set of real `A_*` names actually referenced from
+/// some entry's `action` field -- the one true source `action_fn.rs`'s
+/// own `render_action_fn_enum` reuses for its variant list, rather than
+/// re-deriving it.
 pub struct StatesTable {
     pub rendered: String,
     pub imports: BTreeMap<String, BTreeSet<String>>,
+    pub action_names: BTreeSet<String>,
 }
 
 /// `state_index` -- hand-rendered literal text, not corpus-mapped, the
@@ -176,6 +209,7 @@ pub fn render_states_table(corpus_dir: &Path) -> Result<StatesTable, String> {
     };
 
     let mut imports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut action_names: BTreeSet<String> = BTreeSet::new();
     let mut rendered_entries = Vec::with_capacity(entries.len());
     for (i, entry) in entries.iter().enumerate() {
         let Initializer::List(values) = entry else {
@@ -191,7 +225,7 @@ pub fn render_states_table(corpus_dir: &Path) -> Result<StatesTable, String> {
         let mut field_strs = Vec::with_capacity(field_names.len());
         for (name, value) in field_names.iter().zip(values) {
             let rendered = if *name == "action" {
-                render_action_field(value, "info", &actions, &mut imports).ok_or_else(|| {
+                render_action_field(value, &actions, &mut action_names).ok_or_else(|| {
                     format!("states[{i}].action: no rendering for this value shape")
                 })?
             } else {
@@ -215,7 +249,11 @@ pub fn render_states_table(corpus_dir: &Path) -> Result<StatesTable, String> {
         rendered_entries.join("\n")
     );
 
-    Ok(StatesTable { rendered, imports })
+    Ok(StatesTable {
+        rendered,
+        imports,
+        action_names,
+    })
 }
 
 #[cfg(test)]
@@ -253,65 +291,97 @@ mod tests {
     }
 
     #[test]
-    fn test_mobj_shaped_action_renders_correctly() {
+    fn test_mobj_shaped_action_renders_as_bare_tag() {
         // S_POSS_RUN1: {SPR_POSS,0,4,{A_Chase},S_POSS_RUN2,0,0} -- A_Chase
         // (p_enemy.c) is fn(mobj_t*) shaped, the classic monster chase-AI
-        // action.
+        // action. Round 19: no more `Mobj(..)` wrapper, just the bare tag.
         let table = render_states_table(&corpus_dir()).expect("should render cleanly");
         let line = table
             .rendered
             .lines()
-            .find(|l| l.contains("A_Chase"))
-            .expect("A_Chase not found in rendered output");
+            .find(|l| l.contains("ActionFn::AChase"))
+            .expect("ActionFn::AChase not found in rendered output");
         assert!(
-            line.contains("action: Some(ActionFn::Mobj(A_Chase))"),
-            "expected Mobj variant, got: {line}"
+            line.contains("action: Some(ActionFn::AChase)"),
+            "expected AChase tag, got: {line}"
         );
     }
 
     #[test]
-    fn test_weapon_shaped_action_renders_correctly() {
+    fn test_weapon_shaped_action_renders_as_bare_tag() {
         // S_LIGHTDONE (index 1): {SPR_SHTG,4,0,{A_Light0},S_NULL,0,0} --
-        // A_Light0 is fn(player_t*, pspdef_t*) shaped.
+        // A_Light0 is fn(player_t*, pspdef_t*) shaped, but round 19's
+        // tagged enum doesn't distinguish shape at the STATES-table level
+        // at all any more -- the dispatcher alone knows.
         let table = render_states_table(&corpus_dir()).expect("should render cleanly");
         let line = table
             .rendered
             .lines()
-            .find(|l| l.contains("A_Light0"))
-            .expect("A_Light0 not found in rendered output");
+            .find(|l| l.contains("ActionFn::ALight0"))
+            .expect("ActionFn::ALight0 not found in rendered output");
         assert!(
-            line.contains("action: Some(ActionFn::Weapon(A_Light0))"),
-            "expected Weapon variant, got: {line}"
+            line.contains("action: Some(ActionFn::ALight0)"),
+            "expected ALight0 tag, got: {line}"
         );
     }
 
     #[test]
-    fn test_cross_file_action_shape_resolved_by_signature_not_file() {
-        // A_OpenShotgun2 is *defined* in p_enemy.c but is genuinely
-        // fn(player_t*, pspdef_t*)-shaped (the double-barrel shotgun's own
-        // weapon state chain) -- confirms shape comes from the real
-        // parameter count, not from which file happened to define it.
+    fn test_action_defined_in_p_enemy_still_resolves_by_name() {
+        // A_OpenShotgun2 is *defined* in p_enemy.c despite being
+        // genuinely fn(player_t*, pspdef_t*)-shaped (the double-barrel
+        // shotgun's own weapon state chain) -- round 18 confirmed shape
+        // comes from real parameter count, not file location. Round 19:
+        // that distinction no longer matters for the STATES table at
+        // all, only that the name resolves to a real corpus action.
         let table = render_states_table(&corpus_dir()).expect("should render cleanly");
         let line = table
             .rendered
             .lines()
-            .find(|l| l.contains("A_OpenShotgun2"))
-            .expect("A_OpenShotgun2 not found in rendered output");
+            .find(|l| l.contains("ActionFn::AOpenShotgun2"))
+            .expect("ActionFn::AOpenShotgun2 not found in rendered output");
         assert!(
-            line.contains("action: Some(ActionFn::Weapon(A_OpenShotgun2))"),
-            "expected Weapon variant, got: {line}"
+            line.contains("action: Some(ActionFn::AOpenShotgun2)"),
+            "expected AOpenShotgun2 tag, got: {line}"
         );
-        assert!(table.imports["p_enemy"].contains("A_OpenShotgun2"));
     }
 
     #[test]
-    fn test_needs_p_enemy_and_p_pspr_imports_not_info() {
+    fn test_no_action_imports_needed_any_more() {
+        // Round 19: a bare tag like `ActionFn::AChase` needs no
+        // cross-module `use A_Chase;` the way the old `Mobj(A_Chase)`
+        // fn-pointer literal did -- only the dispatcher's own module
+        // needs to import the real functions it calls by name.
         let table = render_states_table(&corpus_dir()).expect("should render cleanly");
-        assert!(!table.imports.contains_key("info"));
-        assert!(table.imports.contains_key("p_enemy"));
-        assert!(table.imports.contains_key("p_pspr"));
-        assert!(table.imports["p_enemy"].contains("A_Chase"));
-        assert!(table.imports["p_pspr"].contains("A_Light0"));
+        assert!(!table.imports.contains_key("p_enemy"));
+        assert!(!table.imports.contains_key("p_pspr"));
+    }
+
+    #[test]
+    fn test_action_names_is_the_74_real_state_dispatched_functions() {
+        // Corpus-verified: `grep -oP '\{A_\w+\}' info.c | sort -u` finds
+        // exactly 74 distinct names actually referenced from some
+        // states[] entry's own action field -- out of 132 real `A_*`
+        // definitions total (`p_enemy.c`/`p_pspr.c`). `A_PainShootSkull`
+        // is the confirmed counterexample: a real, defined action
+        // function that's a plain helper (`A_PainAttack`/`A_PainDie`
+        // call it directly with an extra `angle` argument), never a
+        // `states[]` entry's own action value, so it must NOT appear
+        // here even though `build_action_function_index` (scanning
+        // p_enemy.c/p_pspr.c directly) knows about it.
+        let table = render_states_table(&corpus_dir()).expect("should render cleanly");
+        assert_eq!(table.action_names.len(), 74);
+        assert!(table.action_names.contains("A_Chase"));
+        assert!(table.action_names.contains("A_Light0"));
+        assert!(table.action_names.contains("A_OpenShotgun2"));
+        assert!(!table.action_names.contains("A_PainShootSkull"));
+    }
+
+    #[test]
+    fn test_action_variant_name_strips_single_underscore() {
+        assert_eq!(action_variant_name("A_Chase"), "AChase");
+        assert_eq!(action_variant_name("A_FaceTarget"), "AFaceTarget");
+        assert_eq!(action_variant_name("A_SPosAttack"), "ASPosAttack");
+        assert_eq!(action_variant_name("A_BFGsound"), "ABFGsound");
     }
 
     #[test]
