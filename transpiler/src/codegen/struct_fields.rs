@@ -26,7 +26,7 @@
 
 use crate::codegen::enum_values::fold_const_int;
 use crate::parser::ast::{
-    DeclSpecifiers, Declarator, DirectDeclarator, ExternalDecl, FieldDecl, StorageClass,
+    DeclSpecifiers, Declarator, DirectDeclarator, Expr, ExternalDecl, FieldDecl, StorageClass,
     TypeSpecifier,
 };
 use crate::parser::grammar::declarator_name;
@@ -121,6 +121,26 @@ fn map_type(
             [TypeSpecifier::TypedefName(name)] if enum_typedefs.contains(name) => {
                 Some("i32".to_string())
             }
+            // `char` (`ticcmd_t.forwardmove`/`.sidemove`, d_ticcmd.h) --
+            // plain signed 8-bit on this project's Linux/x86 ILP32 target
+            // (the same target `long`'s own mapping already assumes),
+            // where `char` defaults to signed.
+            [TypeSpecifier::Char] => Some("i8".to_string()),
+            // `byte` (`typedef unsigned char byte;`, doomtype.h) --
+            // `ticcmd_t.chatchar`/`.buttons`' own declared type.
+            [TypeSpecifier::TypedefName(name)] if name == "byte" => Some("u8".to_string()),
+            // `ticcmd_t` (d_ticcmd.h) embedded by value in `player_t.cmd`
+            // -- a plain value struct (four scalar fields, no pointers),
+            // same "ad hoc translated name" precedent as `mapthing_t`/
+            // `divline_t` above.
+            [TypeSpecifier::TypedefName(name)] if name == "ticcmd_t" => Some("TicCmd".to_string()),
+            // `pspdef_t` (p_pspr.h) embedded by value, `player_t.psprites
+            // [NUMPSPRITES]` -- another plain value struct. Its own `state`
+            // field needs a name-collision correction `map_pspdef_t_fields`
+            // applies after this generic pass -- see that function's docs.
+            [TypeSpecifier::TypedefName(name)] if name == "pspdef_t" => {
+                Some("PlayerSpriteState".to_string())
+            }
             _ => None,
         };
     }
@@ -129,6 +149,18 @@ fn map_type(
             [TypeSpecifier::TypedefName(name)] if name == "sector_t" => {
                 Some("SectorId".to_string())
             }
+            // `char*` (`player_t.message`, d_player.h) -- round 16's own
+            // corpus-wide sweep (docs/03_TRANSPILER.md) found every real
+            // assignment site is either a `#define`d string-literal macro,
+            // `NULL`/`0`, or a `static`-lifetime local buffer's address --
+            // all representable as `Option<&'static str>`, decided there.
+            // `message` is the only `char*`-typed field mapped so far, so
+            // this rule is written as a type-general rule (any `char*`
+            // pointer field), not name-scoped like `specialdata`/
+            // `backsector` below -- nothing in the corpus so far
+            // contradicts treating every `char*` field this way, unlike
+            // those two fields' own genuinely mixed-nullability siblings.
+            [TypeSpecifier::Char] => Some("Option<&'static str>".to_string()),
             // mobjinfo_t*/state_t* point into mobjinfo[]/states[] (info.h):
             // static, program-lifetime, read-only tables -- never freed or
             // per-level, unlike everything else mapped so far, so a real
@@ -266,14 +298,37 @@ pub(crate) fn rust_field_name(name: &str) -> Result<String, String> {
 /// recursing into its base, not after -- the size closest to the AST root
 /// ends up closest to the element type in the finished Rust type, exactly
 /// mirroring the C reading (rightmost bracket = innermost dimension).
-/// Every array length in the corpus fields mapped so far is a bare integer
-/// literal, so `enum_values.rs`'s own `fold_const_int` (reused, not
-/// reimplemented) is all the evaluation this needs.
+/// Every array length in the corpus fields mapped so far up through
+/// `mobj_t`/`sector_t` is a bare integer literal, so `enum_values.rs`'s own
+/// `fold_const_int` (reused, not reimplemented) was all the evaluation
+/// that needed. `player_t`'s own array fields (`powers[NUMPOWERS]`,
+/// `cards[NUMCARDS]`, `frags[MAXPLAYERS]`, `weaponowned[NUMWEAPONS]`,
+/// `ammo`/`maxammo[NUMAMMO]`, `psprites[NUMPSPRITES]`) are every one of
+/// them sized by a bare identifier instead -- an enum sentinel constant
+/// (`NUMPOWERS` etc., each the trailing `typedef enum {...}` value in its
+/// own doomdef.h/p_pspr.h enum, corpus-checked, not folded to a literal
+/// count) or a `#define`d object-macro (`MAXPLAYERS`). This project's own
+/// preprocessor (`resolve_conditionals`) only resolves conditional
+/// compilation, never substitutes object-like `#define` bodies or enum
+/// constants into the token stream, so every one of these still parses as
+/// a bare `Expr::Ident` here, not a literal -- matching the same
+/// "opaque pass-through, assumed correctly defined wherever the real
+/// generated crate eventually defines them" precedent this project already
+/// uses for `FRACUNIT`/`MISSILERANGE` (and already relied on, unverified
+/// until now, by this file's own pre-existing `("powers", "[i32;
+/// NUMPOWERS]")` test-registration precedent in `function_body.rs`). A
+/// real Rust array type accepts any `const`-valued expression as its
+/// length, so emitting the identifier text verbatim (`[i32; NUMPOWERS]`)
+/// is valid syntax as soon as the target crate defines a matching
+/// `pub const NUMPOWERS: usize = ..;` -- not yet this module's own concern.
 fn wrap_arrays(d: &DirectDeclarator, elem: &str) -> Option<String> {
     match d {
         DirectDeclarator::Ident(_) => Some(elem.to_string()),
         DirectDeclarator::Array(base, Some(size_expr)) => {
-            let size = fold_const_int(size_expr)?;
+            let size = match size_expr {
+                Expr::Ident(name) => name.clone(),
+                _ => fold_const_int(size_expr)?.to_string(),
+            };
             wrap_arrays(base, &format!("[{elem}; {size}]"))
         }
         _ => None,
@@ -391,6 +446,31 @@ pub fn map_struct_fields(
         }
     }
     Ok(out)
+}
+
+/// `pspdef_t`'s (p_pspr.h) own `state_t* state` field -- unlike `mobj_t`'s
+/// same-named `state` field (always set, corpus-checked non-`Option`),
+/// this one is genuinely nullable: p_pspr.h's own comment reads "a NULL
+/// state means not active". `map_struct_fields` maps a field purely by its
+/// own name/type, one struct's field list at a time, with no notion of
+/// which enclosing struct it's being called for -- so it can't tell these
+/// two same-named, same-typed fields apart, and correctly keeps mapping
+/// every `state_t*` to the non-`Option` `&'static State` that's right for
+/// `mobj_t` (and every other struct with a `state` field this project
+/// might map later). This thin wrapper is `pspdef_t`'s own call site
+/// fixing up just this one field afterward, rather than teaching the
+/// shared engine a struct-name-scoped exception it doesn't otherwise need.
+pub fn map_pspdef_t_fields(
+    fields: &[FieldDecl],
+    enum_typedefs: &HashSet<String>,
+) -> Result<Vec<MappedField>, String> {
+    let mut mapped = map_struct_fields(fields, enum_typedefs)?;
+    for f in &mut mapped {
+        if f.name == "state" && f.rust_type == "&'static State" {
+            f.rust_type = "Option<&'static State>".to_string();
+        }
+    }
+    Ok(mapped)
 }
 
 /// Renders `name`'s Rust struct definition from its already-mapped fields.
@@ -1059,6 +1139,128 @@ mod tests {
                 field("nextstate", "i32"),
                 field("misc1", "i32"),
                 field("misc2", "i32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_ticcmd_t_exactly() {
+        // d_ticcmd.h's ticcmd_t: a plain value struct (no thinker_t
+        // header, no pointers), embedded by value in player_t.cmd --
+        // exercises `char` (-> i8) and `byte` (-> u8), neither needed by
+        // any struct mapped before player_t.
+        let items = parse_rough("d_ticcmd.h");
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "ticcmd_t").expect("ticcmd_t not found");
+        let mapped = map_struct_fields(fields, &enum_typedefs).expect("should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("forwardmove", "i8"),
+                field("sidemove", "i8"),
+                field("angleturn", "i16"),
+                field("consistancy", "i16"),
+                field("chatchar", "u8"),
+                field("buttons", "u8"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_pspdef_t_exactly() {
+        // p_pspr.h's pspdef_t: a plain value struct, embedded by value in
+        // player_t.psprites[NUMPSPRITES]. Its own `state` field needs
+        // map_pspdef_t_fields's after-the-fact correction (Option-wrapped,
+        // unlike mobj_t's same-named, non-Option field) -- see that
+        // function's own docs for why map_struct_fields itself can't tell
+        // the two apart.
+        // info.h is needed first so `state_t` is already a known typedef
+        // name by the time p_pspr.h's own `state_t* state;` is parsed --
+        // p_pspr.h #includes info.h for exactly this reason.
+        let mut items = parse_rough("info.h");
+        items.extend(parse_rough("p_pspr.h"));
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "pspdef_t").expect("pspdef_t not found");
+        let mapped =
+            map_pspdef_t_fields(fields, &enum_typedefs).expect("pspdef_t should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("state", "Option<&'static State>"),
+                field("tics", "i32"),
+                field("sx", "FixedT"),
+                field("sy", "FixedT"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_maps_player_t_completely() {
+        // player_t (d_player.h), the 10th thinker-adjacent struct this
+        // module maps (not itself a Thinker variant -- players[] is its
+        // own fixed-size, program-lifetime array, per struct_fields.rs's
+        // own mo/attacker docs and function_body.rs's PlayerId reasoning).
+        // Exercises every new mapping this round added in one real struct:
+        // mobj_t* (mo/attacker, both genuinely nullable -- players[i].mo =
+        // NULL at level setup (p_setup.c) and load (p_saveg.c), and
+        // st_stuff.c's own `if (plyr->mo)` cheat-code guard, confirms this
+        // directly, contradicting an earlier round's informal per-function
+        // assumption that mo is never null -- see docs/03_TRANSPILER.md's
+        // Round 21 entry), ticcmd_t (cmd, by value), char* (message,
+        // Option<&'static str>, round 16's own decision), pspdef_t arrays
+        // (psprites), and five enum-sentinel-sized arrays (powers/cards/
+        // frags/weaponowned/ammo/maxammo) whose array-length identifiers
+        // (NUMPOWERS, NUMCARDS, MAXPLAYERS, NUMWEAPONS, NUMAMMO) all stay
+        // symbolic per wrap_arrays's own updated docs, not folded to a
+        // literal count.
+        let mut items = parse_rough("info.h");
+        items.extend(parse_rough("p_mobj.h"));
+        items.extend(parse_rough("d_ticcmd.h"));
+        items.extend(parse_rough("p_pspr.h"));
+        items.extend(parse_rough("doomdef.h"));
+        items.extend(parse_rough("d_player.h"));
+        let enum_typedefs = collect_enum_typedef_names(&items);
+        let fields = find_typedef_struct(&items, "player_t").expect("player_t not found");
+        let mapped =
+            map_struct_fields(fields, &enum_typedefs).expect("player_t should map cleanly");
+        assert_eq!(
+            mapped,
+            vec![
+                field("mo", "Option<Handle<Thinker>>"),
+                field("playerstate", "i32"),
+                field("cmd", "TicCmd"),
+                field("viewz", "FixedT"),
+                field("viewheight", "FixedT"),
+                field("deltaviewheight", "FixedT"),
+                field("bob", "FixedT"),
+                field("health", "i32"),
+                field("armorpoints", "i32"),
+                field("armortype", "i32"),
+                field("powers", "[i32; NUMPOWERS]"),
+                field("cards", "[bool; NUMCARDS]"),
+                field("backpack", "bool"),
+                field("frags", "[i32; MAXPLAYERS]"),
+                field("readyweapon", "i32"),
+                field("pendingweapon", "i32"),
+                field("weaponowned", "[bool; NUMWEAPONS]"),
+                field("ammo", "[i32; NUMAMMO]"),
+                field("maxammo", "[i32; NUMAMMO]"),
+                field("attackdown", "i32"),
+                field("usedown", "i32"),
+                field("cheats", "i32"),
+                field("refire", "i32"),
+                field("killcount", "i32"),
+                field("itemcount", "i32"),
+                field("secretcount", "i32"),
+                field("message", "Option<&'static str>"),
+                field("damagecount", "i32"),
+                field("bonuscount", "i32"),
+                field("attacker", "Option<Handle<Thinker>>"),
+                field("extralight", "i32"),
+                field("fixedcolormap", "i32"),
+                field("colormap", "i32"),
+                field("psprites", "[PlayerSpriteState; NUMPSPRITES]"),
+                field("didsecret", "bool"),
             ]
         );
     }
