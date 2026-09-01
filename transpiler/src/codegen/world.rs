@@ -122,6 +122,18 @@
 //! already established, `soundtarget` genuinely nullable (`Option<
 //! Handle<Thinker>>`, matching `sector_t.soundtarget`'s own already-
 //! established mapping, which this exact global is copied into).
+//! `consoleplayer` joined once `P_GiveWeapon` (`p_inter.c`, round 14)
+//! needed somewhere to hold `d_net.c`'s own file-scope `int
+//! consoleplayer;` -- corpus-verified (`doomstat.h`) as the local
+//! machine's own player slot in a net game, read (never itself
+//! reassigned) by every `if (player == &players[consoleplayer])`-shaped
+//! "is this the local player" identity check (`P_GiveWeapon`/
+//! `P_TouchSpecialThing`/`P_KillMobj`/`P_DamageMobj`'s own shared
+//! idiom). Typed `PlayerId` rather than plain `i32` since it only ever
+//! indexes `players[]` -- the same "hold the real index type, not the
+//! raw C int" reasoning `linetarget`/`corpsehit` already get for their
+//! own `Handle<Thinker>` fields, just for this project's other index
+//! newtype.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -162,6 +174,7 @@ pub struct World {
     pub lowfloor: FixedT,
     pub validcount: i32,
     pub soundtarget: Option<Handle<Thinker>>,
+    pub consoleplayer: PlayerId,
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -279,6 +292,7 @@ mod tests {
         assert!(rendered.contains("pub lowfloor: FixedT,"));
         assert!(rendered.contains("pub validcount: i32,"));
         assert!(rendered.contains("pub soundtarget: Option<Handle<Thinker>>,"));
+        assert!(rendered.contains("pub consoleplayer: PlayerId,"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));

@@ -39,7 +39,9 @@
 //! two *do* rescale by `FRACUNIT` (true fixed-point multiply/divide)
 //! and mixing the two meanings under one name would be wrong.
 
-use std::ops::{Add, AddAssign, Div, Mul, Neg, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign};
+use std::ops::{
+    Add, AddAssign, BitAnd, BitXor, Div, Mul, Neg, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
+};
 
 pub const FRACBITS: u32 = 16;
 pub const FRACUNIT: FixedT = FixedT(1 << FRACBITS);
@@ -254,6 +256,45 @@ impl Shr<u32> for FixedT {
     }
 }
 
+/// `line->dy ^ line->dx ^ dx ^ dy` (`P_PointOnDivlineSide`, `p_maputl.c`)
+/// -- a raw sign-bit fast-path check directly on `fixed_t` values (`x^y`
+/// on the representation, not a rescaling operation -- `fixed_t` really
+/// is just `int` here, the same idiom every other bitwise/arithmetic
+/// operator in this file already models). Round 13's own corpus survey
+/// flagged this exact gap (`FixedT` had no `BitXor` impl at all) as the
+/// one new mechanism this function's sign-bit shortcut needed.
+impl BitXor for FixedT {
+    type Output = FixedT;
+    fn bitxor(self, rhs: FixedT) -> FixedT {
+        FixedT(self.0 ^ rhs.0)
+    }
+}
+
+/// `(...) & 0x80000000` (`P_PointOnDivlineSide`) -- the `BitAnd` sibling
+/// of `BitXor` just above, needed for the same sign-bit fast-path check
+/// (masking down to just the top bit to compare signs without a full
+/// `FixedMul`). Same raw-representation-`&`, not a rescaling operation.
+impl BitAnd for FixedT {
+    type Output = FixedT;
+    fn bitand(self, rhs: FixedT) -> FixedT {
+        FixedT(self.0 & rhs.0)
+    }
+}
+
+/// `(node->dy>>FRACBITS) * (dx>>FRACBITS)` (`P_DivlineSide`, `p_sight.c`)
+/// -- a plain, non-`FixedMul` integer multiply of two pre-shifted
+/// `fixed_t` operands, deliberately abusing C's "`fixed_t` really is just
+/// `int`" idiom the same way `Mul<i32>`/`Mul<FixedT> for i32` already do
+/// for a scale-factor multiply -- this is the missing same-type case
+/// (`FixedT * FixedT`, raw representation, no `FRACUNIT` rescaling),
+/// round 13's own second flagged gap for this function.
+impl Mul for FixedT {
+    type Output = FixedT;
+    fn mul(self, rhs: FixedT) -> FixedT {
+        FixedT(self.0.wrapping_mul(rhs.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +454,30 @@ mod tests {
         let numerator = FixedT(100);
         let divisor = FixedT(4);
         assert_eq!(numerator / divisor, FixedT(25));
+    }
+
+    #[test]
+    fn test_bitxor_matches_raw_representation_xor() {
+        // `line->dy ^ line->dx ^ dx ^ dy` (`P_PointOnDivlineSide`) -- raw
+        // bitwise XOR of the representation, not a rescaling operation.
+        assert_eq!(FixedT(0b1010) ^ FixedT(0b0110), FixedT(0b1100));
+    }
+
+    #[test]
+    fn test_bitand_matches_raw_representation_and() {
+        // `(...) & 0x80000000` (`P_PointOnDivlineSide`) -- masking down to
+        // the sign bit for the sign-bit fast-path check.
+        let neg = FixedT(-1_i32); // all bits set
+        let sign_mask = FixedT(0x80000000_u32 as i32);
+        assert_eq!(neg & sign_mask, sign_mask);
+        assert_eq!(FixedT(1) & sign_mask, FixedT(0));
+    }
+
+    #[test]
+    fn test_mul_fixed_by_fixed_is_raw_representation_multiply() {
+        // `(node->dy>>FRACBITS) * (dx>>FRACBITS)` (`P_DivlineSide`) -- a
+        // plain `int*int` of two already-shifted-down operands, not a
+        // rescaling `fixed_mul`.
+        assert_eq!(FixedT(5) * FixedT(4), FixedT(20));
     }
 }
