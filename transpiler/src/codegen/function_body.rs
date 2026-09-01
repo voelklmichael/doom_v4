@@ -876,6 +876,20 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "vileobj" {
                 return Ok(("world.vileobj".to_string(), false));
             }
+            // `ceilingline` (`p_map.c`'s own file-scope `line_t*
+            // ceilingline;`, `P_XYMovement`'s idiom) -- the same category
+            // `corpsehit`/`vileobj` already established, just `Option<
+            // LineId>`-typed.
+            if name == "ceilingline" {
+                return Ok(("world.ceilingline".to_string(), false));
+            }
+            // `skyflatnum` (`doomstat.h`'s own file-scope `extern int
+            // skyflatnum;`, `P_XYMovement`'s own "don't make missiles
+            // explode against the sky" check) -- the same category
+            // `validcount` already established, a plain `i32`.
+            if name == "skyflatnum" {
+                return Ok(("world.skyflatnum".to_string(), false));
+            }
             // `numsectors` (`p_setup.c`'s own file-scope `int
             // numsectors;`, `P_FindSectorFromLineTag`'s own `for
             // (i=start+1;i<numsectors;i++)`) -- unlike `linetarget`/
@@ -1315,6 +1329,43 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].{field}"), true))
         }
+        // `ceilingline->backsector` (`P_XYMovement`, `p_mobj.c`'s own
+        // file-scope `line_t* ceilingline;`, genuinely nullable) -- the
+        // `Option<LineId>` sibling of the `frontsector`/`v1`/`v2` arms
+        // just above (a bare `LineId` base), needing its own `.unwrap()`
+        // first, the same "known live within this function's own body"
+        // discipline every other `Option<..>`-typed base already gets at
+        // its own point of use (every real corpus call site guards the
+        // whole block behind `if (ceilingline && ceilingline->backsector
+        // && ..)`, C's own short-circuit `&&` carried straight through to
+        // Rust's identical one).
+        Expr::Member { base, field, .. }
+            if field == "backsector"
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<LineId>")) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}.unwrap()].backsector"), true))
+        }
+        // `ceilingline->backsector->ceilingpic` (`P_XYMovement`) -- a
+        // `Sector` field reached through `Line.backsector`'s own `Option<
+        // SectorId>` cross-reference with *no* local variable bound in
+        // between, the exact `target->player->field` shape `P_KillMobj`
+        // (round 23) already established one field-pair over: renders
+        // through `world[..]`, reusing the `backsector` arm just above
+        // for the middle step, so this also transparently unlocks the
+        // generic write path with no separate write-specific arm needed.
+        Expr::Member { base, field, .. }
+            if field != "backsector"
+                && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+                    if bf == "backsector"
+                        && matches!(bb.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<LineId>"))) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((
+                format!("world[{base_text}.unwrap()].{}", rust_field_name(field)?),
+                false,
+            ))
+        }
         // `actor->subsector->sector` (`A_Look`'s own `actor->subsector->
         // sector->soundtarget`) -- a second level of self-struct
         // chaining the generic fallback below can't resolve on its own:
@@ -1623,6 +1674,29 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         } if matches!(rhs.as_ref(), Expr::Ident(n) if n == "sectors") => {
             let (lhs_text, _) = render_expr(lhs, ctx)?;
             Ok((format!("{lhs_text}.0 as i32"), false))
+        }
+        // `player->mo->state - states` (`P_XYMovement`'s own "is this a
+        // walking frame" check, `p_mobj.c`) -- `sec-sectors`'s own idiom
+        // just above, one level over: real C pointer arithmetic measuring
+        // a `state_t*` value's own distance from the table's base, which
+        // is exactly what `state_index` already computes
+        // (`states_data.rs`'s own helper, `A_FireCGun`'s precedent for the
+        // *reference-subtraction* half of this same idiom below) -- this
+        // is its simpler, bare-`states`-identifier sibling (no `&states
+        // [idx]`/addition first), needing no algebraic simplification at
+        // all. Matched by the LHS's own field name (`"state"`), the same
+        // by-name style every other `state`-pointer arm in this module
+        // already uses, since a plain `Member` read can't be told apart
+        // from any other reference by AST shape alone.
+        Expr::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+        } if matches!(rhs.as_ref(), Expr::Ident(n) if n == "states")
+            && matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "state") =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            Ok((format!("state_index({lhs_text})"), false))
         }
         // `weaponinfo[player->readyweapon].flashstate + psp->state -
         // &states[S_CHAIN1]` (`A_FireCGun`, `p_pspr.c`) -- real C pointer
@@ -2113,6 +2187,24 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (rhs_text, _) = render_expr(rhs, ctx)?;
             Ok((format!("{lhs_text} == {rhs_text} as i32"), false))
         }
+        // `ceilingline->backsector->ceilingpic == skyflatnum` (`P_XYMovement`,
+        // `p_mobj.c`) -- another genuine `i16`-vs-`i32` mismatch, the same
+        // category as the `tag` arm just above: `Sector.ceilingpic: i16`
+        // (`struct_fields.rs`) compared against `skyflatnum` (`doomstat.h`'s
+        // own file-scope `extern int skyflatnum;`, `world.skyflatnum`).
+        // Widens the `i16` side with `as i32`, matching C's own implicit
+        // `int` promotion.
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+        } if matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "ceilingpic")
+            && matches!(rhs.as_ref(), Expr::Ident(n) if n == "skyflatnum") =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            Ok((format!("{lhs_text} as i32 == {rhs_text}"), false))
+        }
         // `check->lightlevel < min` (`P_FindMinSurroundingLight`)/`temp->
         // lightlevel > bright` (`EV_LightTurnOn`, `p_lights.c`) -- another
         // genuine `i16`-vs-`i32` mismatch, the same category as the `tag`
@@ -2530,17 +2622,46 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let inner_text = parenthesize_if_needed(expr, &inner_text, u8::MAX, false);
             Ok((format!("{op_text}{inner_text}"), false))
         }
+        // `(unsigned)((player->mo->state - states)- S_PLAY_RUN1)`
+        // (`P_XYMovement`'s own "is this a walking frame" check, `p_mobj.c`)
+        // -- the first real cast reflecting a genuine numeric conversion,
+        // not type-erasure noise (see the generic fallback's own doc
+        // comment just below): dropping it here would be a real behavior
+        // bug, not just a style nit -- a state index *before*
+        // `S_PLAY_RUN1` yields a negative `int` difference, which C's
+        // `(unsigned)` cast reinterprets as a huge positive value
+        // (correctly excluded by the surrounding `< 4`), but a bare
+        // signed comparison would wrongly *include* it. Rust's `as u32`
+        // on an `i32` performs the identical bit-for-bit reinterpretation,
+        // so this is a direct, always-safe translation -- scoped to
+        // exactly `unsigned` (not `unsigned int`/a pointer cast), the one
+        // real corpus shape found so far. Wrapped in a *second*, fully
+        // enclosing pair of parens (not just the one grouping the inner
+        // expression before `as`): confirmed a real `rustc` parse
+        // rejection without it ("`<` is interpreted as a start of generic
+        // arguments for `u32`") once this value is compared against a
+        // literal right after -- the same `as`-then-comparison ambiguity
+        // the `lightlevel`-vs-`i32` widening arm's own doc comment already
+        // documents, just discovered here for a cast instead of a field
+        // read, and unconditional (not only when a comparison actually
+        // follows) since this is the only real corpus shape found so far.
+        Expr::Cast { type_name, expr }
+            if type_name.specifiers.type_specifiers == [TypeSpecifier::Unsigned]
+                && type_name.abstract_declarator.is_none() =>
+        {
+            let (inner_text, _) = render_expr(expr, ctx)?;
+            Ok((format!("(({inner_text}) as u32)"), false))
+        }
         // A C cast, dropped entirely rather than rendered as `as
-        // TargetType` -- every one seen so far is type-erasure noise
-        // with no real value transformation behind it (matching the
-        // `(actionf_p1)` cast around an action-function pointer, already
-        // elided the same way by `ActionFn`'s own design): `(mobj_t *)
-        // &door->sector->soundorg` reinterprets a `degenmobj_t`'s memory
-        // layout as a `mobj_t*` purely so `S_StartSound`'s C signature
-        // (`void* origin`) accepts it, not because the value is actually
-        // becoming a `Mobj`. A cast reflecting a genuine numeric
-        // conversion hasn't been seen yet; this would need revisiting if
-        // one turns up.
+        // TargetType` -- every one seen so far (besides the `unsigned`
+        // arm just above) is type-erasure noise with no real value
+        // transformation behind it (matching the `(actionf_p1)` cast
+        // around an action-function pointer, already elided the same way
+        // by `ActionFn`'s own design): `(mobj_t *) &door->sector->
+        // soundorg` reinterprets a `degenmobj_t`'s memory layout as a
+        // `mobj_t*` purely so `S_StartSound`'s C signature (`void*
+        // origin`) accepts it, not because the value is actually becoming
+        // a `Mobj`.
         Expr::Cast { expr, .. } => render_expr(expr, ctx),
         // `player->refire++;` (`A_ReFire`) -- a bare increment/decrement
         // used as its own standalone statement, not as an `if`'s own
@@ -2795,6 +2916,15 @@ fn render_binary_operand(
             || matches!(operand, Expr::Index { .. })
             || matches!(operand, Expr::Binary { op, .. } if !is_comparison_or_logical(*op))
             || (matches!(operand, Expr::Ident(_)) && is_option_valued(operand, ctx))
+            // `xmove || ymove` (`P_XYMovement`'s own `do`/`while`
+            // condition) -- a bare `fixed_t`-declared local operand,
+            // `render_bool_expr`'s own new `fixed_t_locals` arm's
+            // routing sibling: `FixedT` has no `PartialEq<i32>`, so
+            // falling through to the default `render_expr` passthrough
+            // below would render a bare, non-`bool` `FixedT` value
+            // straight into a `||`/`&&` operand position, a real `rustc`
+            // rejection (`expected bool, found FixedT`), not just style.
+            || matches!(operand, Expr::Ident(n) if ctx.fixed_t_locals.contains(n.as_str()))
             || not_of_known_int_local
             || not_of_non_comparison_binary
             || not_of_powers_index)
@@ -2850,13 +2980,47 @@ fn is_option_valued(expr: &Expr, ctx: &FnBodyContext) -> bool {
         // from `getNextSector(..)`'s own real `Option<SectorId>` return
         // (`tsec`, `EV_LightTurnOn`'s idiom) -- all tracked the same way,
         // via `ctx.extra_cross_ref_idents`.
+        // `ceilingline` (`P_XYMovement`, `p_mobj.c`'s own file-scope
+        // `line_t* ceilingline;`) joins the same set once registered
+        // there -- genuinely nullable, the same "no local variable bound
+        // in between" shape `linetarget`/`corpsehit` already established
+        // for a bare file-scope global.
         Expr::Ident(n) => matches!(
             ctx.extra_cross_ref_idents
                 .get(n.as_str())
                 .map(String::as_str),
-            Some("Option<PlayerId>") | Some("Option<Handle<Thinker>>") | Some("Option<SectorId>")
+            Some("Option<PlayerId>")
+                | Some("Option<Handle<Thinker>>")
+                | Some("Option<SectorId>")
+                | Some("Option<LineId>")
         ),
         Expr::Member { field, .. } if field == "player" => true,
+        // `ceilingline->backsector` (`P_XYMovement`, `p_mobj.c`) --
+        // `Line.backsector: Option<SectorId>` (`struct_fields.rs`'s own
+        // mapping, corpus-verified genuinely nullable), the same "any
+        // field known `Option`-typed by name" treatment `field ==
+        // "player"` just above already gets, generalized to a second real
+        // field name now that a second real corpus example needs it --
+        // unconditional on the base's own shape, since `backsector` is
+        // always `Option<SectorId>` regardless of what value it's read
+        // off (a bare global here, a `LineId` parameter/local elsewhere).
+        Expr::Member { field, .. } if field == "backsector" => true,
+        // `player->mo` (`P_XYMovement`'s own `P_SetMobjState(player->mo,
+        // S_PLAY)` target, `p_mobj.c`) -- `is_option_player_mo_field`'s
+        // own shape (a `player` *local*, `Option<PlayerId>`-typed, not
+        // `self`), needing the identical `Option<Handle<Thinker>>`
+        // truthiness/unwrap-at-point-of-use treatment the generic self-
+        // field arm above already gives `is_self_bare_handle_field`'s
+        // sibling case -- `player` here is never `self_param`
+        // (`P_XYMovement`'s own receiver is `mo`, a `Mobj`, not a
+        // `Player`), so that arm can't reach it. Confirmed a real gap
+        // (not just extra caution): without this, `as_p_set_mobj_state_
+        // call`'s own target-unwrap decision wrongly skipped `.unwrap()`,
+        // passing a still-`Option`-wrapped value straight into `Arena::
+        // take_out` (which only takes a bare `Handle<T>`), a genuine
+        // `rustc` type-mismatch caught by attempting the naive version
+        // first.
+        Expr::Member { .. } if is_option_player_mo_field(expr, ctx) => true,
         // `activeplats[i]`/`activeceilings[j]` (`P_ActivateInStasis`/
         // `EV_StopPlat`'s own scan) -- the global-array sibling of the
         // cases just below, `Option<Handle<Thinker>>`-valued the same way
@@ -3066,6 +3230,17 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // `boolean`-local truthiness check in this codebase's own corpus
         // so far only ever appeared negated).
         Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) => Ok(render_expr(cond, ctx)?.0),
+        // `while (xmove || ymove)` (`P_XYMovement`'s own `do`/`while`
+        // condition, `p_mobj.c`) -- a bare, non-negated `fixed_t`-declared
+        // *local* (`FnBodyContext::fixed_t_locals`) used for truthiness:
+        // `FixedT` has no `PartialEq<i32>` (only against itself), so the
+        // generic `Expr::Ident` `!= 0` fallback just below doesn't compile
+        // against it -- the `fixed_t_locals` sibling of `is_self_fixed_t_
+        // field`'s own bare-self-struct-field arm above, just for a local
+        // instead of a field.
+        Expr::Ident(n) if ctx.fixed_t_locals.contains(n.as_str()) => {
+            Ok(format!("{} != FixedT(0)", render_expr(cond, ctx)?.0))
+        }
         // `if (oldammo) return true;` (`P_GiveAmmo`) -- a bare, non-
         // negated plain `int` local used for truthiness at a condition's
         // own top level, the `Expr::Ident` sibling of the plain-`Member`/
@@ -5242,7 +5417,19 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
         // would double-wrap an already-genuine `FixedT` expression in
         // `FixedT(..)` a second time, the identical class of bug
         // `corpsehit->momy`'s own arm just above was built to prevent.
-        Expr::Ident(n) => n == "FRACUNIT" || ctx.fixed_t_locals.contains(n.as_str()),
+        // `MAXMOVE` (`p_local.h`'s own `#define MAXMOVE (30*FRACUNIT)`,
+        // `P_XYMovement`'s own `xmove > MAXMOVE/2` -- `xmove` a genuine
+        // `fixed_t_locals` local) -- the same "opaque macro assumed
+        // correctly `FixedT`-typed in the real generated crate"
+        // convention `FRACUNIT` already gets here, just a second name:
+        // without this, `MAXMOVE/2` looks *not* already `FixedT`-valued,
+        // so the bare-local-vs-other-side comparison-wrap arm above
+        // would double-wrap it in `FixedT(..)` a second time (`FixedT`
+        // built from a `FixedT` argument, a real `rustc` rejection),
+        // confirmed by rendering the naive pre-fix version first.
+        Expr::Ident(n) => {
+            n == "FRACUNIT" || n == "MAXMOVE" || ctx.fixed_t_locals.contains(n.as_str())
+        }
         Expr::Member { base, field, .. } => {
             // `corpsehit->momy` (`PIT_VileCheck`) -- a third real source,
             // alongside `self_param`'s own fields and a spawned `Handle<
@@ -7105,6 +7292,13 @@ fn render_fn_impl_with_two_scalar_params(
     // never previously threaded through this renderer's own self-struct-
     // shaped sibling since no earlier caller needed it.
     extra_cross_ref_idents.extend(collect_line_sector_aliases(&f.body.items));
+    // `player = mo->player;` (`P_XYMovement`, `p_mobj.c`) -- the first
+    // `render_fn`/`render_fn_impl` caller aliasing a self-struct field
+    // itself `Option<PlayerId>`-typed into a plain local, rather than
+    // `Option<Handle<Thinker>>` (`target`/`tracer`) or a cross-reference
+    // chain (`collect_line_sector_aliases`'s own shapes) -- see `collect_
+    // self_player_alias`'s own doc comment.
+    extra_cross_ref_idents.extend(collect_self_player_alias(&f.body.items, &param_name));
     // `linetarget` (`p_local.h`'s own `extern mobj_t* linetarget;`) --
     // `render_weapon_fn`'s own idiom (`A_Punch`/`A_Saw`), needed here too
     // now that a plain `mobj_t*`-self action function references it
@@ -7135,6 +7329,14 @@ fn render_fn_impl_with_two_scalar_params(
             "Option<Handle<Thinker>>".to_string(),
         );
         extra_cross_ref_idents.insert("vileobj".to_string(), "Option<Handle<Thinker>>".to_string());
+    }
+    // `ceilingline` (`p_map.c`'s own file-scope `line_t* ceilingline;`,
+    // `P_XYMovement`'s own "don't make missiles explode against the sky"
+    // check) -- the same registration `corpsehit`/`vileobj` just above
+    // get, just `Option<LineId>`-typed instead of `Option<Handle
+    // <Thinker>>`.
+    if body_has_any_ident_ref(&f.body.items, &["ceilingline"]) {
+        extra_cross_ref_idents.insert("ceilingline".to_string(), "Option<LineId>".to_string());
     }
     // `tmthing` (`p_map.c`'s own file-scope `mobj_t* tmthing;`,
     // `PIT_StompThing`'s own idiom), and its siblings `bombspot`/
@@ -8017,6 +8219,74 @@ fn collect_target_tracer_aliases_stmt(
         Stmt::For { body, .. } => {
             collect_target_tracer_aliases_stmt(body, self_param, self_field_types, aliases)
         }
+        _ => {}
+    }
+}
+
+/// `player = mo->player;` (`P_XYMovement`, `p_mobj.c`) -- a local
+/// directly assigned a self-struct field itself `Option<PlayerId>`-typed
+/// (`Mobj.player`), the `Option<PlayerId>` sibling of `collect_target_
+/// tracer_aliases`' own `Option<Handle<Thinker>>`-typed `target`/`tracer`
+/// case: the identical "local aliased straight from a self field" idiom,
+/// just for a different self field/type pair. Scoped narrowly to exactly
+/// `player` by field name (this module's usual "hand-match the one real
+/// corpus shape" discipline -- `is_option_player_mo_field`'s own `"mo"`
+/// field is the identical narrowness one field over) rather than
+/// generalized to any `Option`-typed self field, since no second real
+/// corpus example needs that yet.
+fn collect_self_player_alias(items: &[BlockItem], self_param: &str) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    collect_self_player_alias_in(items, self_param, &mut aliases);
+    aliases
+}
+
+fn collect_self_player_alias_in(
+    items: &[BlockItem],
+    self_param: &str,
+    aliases: &mut HashMap<String, String>,
+) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_self_player_alias_stmt(s, self_param, aliases);
+        }
+    }
+}
+
+fn collect_self_player_alias_stmt(
+    s: &Stmt,
+    self_param: &str,
+    aliases: &mut HashMap<String, String>,
+) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && matches!(rhs.as_ref(), Expr::Member { base, field, .. }
+            if field == "player" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param))
+    {
+        aliases.insert(name.clone(), "Option<PlayerId>".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_self_player_alias_in(&c.items, self_param, aliases),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_self_player_alias_stmt(then_branch, self_param, aliases);
+            if let Some(eb) = else_branch {
+                collect_self_player_alias_stmt(eb, self_param, aliases);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_self_player_alias_stmt(body, self_param, aliases),
+        Stmt::Case { stmt, .. } => collect_self_player_alias_stmt(stmt, self_param, aliases),
+        Stmt::Default(stmt) => collect_self_player_alias_stmt(stmt, self_param, aliases),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_self_player_alias_stmt(body, self_param, aliases)
+        }
+        Stmt::For { body, .. } => collect_self_player_alias_stmt(body, self_param, aliases),
         _ => {}
     }
 }
@@ -18160,6 +18430,222 @@ pub fn P_ZMovement(mo: &mut Mobj, world: &mut World, thinkers: &Arena<Thinker>) 
             P_ExplodeMissile(mo);
             return;
         }
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_XYMovement` (`p_mobj.c`) -- `render_fn`'s existing self-struct
+    /// tick-function shape, needing six new, narrowly-scoped pieces, each
+    /// measured against this real body before being trusted. **(1)
+    /// `player = mo->player;`** -- the first `render_fn`/`render_fn_impl`
+    /// caller aliasing a self-struct field itself `Option<PlayerId>`-typed
+    /// into a plain local (`collect_self_player_alias`, `collect_target_
+    /// tracer_aliases`' own `Option<Handle<Thinker>>`-typed sibling), so
+    /// every already-existing `Option<PlayerId>`-aware machinery
+    /// (`is_option_valued`, `is_option_player_mo_field`, the generic
+    /// `Option<PlayerId>`/`Option<SectorId>` `Member` chain-through arm)
+    /// applies to it automatically. **(2) `ceilingline`** (`p_map.c`'s own
+    /// file-scope `line_t* ceilingline;`) joins the by-name `World` global
+    /// list, `Option<LineId>`-typed -- genuinely nullable, and its own
+    /// `->backsector` (`Line.backsector: Option<SectorId>`,
+    /// `struct_fields.rs`) needs a real *two-level* nested `Option` unwrap
+    /// chain (`ceilingline->backsector->ceilingpic`) this module had no
+    /// precedent for before now (flagged as a real gap several rounds ago,
+    /// confirmed still accurate): two new `Expr::Member` arms mirror
+    /// `P_KillMobj`'s own `target->player->field` shape exactly, one field
+    /// pair over, plus a new `is_option_valued`/render text arm for a bare
+    /// `X->backsector` reference. `ceilingpic` (`i16`) compared against
+    /// `skyflatnum` (`doomstat.h`'s own file-scope `extern int
+    /// skyflatnum;`, a new by-name `i32` `World` global) needed the same
+    /// `i16`-vs-`i32` widening cast the `tag`/`lightlevel` arms already
+    /// established, just a third field pair. **(3) `player->mo`, passed as
+    /// `P_SetMobjState`'s own target** -- `is_option_valued` had no arm at
+    /// all for `is_option_player_mo_field`'s own shape (only the identical
+    /// self-struct-field case, `is_self_bare_handle_field`'s sibling, was
+    /// covered) -- confirmed a real gap, not just extra caution: without
+    /// it, `as_p_set_mobj_state_call`'s own target-unwrap decision silently
+    /// skipped `.unwrap()`, passing a still-`Option`-wrapped value straight
+    /// into `Arena::take_out` (which only takes a bare `Handle<T>`), a
+    /// genuine `rustc` type mismatch caught by rendering the naive version
+    /// first. **(4) `player->mo->state - states`** -- real C pointer
+    /// arithmetic measuring a `state_t*` value's own distance from the
+    /// table's base, exactly what `state_index` already computes
+    /// (`A_FireCGun`'s own precedent for the *reference-subtraction* half
+    /// of this same idiom) -- this is state_index's simpler, bare-
+    /// `states`-identifier sibling, needing no algebraic simplification.
+    /// **(5) `(unsigned)(...)` on the resulting difference, before `< 4`**
+    /// -- the first real cast reflecting a genuine numeric conversion, not
+    /// type-erasure noise (every earlier cast in this module's own corpus
+    /// was): dropping it (the generic `Expr::Cast` fallback's own prior
+    /// behavior) would be a real behavior bug, not a style nit -- a state
+    /// index *before* `S_PLAY_RUN1` yields a negative difference, which
+    /// C's `(unsigned)` cast reinterprets as huge and positive (correctly
+    /// excluded by `< 4`), but a bare signed comparison would wrongly
+    /// *include* it. Rendered `as u32`, wrapped in a *second*, fully
+    /// enclosing pair of parens -- confirmed a real `rustc` parse
+    /// rejection without it (`` `<` is interpreted as a start of generic
+    /// arguments for `u32` ``), the same `as`-then-comparison ambiguity
+    /// the `lightlevel`-vs-`i32` widening arm's own doc comment already
+    /// documents. **(6) `while (xmove || ymove)`** (the `do`/`while`
+    /// loop's own condition) -- a bare, non-negated `fixed_t`-declared
+    /// *local* used for truthiness: `FixedT` has no `PartialEq<i32>`, so
+    /// two new arms (`render_bool_expr`'s own `fixed_t_locals` `Expr::
+    /// Ident` case, and `render_binary_operand`'s matching routing rule)
+    /// give it `!= FixedT(0)` instead of the generic `!= 0` that would
+    /// otherwise reach it (a real `rustc` type-mismatch since `FRICTION`/
+    /// `MAXMOVE`/`STOPSPEED` are all real corpus proof this module never
+    /// tracked a plain local's `fixed_t`-ness against a bare `||`
+    /// operand position before). **A real, latent double-wrap bug
+    /// surfaced and fixed, not new to this function**: `xmove > MAXMOVE/2`
+    /// -- `MAXMOVE` (`p_local.h`'s own `#define MAXMOVE (30*FRACUNIT)`) is
+    /// the same "opaque macro assumed correctly `FixedT`-typed" category
+    /// `FRACUNIT` already gets in `expr_is_fixed_t_valued`, but wasn't
+    /// itself recognized there -- so `MAXMOVE/2` looked *not* already
+    /// `FixedT`-valued, and the bare-local-vs-other-side comparison-wrap
+    /// arm wrongly wrapped it in `FixedT(..)` a second time (`FixedT`
+    /// built from a `FixedT` argument, a real `rustc` rejection), caught
+    /// by rendering the naive pre-fix version first, not assumed; fixed
+    /// generally by adding `MAXMOVE` alongside `FRACUNIT`. Everything else
+    /// in the function -- the `do`/`while` loop shape itself (`render_do_
+    /// while`, already proven), the triple/double chained assignments
+    /// (`mo->momx = mo->momy = mo->momz = 0;`/`xmove = ymove = 0;`/`mo->
+    /// momx = mo->momy = 0;`, the existing N-ary flattening), `P_TryMove`
+    /// (already `is_bool_returning_call`-registered), the nested `actor->
+    /// subsector->sector->floorheight` chain, `player->cmd.forwardmove`/
+    /// `.sidemove` (an ordinary further field chain through the existing
+    /// generic `Option<PlayerId>` `Member` arm's own already-resolved
+    /// text), the self-targeted `P_SetMobjState(mo, mo->info->spawnstate)`
+    /// call (`mo->info->spawnstate`, an `i32` state index per `struct_
+    /// fields.rs`, not a `&'static State` -- `MobjInfo`'s own state-index
+    /// fields, unlike `Mobj.state` itself), and the self-removal-shaped
+    /// `P_RemoveMobj(mo)` call (`A_SpawnFly`'s own already-proven "remove
+    /// my own handle" shape) -- reused wholly pre-existing machinery.
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// bin`) against a hand-written `Mobj`/`MobjInfo`/`State`/`Player`/
+    /// `TicCmd`/`Sector`/`Subsector`/`Line`/`World`/`Handle`/`Arena`/
+    /// `FixedT`/`PlayerId`/`SectorId`/`SubsectorId`/`LineId`/`state_index`
+    /// stand-in and stub forward-referenced functions (`P_TryMove`/
+    /// `P_SlideMove`/`P_ExplodeMissile`/`P_RemoveMobj`/`P_AproxDistance`/
+    /// `FixedMul`/`P_SetMobjState`) -- zero errors. 487 -> 488 tests
+    /// passing.
+    #[test]
+    fn test_p_xymovement_renders_exactly() {
+        let field_types = field_types(&[
+            ("player", "Option<PlayerId>"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("flags", "i32"),
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("floorz", "FixedT"),
+            ("subsector", "SubsectorId"),
+            ("info", "&'static MobjInfo"),
+            ("state", "&'static State"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_XYMovement",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_XYMovement(mo: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {
+    let mut ptryx;
+    let mut ptryy;
+    let mut player;
+    let mut xmove;
+    let mut ymove;
+    if mo.momx == FixedT(0) && mo.momy == FixedT(0) {
+        if (mo.flags & MF_SKULLFLY) != 0 {
+            mo.flags &= !MF_SKULLFLY;
+            mo.momz = FixedT(0);
+            mo.momy = mo.momz;
+            mo.momx = mo.momy;
+            P_SetMobjState(mo, mo.info.spawnstate, world, handle, thinkers);
+        }
+        return;
+    }
+    player = mo.player;
+    if mo.momx > MAXMOVE {
+        mo.momx = MAXMOVE;
+    } else {
+        if mo.momx < -MAXMOVE {
+            mo.momx = -MAXMOVE;
+        }
+    }
+    if mo.momy > MAXMOVE {
+        mo.momy = MAXMOVE;
+    } else {
+        if mo.momy < -MAXMOVE {
+            mo.momy = -MAXMOVE;
+        }
+    }
+    xmove = mo.momx;
+    ymove = mo.momy;
+    loop {
+        if xmove > MAXMOVE / 2 || ymove > MAXMOVE / 2 {
+            ptryx = mo.x + xmove / 2;
+            ptryy = mo.y + ymove / 2;
+            xmove >>= 1;
+            ymove >>= 1;
+        } else {
+            ptryx = mo.x + xmove;
+            ptryy = mo.y + ymove;
+            ymove = FixedT(0);
+            xmove = ymove;
+        }
+        if !P_TryMove(mo, ptryx, ptryy) {
+            if mo.player.is_some() {
+                P_SlideMove(mo);
+            } else {
+                if (mo.flags & MF_MISSILE) != 0 {
+                    if world.ceilingline.is_some() && world[world.ceilingline.unwrap()].backsector.is_some() && world[world[world.ceilingline.unwrap()].backsector.unwrap()].ceilingpic as i32 == world.skyflatnum {
+                        thinkers.remove(handle);
+                        return;
+                    }
+                    P_ExplodeMissile(mo);
+                } else {
+                    mo.momy = FixedT(0);
+                    mo.momx = mo.momy;
+                }
+            }
+        }
+        if !(xmove != FixedT(0) || ymove != FixedT(0)) {
+            break;
+        }
+    }
+    if player.is_some() && (world[player.unwrap()].cheats & CF_NOMOMENTUM) != 0 {
+        mo.momy = FixedT(0);
+        mo.momx = mo.momy;
+        return;
+    }
+    if (mo.flags & (MF_MISSILE | MF_SKULLFLY)) != 0 {
+        return;
+    }
+    if mo.z > mo.floorz {
+        return;
+    }
+    if (mo.flags & MF_CORPSE) != 0 {
+        if mo.momx > FRACUNIT / 4 || mo.momx < -FRACUNIT / 4 || mo.momy > FRACUNIT / 4 || mo.momy < -FRACUNIT / 4 {
+            if mo.floorz != world[world[mo.subsector].sector].floorheight {
+                return;
+            }
+        }
+    }
+    if mo.momx > -STOPSPEED && mo.momx < STOPSPEED && mo.momy > -STOPSPEED && mo.momy < STOPSPEED && (player.is_none() || world[player.unwrap()].cmd.forwardmove == 0 && world[player.unwrap()].cmd.sidemove == 0) {
+        if player.is_some() && ((state_index(match thinkers.get(world[player.unwrap()].mo.unwrap()) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) - S_PLAY_RUN1) as u32) < 4 {
+            thinkers.take_out(world[player.unwrap()].mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY, world, h, a); } });
+        }
+        mo.momx = FixedT(0);
+        mo.momy = FixedT(0);
+    } else {
+        mo.momx = FixedMul(mo.momx, FRICTION);
+        mo.momy = FixedMul(mo.momy, FRICTION);
     }
 }";
         assert_eq!(rendered, expected);
