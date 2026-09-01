@@ -5404,6 +5404,40 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && (field == "target" || field == "tracer"));
         let rhs_is_handle_local = matches!(rhs.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"));
+        // `player->message = GOTARMOR;` (`EV_DoLockedDoor`/`EV_VerticalDoor`,
+        // `p_doors.c`; also `P_TouchSpecialThing`, `p_inter.c`, round 16) --
+        // `Player.message`'s own real C declaration is a nullable `char*`
+        // (`d_player.h`), corpus-verified against every real assignment
+        // site (not just this file's own six): every `#define`d gettable-
+        // item/locked-door string macro (`d_englsh.h`, e.g. `GOTARMOR`),
+        // plus `NULL`/`0` (`p_mobj.c`'s own constructor, `hu_stuff.c`'s
+        // own "message shown, clear it" idiom) and a `static char
+        // buffer[]`/`buf[]` local's own address (`am_map.c`/`st_stuff.c`'s
+        // cheat/mark-spot messages -- `'static` lifetime either way, so
+        // still representable, just not yet a real corpus function this
+        // project translates). `hu_stuff.c` also reads it back
+        // (`if (plr->message && ..) { ..; plr->message = 0; }`), ruling
+        // out a plain non-`Option` `&'static str` the way this field's
+        // *own* two already-shipped call sites wrongly assumed (no
+        // `Some(..)` wrap at all -- a real latent gap in their own
+        // "verified compiling" claim, caught only by this round's fuller
+        // corpus sweep, not a new regression). Decided: `Option<&'static
+        // str>`. The RHS itself needs no new macro-substitution machinery
+        // at all -- every real assignment site's RHS is a bare `#define`d
+        // identifier, already rendered as opaque pass-through text by the
+        // pre-existing `Expr::Ident` fallback (the same `FRACUNIT`/
+        // `MISSILERANGE`/`GRAVITY` precedent, "assumed correctly typed
+        // wherever the real generated crate eventually defines them" --
+        // now just a `&'static str` const instead of a numeric one). Only
+        // the `Some(..)` wrap itself was missing. Scoped to the one real
+        // corpus base shape (a bare local/parameter registered
+        // `Option<PlayerId>`, `p`/`player`'s own idiom) rather than also
+        // `self.player.message` (no real corpus call reaches that shape
+        // yet -- not forced ahead of one, matching this project's own
+        // "no body to check it against" discipline).
+        let lhs_is_option_player_message_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if field == "message"
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<PlayerId>")));
         // `activeplats[i] = plat;` (`P_AddActivePlat`) -- storing a bare
         // `Handle<Thinker>`-typed parameter straight into a slot of the
         // `Option<Handle<Thinker>>`-typed global array, the same `Some(..)`
@@ -5468,6 +5502,18 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             // wrap every other bare-handle-into-`Option`-slot write in
             // this function already gets, just for this one more LHS/RHS
             // pairing.
+            format!("Some({rhs_text})")
+        } else if lhs_is_option_player_message_field
+            && *op == AssignOp::Assign
+            && rhs_text != "None"
+        {
+            // `player->message = GOTARMOR;` -- see `lhs_is_option_player_
+            // message_field`'s own doc comment just above for the full
+            // corpus-verification. `rhs_text != "None"` guards the one
+            // other real corpus RHS shape (`player->message = NULL;`,
+            // `Expr::Ident("NULL")` already renders bare `None` via the
+            // pre-existing project-wide "`NULL` is always `None`" rule) --
+            // wrapping that a second time would be `Some(None)`, wrong.
             format!("Some({rhs_text})")
         } else if lhs_is_plain_int_local && rhs_is_u32_self_field
             || lhs_is_plain_i32_ident && *op == AssignOp::Assign && rhs_is_lightlevel_field
@@ -11335,6 +11381,17 @@ pub fn EV_DoPlat(line: LineId, r#type: i32, amount: i32, world: &mut World, thin
     /// mismatch. Fixed by adding the cast here (and in `EV_VerticalDoor`
     /// below) to match the corrected, more broadly-applicable rendering,
     /// not by narrowing the new code to dodge it.
+    ///
+    /// **A second real, latent gap in this same expected string, found and
+    /// fixed in round 16 while corpus-verifying `Player.message`'s own
+    /// type for `P_TouchSpecialThing`**: `player->message = PD_BLUEO;`
+    /// rendered here as a bare (non-`Option`) `world[p.unwrap()].message =
+    /// PD_BLUEO;` -- correct only against a stand-in `Player.message: &
+    /// 'static str`, not the real, corpus-verified `Option<&'static str>`
+    /// (nullable: read back and cleared in `hu_stuff.c`, assigned `NULL`
+    /// in `p_mobj.c`). Fixed to `Some(PD_BLUEO)` -- see `lhs_is_option_
+    /// player_message_field`'s own doc comment (`render_expr_stmt`) for
+    /// the full corpus sweep.
     #[test]
     fn test_ev_do_locked_door_renders_exactly() {
         let params: HashMap<String, String> = [
@@ -11370,7 +11427,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
                 return 0;
             }
             if !world[p.unwrap()].cards[it_bluecard as usize] && !world[p.unwrap()].cards[it_blueskull as usize] {
-                world[p.unwrap()].message = PD_BLUEO;
+                world[p.unwrap()].message = Some(PD_BLUEO);
                 S_StartSound(None, sfx_oof);
                 return 0;
             }
@@ -11380,7 +11437,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
                 return 0;
             }
             if !world[p.unwrap()].cards[it_redcard as usize] && !world[p.unwrap()].cards[it_redskull as usize] {
-                world[p.unwrap()].message = PD_REDO;
+                world[p.unwrap()].message = Some(PD_REDO);
                 S_StartSound(None, sfx_oof);
                 return 0;
             }
@@ -11390,7 +11447,7 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
                 return 0;
             }
             if !world[p.unwrap()].cards[it_yellowcard as usize] && !world[p.unwrap()].cards[it_yellowskull as usize] {
-                world[p.unwrap()].message = PD_YELLOWO;
+                world[p.unwrap()].message = Some(PD_YELLOWO);
                 S_StartSound(None, sfx_oof);
                 return 0;
             }
@@ -11448,6 +11505,10 @@ pub fn EV_DoLockedDoor(line: LineId, r#type: i32, thing: Handle<Thinker>, world:
     /// the complete function with `rustc` directly (hand-written `World`/
     /// `Sector`/`Side`/`Line`/`Player`/`Mobj`/`VerticalDoor`/`Thinker`/
     /// `Arena`/`Handle` stand-ins), zero errors.
+    ///
+    /// **Same round-16 `Player.message` fix as `EV_DoLockedDoor` above**:
+    /// its three `player->message = PD_*K;` lines are now `Some(..)`-
+    /// wrapped too, for the identical reason.
     #[test]
     fn test_ev_vertical_door_renders_exactly() {
         let params: HashMap<String, String> = [
@@ -11493,7 +11554,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
                 return;
             }
             if !world[player.unwrap()].cards[it_bluecard as usize] && !world[player.unwrap()].cards[it_blueskull as usize] {
-                world[player.unwrap()].message = PD_BLUEK;
+                world[player.unwrap()].message = Some(PD_BLUEK);
                 S_StartSound(None, sfx_oof);
                 return;
             }
@@ -11503,7 +11564,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
                 return;
             }
             if !world[player.unwrap()].cards[it_yellowcard as usize] && !world[player.unwrap()].cards[it_yellowskull as usize] {
-                world[player.unwrap()].message = PD_YELLOWK;
+                world[player.unwrap()].message = Some(PD_YELLOWK);
                 S_StartSound(None, sfx_oof);
                 return;
             }
@@ -11513,7 +11574,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
                 return;
             }
             if !world[player.unwrap()].cards[it_redcard as usize] && !world[player.unwrap()].cards[it_redskull as usize] {
-                world[player.unwrap()].message = PD_REDK;
+                world[player.unwrap()].message = Some(PD_REDK);
                 S_StartSound(None, sfx_oof);
                 return;
             }
