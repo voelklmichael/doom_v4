@@ -680,18 +680,32 @@ fn target_tracer_key<'e>(e: &'e Expr, self_param: &str) -> Option<&'e str> {
 }
 
 /// Whether `e` is `{self_param}.field` where `field`'s registered type is
-/// exactly `"Handle<Thinker>"` -- bare, never `Option`-wrapped, unlike
-/// `is_target_tracer_typed`'s `target`/`tracer` case. `player->mo`
+/// exactly `"Option<Handle<Thinker>>"` -- `player->mo`/`player->attacker`
 /// (`render_weapon_fn`'s own `player_field_types` map, since `player_t`
-/// isn't struct-mapped) is the corpus-checked real example: no call site
-/// anywhere null-checks `player->mo` before dereferencing it (the same
-/// "no real call site ever null-checks this" reasoning already
-/// established for a `P_SpawnMobj` result), so the field is registered
-/// bare rather than `Option`-wrapped, and its own chain-through render
-/// arm needs no `.unwrap()` the way `is_target_tracer_typed`'s sibling
-/// arm does -- kept as a genuinely separate predicate/arm pair rather
-/// than folded into that one, since the two shapes render differently at
-/// their point of use.
+/// isn't struct-mapped) are the corpus-checked real examples. **Round 22
+/// correction**: this predicate was originally built (round 20-ish, kept
+/// through round 21) checking for a *bare*, non-`Option` `"Handle<Thinker>"`
+/// registration, on the claimed reasoning "no real call site ever
+/// null-checks `player->mo` before dereferencing it". Round 21's own direct
+/// corpus grep found that reasoning false: `p_setup.c`/`p_saveg.c` both
+/// assign `players[i].mo = NULL;` (level setup/savegame load, before
+/// `P_SpawnPlayer` ever runs), and `st_stuff.c`'s god-mode cheat handler
+/// explicitly guards `if (plyr->mo) plyr->mo->health = 100;` -- so the real
+/// declared type genuinely is `Option<Handle<Thinker>>`, the same as
+/// `is_target_tracer_typed`'s own `target`/`tracer` case, not a separate
+/// bare shape. Every real corpus call site already reached through this
+/// predicate (`A_FireShotgun2`/`A_Punch`/etc.) never itself null-checks
+/// `player->mo` -- it's always live *within that function's own body* --
+/// so the fix is a plain `.unwrap()` at each dereference point, not a
+/// restructured control flow, mirroring `is_target_tracer_typed`'s own
+/// `.unwrap()`-at-point-of-use convention exactly. Kept as a genuinely
+/// separate predicate from `is_target_tracer_typed` (not folded into it):
+/// that one is keyed to the fixed `target`/`tracer` self-field names on a
+/// `Mobj`-shaped receiver, while this one is keyed to *any* field
+/// registered `Option<Handle<Thinker>>` in a `Player`-shaped receiver's own
+/// `self_field_types` map -- different receiver shape, different type
+/// registry, even though both now render identically (`.unwrap()` at each
+/// point of use) once a value is known live.
 fn is_self_bare_handle_field(
     e: &Expr,
     self_param: &str,
@@ -699,7 +713,23 @@ fn is_self_bare_handle_field(
 ) -> bool {
     matches!(e, Expr::Member { base, field, .. }
         if matches!(base.as_ref(), Expr::Ident(n) if n == self_param)
-            && self_field_types.get(field.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+            // `target`/`tracer` are deliberately excluded here even though
+            // they're now registered with the identical `"Option<Handle<
+            // Thinker>>"` type text (round 22's own correction) -- they're
+            // `is_target_tracer_typed`'s own exclusive territory (a `Mobj`-
+            // shaped receiver's two self-referential fields, with their own
+            // dedicated same-target-write/chain-through machinery). Without
+            // this exclusion, `actor->target->field` would wrongly satisfy
+            // *this* predicate too once the type strings collide, stealing
+            // the match away from `is_target_tracer_typed`'s own write arm
+            // (confirmed a real regression, not a hypothetical: caught by
+            // the full suite -- `test_a_vile_attack_renders_exactly` started
+            // wrongly hoisting `actor->target->info->mass` through this
+            // arm's own `same_handle_write`-less fallback instead of the
+            // correct `is_target_tracer_typed` same-target-write shortcut).
+            && field != "target"
+            && field != "tracer"
+            && self_field_types.get(field.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>"))
 }
 
 /// `player->mo` where `player` is a *local*/parameter registered
@@ -707,13 +737,17 @@ fn is_self_bare_handle_field(
 /// `is_self_bare_handle_field`'s own sibling for `render_trigger_fn`'s
 /// shape, needed by `P_TouchSpecialThing`'s own `player->mo->health =
 /// player->health;` (`player = toucher->player;`, `p_inter.c`).
-/// `Player.mo`'s own real declared type is a bare (non-`Option`)
-/// `Handle<Thinker>` (the same "no real call site ever null-checks this"
-/// reasoning `is_self_bare_handle_field`'s own doc comment already
-/// established), so this chain-through arm needs no further `.unwrap()`
-/// beyond the one `player`'s own `Option<PlayerId>` base already gets
-/// (`world[player.unwrap()].mo`, via the pre-existing generic
-/// `Option<PlayerId>`/`Option<SectorId>` `Member` read arm).
+/// **Round 22 correction** (see `is_self_bare_handle_field`'s own doc
+/// comment for the full corpus evidence): `Player.mo`'s own real declared
+/// type is `Option<Handle<Thinker>>`, not bare -- so this chain-through arm
+/// needs its own `.unwrap()` too, on top of the one `player`'s own
+/// `Option<PlayerId>` base already gets (`world[player.unwrap()].mo.
+/// unwrap()`, via the pre-existing generic `Option<PlayerId>`/
+/// `Option<SectorId>` `Member` read arm for the base, then this arm's own
+/// unwrap for the `mo` field itself). `P_TouchSpecialThing`'s own real body
+/// never null-checks `player->mo` either (`player` itself is already
+/// guarded live by the time this is reached), so no control-flow change,
+/// same as `is_self_bare_handle_field`'s sibling fix.
 fn is_option_player_mo_field(e: &Expr, ctx: &FnBodyContext) -> bool {
     matches!(e, Expr::Member { base, field, .. }
         if field == "mo"
@@ -1327,7 +1361,7 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // the bare-self-handle-field mirror of `same_handle_write`'s own
         // arm above (`mo->info` inside a spawned-mobj write): reuses the
         // write's own already-bound `m` instead of a second, independent
-        // `thinkers.get(player.mo)` call, which would be a genuine second
+        // `thinkers.get(player.mo.unwrap())` call, which would be a genuine second
         // borrow of `thinkers` while the write's own `thinkers.
         // get_mut(player.mo)` is still live for the whole block. Keyed
         // the same way (`ctx.same_handle_write`), just holding the self-
@@ -1345,22 +1379,27 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         }
         // `player->mo->field` -- dereferencing *through* `player`'s own
         // `mo` field (`is_self_bare_handle_field`, its own doc comment
-        // explains the bare-vs-`Option` distinction from the arm just
-        // above). `A_FireShotgun2`'s own `angle = player->mo->angle;` is
-        // the real corpus example this was built against -- reading
-        // `player->mo` opaquely (`S_StartSound(player->mo, ..)`, already
-        // correct via the generic `Member` fallback below, since a
-        // registered-but-not-cross-ref-typed field renders as plain
-        // `.mo` access there) is a different, already-working case from
-        // dereferencing *through* it to reach a further field, which this
-        // arm alone handles.
+        // explains the corpus evidence for its real `Option<Handle<
+        // Thinker>>` type, round 22's own correction). `A_FireShotgun2`'s
+        // own `angle = player->mo->angle;` is the real corpus example this
+        // was built against -- reading `player->mo` opaquely (`S_StartSound
+        // (player->mo, ..)`, already correct via the generic `Member`
+        // fallback below, since a registered-but-not-cross-ref-typed field
+        // renders as plain `.mo` access there, matching `target`/`tracer`'s
+        // own opaque-pass-through convention) is a different, already-
+        // working case from dereferencing *through* it to reach a further
+        // field, which needs the base's own `.unwrap()` -- every real
+        // corpus call site reached through this arm is genuinely always
+        // live by the time it dereferences `mo`, the same "no restructured
+        // control flow, just `.unwrap()` at point of use" precedent `target`/
+        // `tracer` already established.
         Expr::Member { base, field, .. }
             if is_self_bare_handle_field(base, ctx.self_param, ctx.self_field_types) =>
         {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((
                 format!(
-                    "match thinkers.get({base_text}) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
+                    "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
                     rust_field_name(field)?
                 ),
                 false,
@@ -1370,12 +1409,13 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // arm, the `render_trigger_fn`-shaped (`player` a local, not
         // `self`) sibling of the arm just above. `P_TouchSpecialThing`'s
         // own `player->mo->health = player->health;` (`p_inter.c`) is the
-        // real corpus example.
+        // real corpus example. Same round 22 `.unwrap()` correction as the
+        // arm above.
         Expr::Member { base, field, .. } if is_option_player_mo_field(base, ctx) => {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((
                 format!(
-                    "match thinkers.get({base_text}) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
+                    "match thinkers.get({base_text}.unwrap()) {{ Some(Thinker::Mobj(m)) => m.{}, _ => unreachable!() }}",
                     rust_field_name(field)?
                 ),
                 false,
@@ -5418,8 +5458,8 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         }
         // `player->mo->angle = R_PointToAngle2(..);` / `player->mo->flags
         // |= MF_JUSTATTACKED;` (`A_Punch`/`A_Saw`) -- writing *through*
-        // `player`'s own bare `Handle<Thinker>` field (`is_self_bare_
-        // handle_field`, the write counterpart of that same read-side
+        // `player`'s own `Option<Handle<Thinker>>`-typed `mo` field
+        // (`is_self_bare_handle_field`, the write counterpart of that same read-side
         // special case, `A_FireShotgun2`'s own `player->mo->angle` read)
         // -- the same fresh-`get_mut`-at-this-point treatment as every
         // other write-through-a-handle arm in this function, for the
@@ -5451,7 +5491,7 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         // which is sound there since nothing is mutably borrowed yet;
         // only the non-hoisted path (no "other" read at all) uses
         // `rhs_ctx`'s `m.field` shortcut, where it's both safe and
-        // necessary (a fresh `thinkers.get(player.mo)` there *would*
+        // necessary (a fresh `thinkers.get(player.mo.unwrap())` there *would*
         // conflict with the write's own live `get_mut`).
         if let Expr::Member {
             base,
@@ -5477,7 +5517,7 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             ) {
                 let rhs_text = render_expr(rhs, ctx)?.0;
                 return Ok(format!(
-                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} __rhs; }}",
+                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} __rhs; }}",
                     render_assign_op(*op)
                 ));
             }
@@ -5487,7 +5527,7 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             };
             let rhs_text = render_expr(rhs, &rhs_ctx)?.0;
             return Ok(format!(
-                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} {rhs_text}; }}",
+                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} {rhs_text}; }}",
                 render_assign_op(*op)
             ));
         }
@@ -5521,13 +5561,13 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             ) {
                 let rhs_text = render_expr(rhs, ctx)?.0;
                 return Ok(format!(
-                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} __rhs; }}",
+                    "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} __rhs; }}",
                     render_assign_op(*op)
                 ));
             }
             let rhs_text = render_expr(rhs, ctx)?.0;
             return Ok(format!(
-                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}) {{ m.{field} {} {rhs_text}; }}",
+                "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} {rhs_text}; }}",
                 render_assign_op(*op)
             ));
         }
@@ -7493,7 +7533,7 @@ fn stmt_has_target_write(
 }
 
 /// Whether `s` (anywhere in its subtree) writes a field *through*
-/// `player`'s own bare `Handle<Thinker>` field (`player->mo->angle =
+/// `player`'s own `Option<Handle<Thinker>>`-typed `mo` field (`player->mo->angle =
 /// ..;`/`player->mo->flags |= ..;`, `A_Punch`/`A_Saw`'s own idiom) --
 /// the bare-self-handle-field mirror of `stmt_has_target_write` just
 /// above, same shallow statement-level shape (no nested-assignment
@@ -8471,14 +8511,18 @@ fn stmt_has_target_deref(
     }
 }
 
-/// Whether `e` (anywhere in its subtree) dereferences *through* a bare
-/// `Handle<Thinker>`-typed self-struct field (`is_self_bare_handle_field`
-/// -- `player->mo->field` under `render_weapon_fn`) -- the mirror of
-/// `expr_has_target_deref`, just for the bare-field shape instead of the
-/// `Option`-wrapped `target`/`tracer` one, and deliberately without an
-/// `aliases` parameter: no real corpus function has aliased `player->mo`
-/// into a plain local the way `A_SkullAttack` aliases `actor->target`, so
-/// that generalization isn't built ahead of a real need. Drives
+/// Whether `e` (anywhere in its subtree) dereferences *through* a
+/// `Player`-shaped `Option<Handle<Thinker>>`-typed self-struct field
+/// (`is_self_bare_handle_field` -- `player->mo->field` under `render_
+/// weapon_fn`) -- the mirror of `expr_has_target_deref`, just for a
+/// `Player`-shaped receiver's own field registry instead of `Mobj`'s fixed
+/// `target`/`tracer` names (both shapes are `Option<Handle<Thinker>>`-typed
+/// since round 22's own correction; the name `is_self_bare_handle_field`
+/// itself predates that fix and is kept for historical continuity, not
+/// because the field is still bare), and deliberately without an `aliases`
+/// parameter: no real corpus function has aliased `player->mo` into a plain
+/// local the way `A_SkullAttack` aliases `actor->target`, so that
+/// generalization isn't built ahead of a real need. Drives
 /// `render_weapon_fn`'s own signature extension, the same "measure, don't
 /// add speculatively" discipline as every other such scan in this module.
 fn expr_has_self_handle_field_deref(
@@ -13956,12 +14000,25 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
 
     #[test]
     fn test_a_gun_flash_renders_exactly() {
-        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_GunFlash", &HashMap::new())
+        // `mo` registered `Option<Handle<Thinker>>` (round 22's own retrofit,
+        // see `is_self_bare_handle_field`'s doc comment) -- this test used to
+        // pass `&HashMap::new()` since, before round 22, an unregistered
+        // `mo` and a bare-`Handle<Thinker>`-registered one rendered
+        // identically here (`is_option_valued`'s target-type check for
+        // `thinkers.take_out(..)`'s own argument only ever fired for an
+        // explicit `Option<Handle<Thinker>>` registration, which `mo` never
+        // had either way) -- a real latent gap surfaced only once `mo`
+        // genuinely became `Option`-typed: an unregistered `mo` would keep
+        // rendering bare here, which no longer compiles against the real
+        // `Player` struct's own `Option<Handle<Thinker>>` field. Registering
+        // it is the fix, not a new mechanism.
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_GunFlash", &field_types)
             .expect("should render cleanly");
         assert_eq!(
             rendered,
             "pub fn A_GunFlash(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
-             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
+             thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n\
              }"
         );
@@ -14025,14 +14082,20 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// established, since `player_t` isn't struct-mapped yet.
     #[test]
     fn test_a_fire_pistol_renders_exactly() {
-        let field_types = field_types(&[("refire", "i32")]);
+        // `mo` registered `Option<Handle<Thinker>>` -- round 22's own
+        // retrofit, same real latent-gap fix as `test_a_gun_flash_renders_
+        // exactly`'s own doc comment explains (an unregistered `mo` used to
+        // render identically to a registered-but-bare one at this exact
+        // `thinkers.take_out(..)` call site, until `mo`'s real type actually
+        // became `Option`-wrapped).
+        let field_types = field_types(&[("refire", "i32"), ("mo", "Option<Handle<Thinker>>")]);
         let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FirePistol", &field_types)
             .expect("should render cleanly");
         assert_eq!(
             rendered,
             "pub fn A_FirePistol(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              S_StartSound(player.mo, sfx_pistol);\n    \
-             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
+             thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
              P_BulletSlope(player.mo);\n    \
@@ -14134,15 +14197,18 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// already-ordinary bare-`int` case.
     #[test]
     fn test_a_fire_shotgun_renders_exactly() {
-        let rendered =
-            render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireShotgun", &HashMap::new())
-                .expect("should render cleanly");
+        // `mo` registered `Option<Handle<Thinker>>` -- round 22's own
+        // retrofit, same real latent-gap fix as `test_a_gun_flash_renders_
+        // exactly`'s own doc comment explains.
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>")]);
+        let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireShotgun", &field_types)
+            .expect("should render cleanly");
         assert_eq!(
             rendered,
             "pub fn A_FireShotgun(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              let mut i;\n    \
              S_StartSound(player.mo, sfx_shotgn);\n    \
-             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
+             thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
              P_BulletSlope(player.mo);\n    \
@@ -14162,11 +14228,12 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// `angle = player->mo->angle;` needs a real `Arena` lookup *through*
     /// `player`'s own `mo` field, the mirror of `thing->player`'s inverse
     /// direction -- `is_self_bare_handle_field`/its own `render_expr` arm,
-    /// registered here via `field_types(&[("mo", "Handle<Thinker>")])`
-    /// (bare, not `Option`-wrapped: no real corpus call site anywhere
-    /// null-checks `player->mo`, the same "no real call site ever
-    /// null-checks this" reasoning already established for a
-    /// `P_SpawnMobj` result). Reading/passing `player->mo` opaquely
+    /// registered here via `field_types(&[("mo", "Option<Handle<Thinker>>")])`
+    /// (round 22's own correction -- `Player.mo` really is nullable per the
+    /// corpus, see `is_self_bare_handle_field`'s own doc comment; every
+    /// dereference within this function is still genuinely always live, so
+    /// it needs only a plain `.unwrap()` at each point of use, not a
+    /// restructured control flow). Reading/passing `player->mo` opaquely
     /// (`S_StartSound`, `P_SetMobjState`, `P_BulletSlope`, `P_LineAttack`'s
     /// own first argument) already rendered correctly before this, via
     /// the pre-existing generic `Member` fallback -- only the *further*
@@ -14211,7 +14278,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
     /// from `A_Tracer`'s own earlier work.
     #[test]
     fn test_a_fire_shotgun2_renders_exactly() {
-        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>")]);
         let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireShotgun2", &field_types)
             .expect("should render cleanly");
         assert_eq!(
@@ -14221,14 +14288,14 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              let mut angle;\n    \
              let mut damage;\n    \
              S_StartSound(player.mo, sfx_dshtgn);\n    \
-             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
+             thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 2;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
              P_BulletSlope(player.mo);\n    \
              i = 0;\n    \
              while i < 20 {\n        \
              damage = 5 * (P_Random() % 3 + 1);\n        \
-             angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n        \
+             angle = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n        \
              angle += (P_Random() - P_Random() << 19) as u32;\n        \
              P_LineAttack(player.mo, angle, MISSILERANGE, world.bulletslope + (P_Random() - P_Random() << 5), damage);\n        \
              i += 1;\n    \
@@ -14905,8 +14972,8 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
     /// `A_Punch` (`p_pspr.c`) -- the first real corpus body needing the
     /// global `linetarget` (`p_local.h`'s own `extern mobj_t*
     /// linetarget;`, the last thing `P_AimLineAttack` hit), and the first
-    /// writing *through* `player`'s own bare `Handle<Thinker>` field
-    /// (`player->mo->angle = ..;`). Three new pieces, each covered by its
+    /// writing *through* `player`'s own `Option<Handle<Thinker>>`-typed `mo`
+    /// field (`player->mo->angle = ..;`). Three new pieces, each covered by its
     /// own doc comment at the call site: `World::linetarget` (a plain
     /// `Option<Handle<Thinker>>` field, the same type `Mobj.target`/
     /// `.tracer` already use); `render_weapon_fn`'s own `world: &mut
@@ -14945,7 +15012,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
     /// deferred-`let` inference already gets it right) -- zero errors.
     #[test]
     fn test_a_punch_renders_exactly() {
-        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>")]);
         let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Punch", &field_types)
             .expect("should render cleanly");
         assert_eq!(
@@ -14958,13 +15025,13 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if player.powers[pw_strength as usize] != 0 {\n        \
              damage *= 10;\n    \
              }\n    \
-             angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n    \
+             angle = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n    \
              angle += (P_Random() - P_Random() << 18) as u32;\n    \
              slope = P_AimLineAttack(player.mo, angle, MELEERANGE);\n    \
              P_LineAttack(player.mo, angle, MELEERANGE, slope, damage);\n    \
              if world.linetarget.is_some() {\n        \
              S_StartSound(player.mo, sfx_punch);\n        \
-             let __rhs = R_PointToAngle2(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }); if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle = __rhs; };\n    \
+             let __rhs = R_PointToAngle2(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }); if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle = __rhs; };\n    \
              }\n\
              }"
         );
@@ -15090,7 +15157,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
     /// zero special-casing at the comparison level.
     #[test]
     fn test_a_saw_renders_exactly() {
-        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>")]);
         let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_Saw", &field_types)
             .expect("should render cleanly");
         assert_eq!(
@@ -15100,7 +15167,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              let mut damage;\n    \
              let mut slope;\n    \
              damage = 2 * (P_Random() % 10 + 1);\n    \
-             angle = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n    \
+             angle = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };\n    \
              angle += (P_Random() - P_Random() << 18) as u32;\n    \
              slope = P_AimLineAttack(player.mo, angle, MELEERANGE + 1);\n    \
              P_LineAttack(player.mo, angle, MELEERANGE + 1, slope, damage);\n    \
@@ -15109,21 +15176,21 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              return;\n    \
              }\n    \
              S_StartSound(player.mo, sfx_sawhit);\n    \
-             angle = R_PointToAngle2(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
-             if angle - match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } > ANG180 {\n        \
-             if angle - match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } < (-(ANG90 as i32) / 20) as u32 {\n            \
-             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle = angle + ANG90 / 21; };\n        \
+             angle = R_PointToAngle2(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(world.linetarget.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
+             if angle - match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } > ANG180 {\n        \
+             if angle - match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } < (-(ANG90 as i32) / 20) as u32 {\n            \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle = angle + ANG90 / 21; };\n        \
              } else {\n            \
-             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle -= ANG90 / 20; };\n        \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle -= ANG90 / 20; };\n        \
              }\n    \
              } else {\n        \
-             if angle - match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } > ANG90 / 20 {\n            \
-             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle = angle - ANG90 / 21; };\n        \
+             if angle - match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } > ANG90 / 20 {\n            \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle = angle - ANG90 / 21; };\n        \
              } else {\n            \
-             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.angle += ANG90 / 20; };\n        \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle += ANG90 / 20; };\n        \
              }\n    \
              }\n    \
-             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.flags |= MF_JUSTATTACKED; };\n\
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.flags |= MF_JUSTATTACKED; };\n\
              }"
         );
     }
@@ -15157,7 +15224,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
     /// forward-referenced functions -- zero errors.
     #[test]
     fn test_a_fire_cgun_renders_exactly() {
-        let field_types = field_types(&[("mo", "Handle<Thinker>"), ("refire", "i32")]);
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>"), ("refire", "i32")]);
         let rendered = render_weapon_fn(&corpus_dir(), "p_pspr.c", "A_FireCGun", &field_types)
             .expect("should render cleanly");
         assert_eq!(
@@ -15167,7 +15234,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] == 0 {\n        \
              return;\n    \
              }\n    \
-             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
+             thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
              P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + state_index(psp.state) - S_CHAIN1);\n    \
              P_BulletSlope(player.mo);\n    \
@@ -15745,7 +15812,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
     #[test]
     fn test_a_weapon_ready_renders_exactly() {
         let field_types = field_types(&[
-            ("mo", "Handle<Thinker>"),
+            ("mo", "Option<Handle<Thinker>>"),
             ("health", "i32"),
             ("attackdown", "i32"),
         ]);
@@ -15756,8 +15823,8 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             "pub fn A_WeaponReady(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              let mut newstate;\n    \
              let mut angle;\n    \
-             if state_index(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK1 || state_index(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK2 {\n        \
-             thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY, world, h, a); } });\n    \
+             if state_index(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK1 || state_index(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY_ATK2 {\n        \
+             thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY, world, h, a); } });\n    \
              }\n    \
              if player.readyweapon == wp_chainsaw && state_index(psp.state) == S_SAW {\n        \
              S_StartSound(player.mo, sfx_sawidl);\n    \
@@ -18383,8 +18450,8 @@ pub fn EV_CeilingCrushStop(line: &Line, world: &mut World, thinkers: &mut Arena<
     /// neither `render_bool_fn` nor `render_fn_with_scalar_param` alone
     /// covering the combination. **The real new capability**:
     /// `player->mo->health = player->health;` writes *through* `player`'s
-    /// own bare (non-`Option`) `Handle<Thinker>` field (`mo`,
-    /// `is_self_bare_handle_field`'s own shape) -- every earlier `render_
+    /// own `mo` field (`Option<Handle<Thinker>>`-typed per round 22's own
+    /// correction, `is_self_bare_handle_field`'s own shape) -- every earlier `render_
     /// fn`/`render_bool_fn` caller has been `Mobj`-shaped, whose own bare-
     /// handle fields (`target`/`tracer`) are `Option`-wrapped and already
     /// covered by `needs_target_deref`/`needs_target_write`, so `render_
@@ -18404,7 +18471,7 @@ pub fn EV_CeilingCrushStop(line: &Line, world: &mut World, thinkers: &mut Arena<
     /// -- zero errors. `test_p_give_body_renders_exactly`.
     #[test]
     fn test_p_give_body_renders_exactly() {
-        let field_types = field_types(&[("health", "i32"), ("mo", "Handle<Thinker>")]);
+        let field_types = field_types(&[("health", "i32"), ("mo", "Option<Handle<Thinker>>")]);
         let rendered = render_bool_fn_with_scalar_param(
             &corpus_dir(),
             "p_inter.c",
@@ -18423,7 +18490,7 @@ pub fn P_GiveBody(player: &mut Player, num: i32, world: &mut World, thinkers: &m
     if player.health > MAXHEALTH {
         player.health = MAXHEALTH;
     }
-    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.health = player.health; };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.health = player.health; };
     return true;
 }";
         assert_eq!(rendered, expected);
@@ -18519,7 +18586,7 @@ pub fn P_GiveCard(player: &mut Player, card: i32, world: &mut World) {
     /// established: `player->powers[power] = ..;` (the plain-`i32`
     /// sibling of `cards`, already `as usize`-cast by name), `player->
     /// mo->flags |= MF_SHADOW;` (a *compound*-assign write through the
-    /// same bare-`Handle<Thinker>` `mo` field `P_GiveBody`'s own write
+    /// same `Option<Handle<Thinker>>`-typed `mo` field `P_GiveBody`'s own write
     /// arm already renders, `render_assign_op` already general over any
     /// operator), and `P_GiveBody (player, 100);` -- a forward-referenced
     /// call using `P_GiveBody`'s *original* two-argument C signature, the
@@ -18532,7 +18599,10 @@ pub fn P_GiveCard(player: &mut Player, card: i32, world: &mut World) {
     /// -- zero errors. `test_p_give_power_renders_exactly`.
     #[test]
     fn test_p_give_power_renders_exactly() {
-        let field_types = field_types(&[("powers", "[i32; NUMPOWERS]"), ("mo", "Handle<Thinker>")]);
+        let field_types = field_types(&[
+            ("powers", "[i32; NUMPOWERS]"),
+            ("mo", "Option<Handle<Thinker>>"),
+        ]);
         let rendered = render_bool_fn_with_scalar_param(
             &corpus_dir(),
             "p_inter.c",
@@ -18550,7 +18620,7 @@ pub fn P_GivePower(player: &mut Player, power: i32, world: &mut World, thinkers:
     }
     if power == pw_invisibility {
         player.powers[power as usize] = INVISTICS;
-        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.flags |= MF_SHADOW; };
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.flags |= MF_SHADOW; };
         return true;
     }
     if power == pw_infrared {
@@ -18608,7 +18678,7 @@ pub fn P_GivePower(player: &mut Player, power: i32, world: &mut World, thinkers:
     /// errors. `test_p_thrust_renders_exactly`.
     #[test]
     fn test_p_thrust_renders_exactly() {
-        let field_types = field_types(&[("mo", "Handle<Thinker>")]);
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>")]);
         let rendered = render_fn_with_two_scalar_params(
             &corpus_dir(),
             "p_user.c",
@@ -18622,8 +18692,8 @@ pub fn P_GivePower(player: &mut Player, power: i32, world: &mut World, thinkers:
         let expected = "\
 pub fn P_Thrust(player: &mut Player, mut angle: u32, r#move: FixedT, world: &mut World, thinkers: &mut Arena<Thinker>) {
     angle >>= ANGLETOFINESHIFT;
-    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momx += FixedMul(r#move, finecosine[angle as usize]); };
-    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo) { m.momy += FixedMul(r#move, finesine[angle as usize]); };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.momx += FixedMul(r#move, finecosine[angle as usize]); };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.momy += FixedMul(r#move, finesine[angle as usize]); };
 }";
         assert_eq!(rendered, expected);
     }
@@ -18866,7 +18936,7 @@ pub fn P_DropWeapon(player: &mut Player, world: &mut World) {
         let field_types = field_types(&[
             ("pendingweapon", "i32"),
             ("readyweapon", "i32"),
-            ("mo", "Handle<Thinker>"),
+            ("mo", "Option<Handle<Thinker>>"),
             ("psprites", "[PlayerSpriteState; NUMPSPRITES]"),
         ]);
         let rendered = render_fn(
@@ -18917,7 +18987,7 @@ pub fn P_BringUpWeapon(player: &mut Player, world: &mut World) {
     /// `weaponinfo` -- zero errors. `test_p_fire_weapon_renders_exactly`.
     #[test]
     fn test_p_fire_weapon_renders_exactly() {
-        let field_types = field_types(&[("readyweapon", "i32"), ("mo", "Handle<Thinker>")]);
+        let field_types = field_types(&[("readyweapon", "i32"), ("mo", "Option<Handle<Thinker>>")]);
         let rendered = render_fn(
             &corpus_dir(),
             "p_pspr.c",
@@ -18932,7 +19002,7 @@ pub fn P_FireWeapon(player: &mut Player, world: &mut World, thinkers: &mut Arena
     if !P_CheckAmmo(player) {
         return;
     }
-    thinkers.take_out(player.mo, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK1, world, h, a); } });
+    thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK1, world, h, a); } });
     newstate = weaponinfo[player.readyweapon as usize].atkstate;
     P_SetPsprite(player, ps_weapon, newstate);
     P_NoiseAlert(player.mo, player.mo);
@@ -19178,7 +19248,7 @@ pub fn P_MovePsprites(player: &mut Player, world: &mut World) {
     #[test]
     fn test_p_player_in_special_sector_renders_exactly() {
         let field_types = field_types(&[
-            ("mo", "Handle<Thinker>"),
+            ("mo", "Option<Handle<Thinker>>"),
             ("powers", "[i32; NUMPOWERS]"),
             ("cheats", "i32"),
             ("secretcount", "i32"),
@@ -19195,8 +19265,8 @@ pub fn P_MovePsprites(player: &mut Player, world: &mut World) {
         let expected = "\
 pub fn P_PlayerInSpecialSector(player: &mut Player, world: &mut World, thinkers: &Arena<Thinker>) {
     let mut sector;
-    sector = world[match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector;
-    if match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } != world[sector].floorheight {
+    sector = world[match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector;
+    if match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } != world[sector].floorheight {
         return;
     }
     match world[sector].special {
@@ -19799,7 +19869,7 @@ pub fn P_ChangeSector(sector: SectorId, crunch: bool, world: &mut World) -> bool
     fn test_p_calc_height_renders_exactly() {
         let field_types = field_types(&[
             ("bob", "FixedT"),
-            ("mo", "Handle<Thinker>"),
+            ("mo", "Option<Handle<Thinker>>"),
             ("cheats", "i32"),
             ("viewz", "FixedT"),
             ("viewheight", "FixedT"),
@@ -19818,17 +19888,17 @@ pub fn P_ChangeSector(sector: SectorId, crunch: bool, world: &mut World) -> bool
 pub fn P_CalcHeight(player: &mut Player, world: &mut World, thinkers: &Arena<Thinker>) {
     let mut angle;
     let mut bob;
-    player.bob = FixedMul(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momx, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momx, _ => unreachable!() }) + FixedMul(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() });
+    player.bob = FixedMul(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.momx, _ => unreachable!() }, match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.momx, _ => unreachable!() }) + FixedMul(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() }, match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() });
     player.bob >>= 2;
     if player.bob > MAXBOB {
         player.bob = MAXBOB;
     }
     if (player.cheats & CF_NOMOMENTUM) != 0 || !world.onground {
-        player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + VIEWHEIGHT;
-        if player.viewz > match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
-            player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
+        player.viewz = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + VIEWHEIGHT;
+        if player.viewz > match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
+            player.viewz = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
         }
-        player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + player.viewheight;
+        player.viewz = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + player.viewheight;
         return;
     }
     angle = FINEANGLES / 20 * leveltime & FINEMASK;
@@ -19852,9 +19922,9 @@ pub fn P_CalcHeight(player: &mut Player, world: &mut World, thinkers: &Arena<Thi
             }
         }
     }
-    player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + player.viewheight + bob;
-    if player.viewz > match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
-        player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
+    player.viewz = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + player.viewheight + bob;
+    if player.viewz > match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
+        player.viewz = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
     }
 }";
         assert_eq!(rendered, expected);
@@ -20169,7 +20239,7 @@ pub fn P_TouchSpecialThing(special: Handle<Thinker>, toucher: Handle<Thinker>, w
                 if world[player.unwrap()].health > 200 {
                     world[player.unwrap()].health = 200;
                 }
-                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo) { m.health = world[player.unwrap()].health; };
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo.unwrap()) { m.health = world[player.unwrap()].health; };
                 world[player.unwrap()].message = Some(GOTHTHBONUS);
             }
             SPR_BON2 => {
@@ -20187,7 +20257,7 @@ pub fn P_TouchSpecialThing(special: Handle<Thinker>, toucher: Handle<Thinker>, w
                 if world[player.unwrap()].health > 200 {
                     world[player.unwrap()].health = 200;
                 }
-                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo) { m.health = world[player.unwrap()].health; };
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo.unwrap()) { m.health = world[player.unwrap()].health; };
                 world[player.unwrap()].message = Some(GOTSUPER);
                 sound = sfx_getpow;
             }
@@ -20196,7 +20266,7 @@ pub fn P_TouchSpecialThing(special: Handle<Thinker>, toucher: Handle<Thinker>, w
                     return;
                 }
                 world[player.unwrap()].health = 200;
-                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo) { m.health = world[player.unwrap()].health; };
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(world[player.unwrap()].mo.unwrap()) { m.health = world[player.unwrap()].health; };
                 P_GiveArmor(player, 2);
                 world[player.unwrap()].message = Some(GOTMSPHERE);
                 sound = sfx_getpow;
