@@ -909,6 +909,20 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "bulletslope" {
                 return Ok(("world.bulletslope".to_string(), false));
             }
+            // `onground` (`p_user.c`'s own file-scope `boolean onground;`,
+            // `P_CalcHeight`'s own "don't bob the view while off the
+            // ground or noclipping" check) -- the same category
+            // `viletryx`/`attackrange`/`swingx`/`swingy`/`bulletslope`
+            // already established, just genuinely `bool`-typed (`boolean`,
+            // matching `crushchange`/`nofit`'s own mapping) rather than
+            // `FixedT`: its one real reference (`!onground`) is a bare
+            // negation, which `render_expr`'s own generic `Expr::Unary`
+            // fallback already renders as plain Rust `!` (correct only
+            // because the resolved value really is `bool` -- not the
+            // `== 0` int-truthiness cast a plain `int` global would need).
+            if name == "onground" {
+                return Ok(("world.onground".to_string(), false));
+            }
             // A function's own `static` local (`A_BrainSpit`'s own
             // `static int easy = 0;`) -- persists across calls, so it
             // lives on `World` instead of a real Rust `let` (`FnBodyContext
@@ -2552,6 +2566,19 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
             op: UnaryOp::Not,
             expr,
         } => Ok(format!("{} == 0", render_expr(expr, ctx)?.0)),
+        // `if (player->deltaviewheight)` (`P_CalcHeight`, `p_user.c`) --
+        // the un-negated sibling of the `!line->dx`/`is_self_fixed_t_field`
+        // arm just above: a bare (non-negated) `FixedT`-typed self-struct
+        // field used for truthiness. The generic `Expr::Member` `!= 0`
+        // fallback further below assumes a plain `int` field and doesn't
+        // compile against `FixedT` (no `PartialEq<i32>`, only `PartialEq`
+        // against itself) -- confirmed a real `rustc` rejection, not just
+        // extra caution, the same way the negated case already was.
+        Expr::Member { .. }
+            if is_self_fixed_t_field(cond, ctx) || is_line_dx_dy_field(cond, ctx) =>
+        {
+            Ok(format!("{} != FixedT(0)", render_expr(cond, ctx)?.0))
+        }
         // A bare value used for truthiness (not a comparison/negation) --
         // C's `if (x)` tests non-zero/non-null. `specialdata` is the one
         // corpus *field* known to be `Option`-typed (`struct_fields.rs`'s
@@ -18758,6 +18785,123 @@ pub fn P_ChangeSector(sector: SectorId, crunch: bool, world: &mut World) -> bool
         x += 1;
     }
     return world.nofit;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_CalcHeight` (`p_user.c`) -- another ordinary `Player`-shaped
+    /// self-struct function (`render_fn`), the first to dereference
+    /// *through* `player->mo` to read `Mobj` fields (`momx`/`momy`/`z`/
+    /// `ceilingz`) rather than just writing to `player`'s own fields:
+    /// `is_self_bare_handle_field`'s existing read arm (`P_GiveBody`'s
+    /// own `player->mo->health` precedent) already covers every one of
+    /// these opaquely, with no new code -- `render_fn_impl`'s existing
+    /// `needs_self_handle_field_deref` flag (`body_has_self_handle_field_
+    /// deref`, general over `self_param`/`self_field_types` since
+    /// `render_weapon_fn` first built it) picks up the read-only
+    /// `thinkers: &Arena<Thinker>` parameter automatically. Two small,
+    /// narrowly-scoped genuinely new pieces: (1) `onground` (`p_user.c`'s
+    /// own file-scope `boolean onground;`) joins the by-name `World`
+    /// global list (`viletryx`/`attackrange`/`swingx`/`bulletslope`'s own
+    /// category, `world.rs`'s own doc comment) -- like those, not yet
+    /// wired into the real hand-rendered `World` struct itself, matching
+    /// the same still-open gap `swingx`/`attackrange`/`bulletslope`
+    /// already left; genuinely `bool`-typed (the `boolean`-to-`bool`
+    /// mapping `crushchange`/`nofit` already established) rather than
+    /// `FixedT`, so its one real reference (`!onground`) needs no wrap at
+    /// all -- `render_expr`'s own generic `Expr::Unary` fallback already
+    /// renders a bare negation as plain Rust `!`, correct here only
+    /// because the resolved value really is `bool`. (2) `render_bool_expr`
+    /// gains a genuinely new arm: `if (player->deltaviewheight)`, a bare
+    /// (non-negated) truthiness check on a `FixedT`-typed self-struct
+    /// field -- the un-negated sibling of the already-shipped `!line->dx`/
+    /// `is_self_fixed_t_field` arm (`P_PointOnLineSide`'s own gap), never
+    /// needed until this first real corpus example, since the generic
+    /// `Expr::Member` `!= 0` fallback doesn't compile against `FixedT`
+    /// (no `PartialEq<i32>`) -- confirmed a real `rustc` rejection by
+    /// attempting the naive translation first, not just extra caution.
+    /// Every other shape reuses fully general, already-shipped machinery:
+    /// `MAXBOB`/`VIEWHEIGHT`/`FINEANGLES`/`FINEMASK` render as bare opaque
+    /// identifiers (the `CEILSPEED`/`WEAPONBOTTOM` deferred-`FixedT`-typing
+    /// precedent); `player->bob >>= 2` reuses `FixedT`'s own
+    /// `ShrAssign<i32>`; `player->bob>MAXBOB`/`player->bob = MAXBOB` need
+    /// no wrap at all (neither side is a bare `Expr::IntLiteral`, the one
+    /// shape the comparison-widening and self-field-assignment-wrap arms
+    /// require); `player->deltaviewheight = 0`/`= 1` reuse
+    /// `lhs_is_fixed_t_self_field`'s already-established literal wrap
+    /// (`P_ExplodeMissile`'s own precedent); `angle = (FINEANGLES/20*
+    /// leveltime)&FINEMASK; ... finesine[angle]` reuses `P_CalcSwing`'s
+    /// own identical shape (a plain `int` local doubling as a `finesine`
+    /// index, `as usize`-cast) verbatim, including the same "redundant
+    /// original parens, correctly dropped" precedence behavior. Verified
+    /// compiling for real (`rustc --edition 2021 --crate-type lib`)
+    /// against a hand-written `Player`/`World`/`Handle`/`Arena`/`Mobj`/
+    /// `FixedT` stand-in (including the real project's own
+    /// `PhantomData<fn() -> T>`-based `Handle<T>`, not a naively-derived
+    /// one -- the naive `#[derive(Copy)]` version wrongly demands `T:
+    /// Copy`) and stub `FixedMul`/constants -- zero errors.
+    /// `test_p_calc_height_renders_exactly`.
+    #[test]
+    fn test_p_calc_height_renders_exactly() {
+        let field_types = field_types(&[
+            ("bob", "FixedT"),
+            ("mo", "Handle<Thinker>"),
+            ("cheats", "i32"),
+            ("viewz", "FixedT"),
+            ("viewheight", "FixedT"),
+            ("deltaviewheight", "FixedT"),
+            ("playerstate", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_user.c",
+            "P_CalcHeight",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_CalcHeight(player: &mut Player, world: &mut World, thinkers: &Arena<Thinker>) {
+    let mut angle;
+    let mut bob;
+    player.bob = FixedMul(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momx, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momx, _ => unreachable!() }) + FixedMul(match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() }, match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.momy, _ => unreachable!() });
+    player.bob >>= 2;
+    if player.bob > MAXBOB {
+        player.bob = MAXBOB;
+    }
+    if (player.cheats & CF_NOMOMENTUM) != 0 || !world.onground {
+        player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + VIEWHEIGHT;
+        if player.viewz > match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
+            player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
+        }
+        player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + player.viewheight;
+        return;
+    }
+    angle = FINEANGLES / 20 * leveltime & FINEMASK;
+    bob = FixedMul(player.bob / 2, finesine[angle as usize]);
+    if player.playerstate == PST_LIVE {
+        player.viewheight += player.deltaviewheight;
+        if player.viewheight > VIEWHEIGHT {
+            player.viewheight = VIEWHEIGHT;
+            player.deltaviewheight = FixedT(0);
+        }
+        if player.viewheight < VIEWHEIGHT / 2 {
+            player.viewheight = VIEWHEIGHT / 2;
+            if player.deltaviewheight <= FixedT(0) {
+                player.deltaviewheight = FixedT(1);
+            }
+        }
+        if player.deltaviewheight != FixedT(0) {
+            player.deltaviewheight += FRACUNIT / 4;
+            if player.deltaviewheight == FixedT(0) {
+                player.deltaviewheight = FixedT(1);
+            }
+        }
+    }
+    player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + player.viewheight + bob;
+    if player.viewz > match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
+        player.viewz = match thinkers.get(player.mo) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
+    }
 }";
         assert_eq!(rendered, expected);
     }
