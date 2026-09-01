@@ -1296,6 +1296,18 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `mthing->x`/`.y`/`.angle`/`.type`/`.options` (`P_NightmareRespawn`)
+        // -- the read half of `collect_spawnpoint_alias`'s three-part
+        // design: `mthing` was never a real Rust binding at all (`render_
+        // decl`'s own skip, `SpawnpointAlias` marker), so every field read
+        // through it resolves statically straight to `{self_param}.
+        // spawnpoint.field` instead of through any local at all.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("SpawnpointAlias")) => {
+            Ok((
+                format!("{}.spawnpoint.{}", ctx.self_param, rust_field_name(field)?),
+                false,
+            ))
+        }
         // `line->frontsector` -- unlike a self-struct field
         // (`self_field_types`) or a constructor-in-progress field
         // (`ctor_field_types`), a trigger function's own parameter (`line:
@@ -1391,6 +1403,23 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                     if bf == "subsector"
                         && (matches!(bb.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                             || matches!(bb.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>")))) =>
+        {
+            let (base_text, _) = render_expr(base, ctx)?;
+            Ok((format!("world[{base_text}].sector"), true))
+        }
+        // `ss->sector` (`P_NightmareRespawn`'s own `ss = R_PointInSubsector
+        // (x,y); ... ss->sector->floorheight`) -- a *direct* `SubsectorId`-
+        // typed local (registered by `collect_subsector_locals`, not a
+        // `self_param.subsector`/bare-`Handle<Thinker>`-parameter chain the
+        // two arms just above already cover), so `.sector` is reached with
+        // no intervening `subsector` field at all. Kept as its own arm
+        // rather than widening either one above: both of those specifically
+        // match a *nested* `Member` base (`X->subsector`), while here `ss`
+        // itself already *is* the subsector -- a genuinely different shape,
+        // not just another base flavor of the same one.
+        Expr::Member { base, field, .. }
+            if field == "sector"
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("SubsectorId")) =>
         {
             let (base_text, _) = render_expr(base, ctx)?;
             Ok((format!("world[{base_text}].sector"), true))
@@ -1817,6 +1846,79 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             };
             let (divisor_text, _) = render_expr(div_rhs, ctx)?;
             Ok((format!("(-({name} as i32) / {divisor_text}) as u32"), false))
+        }
+        // `mobj->spawnpoint.x << FRACBITS` / `.y << FRACBITS`
+        // (`P_NightmareRespawn`) -- `MapThing.x`/`.y` are `i16`
+        // (`struct_fields.rs`'s own corpus-verified mapping), and C
+        // silently promotes a `short` to `int` before a shift, so `<<
+        // FRACBITS` (16) never actually shifts within the original 16-bit
+        // width at the C level at all. A bare Rust `i16 << 16` has no such
+        // promotion -- confirmed a real `attempt to shift left with
+        // overflow` debug-mode panic by tracing the naive translation
+        // (`FRACBITS` equals `i16::BITS`, the exact boundary Rust's own
+        // shift-amount check rejects) -- so the operand needs an explicit
+        // `as i32` widen first, matching C's own implicit promotion.
+        // Scoped to this exact corpus idiom (a `spawnpoint.x`/`.y` read
+        // shifted by the literal `FRACBITS`), the same "hand-match the one
+        // real shape" style as the `-ANG90/20` arm just above, not a
+        // general "every shift needs widening" rule (every other shift
+        // already translated operates on a value already wide enough).
+        Expr::Binary {
+            op: BinaryOp::Shl,
+            lhs: shl_lhs,
+            ..
+        } if is_spawnpoint_xy_shl_fracbits(e, ctx.self_param) => {
+            let (lhs_text, _) = render_expr(shl_lhs, ctx)?;
+            Ok((format!("(({lhs_text}) as i32) << FRACBITS"), false))
+        }
+        // `ANG45 * (mthing->angle/45)` (`P_NightmareRespawn`, also
+        // `P_SpawnPlayer`/`P_SpawnMapThing`, not yet translated) -- mixes
+        // an `ANGxx` macro (rendered opaque `u32`, the same convention the
+        // `-ANG90/20` arm above already establishes) with `mthing->angle`
+        // (`MapThing.angle: i16`) divided by a literal, which stays
+        // ordinary signed arithmetic in Rust (unlike C, no implicit
+        // promotion needed here: dividing a small `i16` by `45` never
+        // overflows either width, so the numeric result already matches
+        // C's `int`-promoted division bit-for-bit) -- but `u32 * i16`
+        // itself doesn't compile at all (no mixed-type `Mul` impl),
+        // confirmed by rendering the naive version first. Looked, and
+        // found no existing general "opaque `u32` macro meets narrower
+        // arithmetic in a `Mul`" mechanism to extend (`find_u32_self_
+        // field_names` only ever looks at `self_param`'s own registered
+        // fields, not a free-standing macro name -- neither operand here
+        // is one), so this is its own new, narrowly-scoped arm, matching
+        // the `-ANG90/20` arm's own "hand-match the one real shape" style
+        // rather than a general rule.
+        Expr::Binary {
+            op: BinaryOp::Mul,
+            lhs: mul_lhs,
+            rhs: mul_rhs,
+        } if matches!(mul_lhs.as_ref(), Expr::Ident(n) if n.starts_with("ANG"))
+            && matches!(
+                mul_rhs.as_ref(),
+                Expr::Binary {
+                    op: BinaryOp::Div,
+                    ..
+                }
+            ) =>
+        {
+            let Expr::Ident(name) = mul_lhs.as_ref() else {
+                unreachable!("guarded above")
+            };
+            let Expr::Binary {
+                lhs: div_lhs,
+                rhs: div_rhs,
+                ..
+            } = mul_rhs.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let (num_text, _) = render_expr(div_lhs, ctx)?;
+            let (den_text, _) = render_expr(div_rhs, ctx)?;
+            Ok((
+                format!("{name} * (({num_text}) / {den_text}) as u32"),
+                false,
+            ))
         }
         // `player->mo->state == &states[S_PLAY_ATK1]` / `psp->state ==
         // &states[S_SAW]` (`A_WeaponReady`) -- comparing a `&'static
@@ -3596,6 +3698,15 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         if ctx.static_locals.contains_key(&name) {
             continue;
         }
+        // `mapthing_t* mthing;` (`P_NightmareRespawn`) -- never becomes a
+        // real Rust binding either, the same "no real value backs this
+        // name" reasoning `embedded_ctor`'s skip just above already
+        // established: every reference to it resolves statically to
+        // `{self_param}.spawnpoint.field` instead (`collect_spawnpoint_
+        // alias`'s own doc comment).
+        if ctx.extra_cross_ref_idents.get(&name).map(String::as_str) == Some("SpawnpointAlias") {
+            continue;
+        }
         // `mobjtype_t type;` (`A_SpawnFly`'s own monster-selection local)
         // -- a plain local literally named `type`, a real Rust keyword.
         // Every declarator name reaching this point used to render
@@ -3809,6 +3920,14 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // nested inside a trigger function's `if` body, not at a
         // constructor's top level.
         Stmt::Expr(Some(e)) if is_active_array_function_pointer_assign(e) => Ok(vec![]),
+        // `mthing = &mobj->spawnpoint;` (`P_NightmareRespawn`) -- discarded
+        // entirely, the statement-skip half of `collect_spawnpoint_alias`'s
+        // own three-part design (decl-skip, statement-skip, `Member`-read
+        // rewrite). Guarded by the exact same shape predicate the collector
+        // itself uses (`is_spawnpoint_alias_assign`), so this only ever
+        // fires for a statement that collector has *already* registered --
+        // never a same-shaped assignment into some other, unrelated local.
+        _ if is_spawnpoint_alias_assign(s, ctx.self_param) => Ok(vec![]),
         Stmt::Expr(Some(e)) => Ok(vec![format!(
             "{}{};",
             indent(depth),
@@ -5427,8 +5546,23 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
         // would double-wrap it in `FixedT(..)` a second time (`FixedT`
         // built from a `FixedT` argument, a real `rustc` rejection),
         // confirmed by rendering the naive pre-fix version first.
+        // `ONFLOORZ`/`ONCEILINGZ` (`p_local.h`'s own `#define ONFLOORZ
+        // MININT`/`#define ONCEILINGZ MAXINT`, `P_NightmareRespawn`'s own
+        // `z = ONCEILINGZ;`/`z = ONFLOORZ;`) -- the same "opaque macro
+        // assumed correctly `FixedT`-typed in the real generated crate"
+        // convention `FRACUNIT`/`MAXMOVE` already get: an existing,
+        // already-shipped call site (`P_SpawnMissile`'s callers) already
+        // passes `ONFLOORZ` bare as a `fixed_t`-typed argument with no
+        // wrap, so the real generated crate must already define it
+        // `FixedT`-typed -- needed here too now that a *plain-assignment*
+        // RHS wrap (just below, this round's own new widening) would
+        // otherwise wrongly double-wrap it in `FixedT(..)` a second time.
         Expr::Ident(n) => {
-            n == "FRACUNIT" || n == "MAXMOVE" || ctx.fixed_t_locals.contains(n.as_str())
+            n == "FRACUNIT"
+                || n == "MAXMOVE"
+                || n == "ONFLOORZ"
+                || n == "ONCEILINGZ"
+                || ctx.fixed_t_locals.contains(n.as_str())
         }
         Expr::Member { base, field, .. } => {
             // `corpsehit->momy` (`PIT_VileCheck`) -- a third real source,
@@ -6470,6 +6604,34 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 || lhs_is_fixed_t_typed_ident && rhs_is_abs_call)
         {
             format!("FixedT({rhs_text})")
+        } else if *op == AssignOp::Assign
+            && lhs_is_fixed_t_local
+            && matches!(lhs.as_ref(), Expr::Ident(_))
+            && is_spawnpoint_xy_shl_fracbits(rhs, ctx.self_param)
+        {
+            // `x = mobj->spawnpoint.x << FRACBITS;` (`P_NightmareRespawn`)
+            // -- `render_decl`'s own `is_fixed_t_decl && !expr_is_fixed_t_
+            // valued(e, ctx)` wrap only ever fires for an initializer in
+            // the *same* declaration statement (`fixed_t x = ..;`), never
+            // for a `fixed_t`-declared local's own *later, separate*
+            // plain-`=` assignment (`fixed_t x; .. x = ..;`, this
+            // function's own idiom) -- a real gap, not just extra caution:
+            // without this, `x`'s own later real `FixedT` uses
+            // (`P_CheckPosition(mobj, x, y)`, `P_SpawnMobj(x, y, ..)`)
+            // would conflict with this plain-`i32`-valued assignment, a
+            // genuine `rustc` type mismatch. Deliberately its own narrow
+            // arm (matched by the *exact* corpus shape, `is_spawnpoint_xy_
+            // shl_fracbits`) rather than a general "RHS not already
+            // provably `FixedT`-valued" widening -- tried the general form
+            // first and it was a real regression, not just extra caution:
+            // `T_MoveCeiling`'s own `ceiling->speed = CEILSPEED;`/`=
+            // CEILSPEED / 8;` (`CEILSPEED` a `#define`d `FRACUNIT` alias
+            // this parser never macro-expands, already `FixedT`-typed in
+            // the real generated crate) got wrongly double-wrapped the
+            // moment the guard stopped requiring a specific known-safe
+            // shape, confirmed by running the full suite against the naive
+            // version first.
+            format!("FixedT({rhs_text})")
         } else if *op == AssignOp::Assign && lhs_is_cards_index && rhs_is_int_literal {
             match rhs.as_ref() {
                 Expr::IntLiteral(s) if s == "1" => "true".to_string(),
@@ -7283,6 +7445,9 @@ fn render_fn_impl_with_two_scalar_params(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone())),
     );
+    // `ss = R_PointInSubsector(x,y);` (`P_NightmareRespawn`) -- see
+    // `collect_subsector_locals`'s own doc comment.
+    extra_cross_ref_idents.extend(collect_subsector_locals(&f.body.items));
     // `sector = player->mo->subsector->sector;`
     // (`P_PlayerInSpecialSector`) -- the first `render_fn`/`render_fn_
     // impl` caller needing a plain local aliased from a cross-reference
@@ -7299,6 +7464,9 @@ fn render_fn_impl_with_two_scalar_params(
     // chain (`collect_line_sector_aliases`'s own shapes) -- see `collect_
     // self_player_alias`'s own doc comment.
     extra_cross_ref_idents.extend(collect_self_player_alias(&f.body.items, &param_name));
+    // `mthing = &mobj->spawnpoint;` (`P_NightmareRespawn`) -- see
+    // `collect_spawnpoint_alias`'s own doc comment.
+    extra_cross_ref_idents.extend(collect_spawnpoint_alias(&f.body.items, &param_name));
     // `linetarget` (`p_local.h`'s own `extern mobj_t* linetarget;`) --
     // `render_weapon_fn`'s own idiom (`A_Punch`/`A_Saw`), needed here too
     // now that a plain `mobj_t*`-self action function references it
@@ -8291,6 +8459,126 @@ fn collect_self_player_alias_stmt(
     }
 }
 
+/// `mthing = &mobj->spawnpoint;` (`P_NightmareRespawn`, `p_mobj.c`) --
+/// aliasing a self-struct field's own *address*, not another struct's
+/// cross-reference the way every other alias collector in this module
+/// handles: `spawnpoint` (`Mobj.spawnpoint: MapThing`, `struct_fields.rs`'s
+/// own mapping) lives embedded *by value* directly inside `Mobj`, so a
+/// real Rust `&mobj.spawnpoint` reference held in a separate local would
+/// keep `self_param` borrowed for the rest of the function -- a real
+/// borrow-checker conflict the moment any other statement needs `&mut
+/// self_param` again (this function's own later `mo->spawnpoint =
+/// mobj->spawnpoint;`/`P_RemoveMobj(mobj)`, `mobj` here being
+/// `self_param`). So this isn't resolved as a live reference at all:
+/// registered `"SpawnpointAlias"` into the same `extra_cross_ref_idents`
+/// map every other alias uses, purely as a marker three call sites act on
+/// -- `render_decl` skips the local's own declaration entirely (mirroring
+/// `FnBodyContext::embedded_ctor`'s own "never a real Rust binding"
+/// precedent), `render_stmt` skips the alias-assignment statement itself
+/// (mirroring `is_active_array_function_pointer_assign`'s "discarded
+/// entirely" precedent), and `render_expr`'s own new `Member` arm rewrites
+/// every `mthing->field` read straight to `{self_param}.spawnpoint.field`
+/// -- so the alias is resolved statically at every use site instead of
+/// through any real Rust value at all.
+fn collect_spawnpoint_alias(items: &[BlockItem], self_param: &str) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    collect_spawnpoint_alias_in(items, self_param, &mut aliases);
+    aliases
+}
+
+fn collect_spawnpoint_alias_in(
+    items: &[BlockItem],
+    self_param: &str,
+    aliases: &mut HashMap<String, String>,
+) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_spawnpoint_alias_stmt(s, self_param, aliases);
+        }
+    }
+}
+
+fn collect_spawnpoint_alias_stmt(
+    s: &Stmt,
+    self_param: &str,
+    aliases: &mut HashMap<String, String>,
+) {
+    if is_spawnpoint_alias_assign(s, self_param)
+        && let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+    {
+        aliases.insert(name.clone(), "SpawnpointAlias".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_spawnpoint_alias_in(&c.items, self_param, aliases),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_spawnpoint_alias_stmt(then_branch, self_param, aliases);
+            if let Some(eb) = else_branch {
+                collect_spawnpoint_alias_stmt(eb, self_param, aliases);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_spawnpoint_alias_stmt(body, self_param, aliases),
+        Stmt::Case { stmt, .. } => collect_spawnpoint_alias_stmt(stmt, self_param, aliases),
+        Stmt::Default(stmt) => collect_spawnpoint_alias_stmt(stmt, self_param, aliases),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_spawnpoint_alias_stmt(body, self_param, aliases)
+        }
+        Stmt::For { body, .. } => collect_spawnpoint_alias_stmt(body, self_param, aliases),
+        _ => {}
+    }
+}
+
+/// Whether `s` is exactly `IDENT = &{self_param}->spawnpoint;` -- shared by
+/// `collect_spawnpoint_alias_stmt` (to register the alias) and
+/// `render_stmt` (to discard the statement itself once registered), so the
+/// two can never drift apart on what shape they each recognize.
+fn is_spawnpoint_alias_assign(s: &Stmt, self_param: &str) -> bool {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+    else {
+        return false;
+    };
+    if !matches!(lhs.as_ref(), Expr::Ident(_)) {
+        return false;
+    }
+    matches!(rhs.as_ref(), Expr::Unary { op: UnaryOp::AddrOf, expr }
+        if matches!(expr.as_ref(), Expr::Member { base, field, .. }
+            if field == "spawnpoint" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
+}
+
+/// Whether `e` is exactly `{self_param}->spawnpoint.x << FRACBITS` (or
+/// `.y`) -- shared by `render_expr`'s own `Expr::Binary { op: Shl, .. }`
+/// arm (which renders the widened shift) and `render_expr_stmt`'s own
+/// plain-assignment `FixedT` wrap (which needs to recognize the exact same
+/// shape to know a wrap is safe here without risking `T_MoveCeiling`'s own
+/// `CEILSPEED` regression -- see that arm's own doc comment).
+fn is_spawnpoint_xy_shl_fracbits(e: &Expr, self_param: &str) -> bool {
+    let Expr::Binary {
+        op: BinaryOp::Shl,
+        lhs: shl_lhs,
+        rhs: shl_rhs,
+    } = e
+    else {
+        return false;
+    };
+    if !matches!(shl_rhs.as_ref(), Expr::Ident(n) if n == "FRACBITS") {
+        return false;
+    }
+    let Expr::Member { base, field, .. } = shl_lhs.as_ref() else {
+        return false;
+    };
+    (field == "x" || field == "y")
+        && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+            if bf == "spawnpoint" && matches!(bb.as_ref(), Expr::Ident(n) if n == self_param))
+}
+
 /// Locals directly assigned a line's own `frontsector`/`backsector`
 /// (`front = linedef->frontsector; back = linedef->backsector;`,
 /// `P_LineOpening`'s own idiom) -- registers `front` as `"SectorId"`
@@ -8512,6 +8800,64 @@ fn collect_i32_widened_locals_stmt(
 /// `P_SpawnMissile` is itself translated (both stay forward-reference
 /// stubs, same as `S_StartSound`/`P_Random` elsewhere in this module) --
 /// only each call site's own return value needs a real type here.
+/// `ss = R_PointInSubsector(x,y);` (`P_NightmareRespawn`, `p_mobj.c`) --
+/// `collect_spawn_mobj_locals`'s own sibling for a different real corpus
+/// callee: `R_PointInSubsector`'s declared C return type is `subsector_t*`
+/// (`r_main.h`, confirmed by direct read), always a real element of the
+/// `subsectors` array (never null in any real corpus call site -- BSP
+/// point location always lands in some subsector), matching this
+/// project's own existing `SubsectorId` representation (`runtime/geometry.rs`)
+/// for exactly that array. Registered bare `"SubsectorId"`, not `Option`-
+/// wrapped, the same "always valid in practice" trust `P_SpawnMobj`'s own
+/// `"Handle<Thinker>"` registration already extends.
+fn collect_subsector_locals(items: &[BlockItem]) -> HashMap<String, String> {
+    let mut locals = HashMap::new();
+    collect_subsector_locals_in(items, &mut locals);
+    locals
+}
+
+fn collect_subsector_locals_in(items: &[BlockItem], locals: &mut HashMap<String, String>) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_subsector_locals_stmt(s, locals);
+        }
+    }
+}
+
+fn collect_subsector_locals_stmt(s: &Stmt, locals: &mut HashMap<String, String>) {
+    if let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+        && matches!(rhs.as_ref(), Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "R_PointInSubsector"))
+    {
+        locals.insert(name.clone(), "SubsectorId".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_subsector_locals_in(&c.items, locals),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_subsector_locals_stmt(then_branch, locals);
+            if let Some(eb) = else_branch {
+                collect_subsector_locals_stmt(eb, locals);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_subsector_locals_stmt(body, locals),
+        Stmt::Case { stmt, .. } => collect_subsector_locals_stmt(stmt, locals),
+        Stmt::Default(stmt) => collect_subsector_locals_stmt(stmt, locals),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_subsector_locals_stmt(body, locals)
+        }
+        Stmt::For { body, .. } => collect_subsector_locals_stmt(body, locals),
+        _ => {}
+    }
+}
+
 fn collect_spawn_mobj_locals(items: &[BlockItem]) -> HashMap<String, String> {
     let mut locals = HashMap::new();
     collect_spawn_mobj_locals_in(items, &mut locals);
@@ -18649,6 +18995,89 @@ pub fn P_XYMovement(mo: &mut Mobj, world: &mut World, thinkers: &mut Arena<Think
     }
 }";
         assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn test_p_nightmare_respawn_renders_exactly() {
+        // `P_NightmareRespawn` (`p_mobj.c`) -- round 24's own fully corpus-
+        // verified punch list, landed this round: (1) `ss = R_PointInSub-
+        // sector(x,y);` (`collect_subsector_locals`, a new `SubsectorId`-
+        // typed local registration, plus a new direct `ss->sector` `Member`
+        // arm); (2) `mthing = &mobj->spawnpoint;` (`collect_spawnpoint_
+        // alias`'s own three-part design: decl-skip, statement-skip, and a
+        // `Member`-read rewrite straight to `mo.spawnpoint.field`); (3)
+        // `x = mobj->spawnpoint.x << FRACBITS;` (`is_spawnpoint_xy_shl_
+        // fracbits`, an `i16`-widen-before-shift fix plus its own narrowly-
+        // scoped plain-assignment `FixedT` wrap); (4) `mo->angle = ANG45 *
+        // (mthing->angle/45);` (a new, narrowly-scoped `Mul` arm mixing an
+        // opaque `u32`-assumed `ANGxx` macro with `i16`-sourced division --
+        // round 24's own suggestion to extend `find_u32_self_field_names`
+        // didn't fit on closer inspection: that function only ever looks at
+        // `self_param`'s own registered fields, and neither operand here is
+        // one, confirmed by direct re-reading rather than trusted from the
+        // old note, matching this project's own "don't trust old blocker
+        // notes without rechecking" discipline).
+        let field_types = field_types(&[
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("subsector", "SubsectorId"),
+            ("info", "&'static MobjInfo"),
+            ("r#type", "i32"),
+            ("angle", "u32"),
+            ("flags", "i32"),
+            ("reactiontime", "i32"),
+            ("spawnpoint", "MapThing"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_NightmareRespawn",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        // `P_RemoveMobj(mobj)` -- `mobj` here is this function's own
+        // `self_param`, matching `is_self_removal_call`'s own already-
+        // established `P_RemoveMobj(mo)` shape (`A_SpawnFly`'s own
+        // precedent): this function genuinely removes its own receiver,
+        // so it picks up the same `handle: Handle<Thinker>` signature
+        // extension and `thinkers.remove(handle)` rendering every other
+        // self-removing tick function already gets -- confirmed correct
+        // by re-reading `is_self_removal_call`'s own existing code rather
+        // than assumed from the plain corpus text alone.
+        assert_eq!(
+            rendered,
+            "pub fn P_NightmareRespawn(mobj: &mut Mobj, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) {\n    \
+             let mut x;\n    \
+             let mut y;\n    \
+             let mut z;\n    \
+             let mut ss;\n    \
+             let mut mo;\n    \
+             x = FixedT(((mobj.spawnpoint.x) as i32) << FRACBITS);\n    \
+             y = FixedT(((mobj.spawnpoint.y) as i32) << FRACBITS);\n    \
+             if !P_CheckPosition(mobj, x, y) {\n        \
+             return;\n    \
+             }\n    \
+             mo = P_SpawnMobj(mobj.x, mobj.y, world[world[mobj.subsector].sector].floorheight, MT_TFOG);\n    \
+             S_StartSound(mo, sfx_telept);\n    \
+             ss = R_PointInSubsector(x, y);\n    \
+             mo = P_SpawnMobj(x, y, world[world[ss].sector].floorheight, MT_TFOG);\n    \
+             S_StartSound(mo, sfx_telept);\n    \
+             if (mobj.info.flags & MF_SPAWNCEILING) != 0 {\n        \
+             z = ONCEILINGZ;\n    \
+             } else {\n        \
+             z = ONFLOORZ;\n    \
+             }\n    \
+             mo = P_SpawnMobj(x, y, z, mobj.r#type);\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.spawnpoint = mobj.spawnpoint; };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.angle = ANG45 * ((mobj.spawnpoint.angle) / 45) as u32; };\n    \
+             if (mobj.spawnpoint.options & MTF_AMBUSH) != 0 {\n        \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.flags |= MF_AMBUSH; };\n    \
+             }\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.reactiontime = 18; };\n    \
+             thinkers.remove(handle);\n\
+             }"
+        );
     }
 
     /// `P_RecursiveSound` (`p_enemy.c`) -- `render_world_fn`'s existing
