@@ -3009,6 +3009,25 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         {
             Ok((format!("{} == 0", render_expr(expr, ctx)?.0), false))
         }
+        // `(unsigned)-ANG5` (`P_DeathThink`, `p_user.c`) -- the bare
+        // (undivided) sibling of the `-ANG90/20` arm above: an `ANGxx`-
+        // prefixed opaque constant is `u32`-valued everywhere else it's
+        // used in this same function (`delta < ANG5`, `m.angle += ANG5;`),
+        // but `u32` has no `Neg` impl at all -- confirmed a real `rustc`
+        // `E0600` ("cannot apply unary operator `-` to type `u32`") on the
+        // naive translation first, not assumed. Widened to `i32` before
+        // negating, the identical "usual arithmetic conversions" fix
+        // `-ANG90/20`'s own division sibling already uses, just with no
+        // divisor to fold the cast into -- the enclosing `(unsigned)` C
+        // cast (`Expr::Cast`'s own `Unsigned` arm) supplies the final `as
+        // u32` back on the outside.
+        Expr::Unary {
+            op: UnaryOp::Minus,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Ident(n) if n.starts_with("ANG")) => {
+            let (inner_text, _) = render_expr(expr, ctx)?;
+            Ok((format!("-({inner_text} as i32)"), false))
+        }
         Expr::Unary { op, expr } => {
             let op_text = match op {
                 UnaryOp::Minus => "-",
@@ -22608,6 +22627,93 @@ pub fn P_MovePlayer(player: &mut Player, world: &mut World, thinkers: &mut Arena
     }
     if (player.cmd.forwardmove != 0 || player.cmd.sidemove != 0) && state_index(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY {
         thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_RUN1, world, h, a); } });
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_DeathThink` (`p_user.c`) -- round 32's own second player-tick
+    /// pickup, immediately after `P_MovePlayer`: blocked in round 12/13's
+    /// own read on the same now-resolved "callees not translated yet"
+    /// reason (`P_MovePsprites`/`P_CalcHeight`, both landed since), plus
+    /// `player->attacker`'s own nullability, resolved rounds 14-31 --
+    /// re-verified, not trusted. Registering `("attacker",
+    /// "Option<Handle<Thinker>>")` in `field_types` is enough on its own
+    /// for every `player->attacker` read (`is_self_bare_handle_field`,
+    /// already fully generic over field name, not hardcoded to `mo`) and
+    /// the `player->attacker != player->mo` handle-identity comparison
+    /// (the same `Handle<T>: PartialEq` already proven for `players[]`) --
+    /// no new mechanism needed for either. One genuinely new gap, found
+    /// only by actually compiling the naive translation: `(unsigned)
+    /// -ANG5` -- `ANG5` (an opaque, `u32`-valued corpus macro, consistent
+    /// with its own other real uses two lines later, `delta < ANG5`/
+    /// `m.angle += ANG5;`) has no `Neg` impl in Rust at all (confirmed a
+    /// real `rustc` `E0600`, "cannot apply unary operator `-` to type
+    /// `u32`"), unlike the already-shipped `-ANG90/20` arm which only
+    /// fires when a division follows. Fixed with a new, narrower sibling
+    /// arm: a *bare* (undivided) `-ANGxx` widens to `i32` before negating,
+    /// the same "usual arithmetic conversions" fix, just with the `unsigned`
+    /// C cast supplying the final `as u32` back on the outside instead of a
+    /// division folding it in. Verified compiling for real (`rustc
+    /// --edition 2021 --crate-type bin`) against a hand-written `Player`/
+    /// `TicCmd`/`Mobj`/`World`/`Handle`/`Arena`/`Thinker`/`FixedT` stand-in
+    /// (including a real `Mul<FixedT> for i32` impl, matching the actual
+    /// runtime's own commutative `FixedT` multiplication) -- zero errors.
+    #[test]
+    fn test_p_death_think_renders_exactly() {
+        let field_types = field_types(&[
+            ("mo", "Option<Handle<Thinker>>"),
+            ("attacker", "Option<Handle<Thinker>>"),
+            ("viewheight", "FixedT"),
+            ("deltaviewheight", "FixedT"),
+            ("damagecount", "i32"),
+            ("cmd", "TicCmd"),
+            ("playerstate", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_user.c",
+            "P_DeathThink",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_DeathThink(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut angle;
+    let mut delta;
+    P_MovePsprites(player);
+    if player.viewheight > 6 * FRACUNIT {
+        player.viewheight -= FRACUNIT;
+    }
+    if player.viewheight < 6 * FRACUNIT {
+        player.viewheight = 6 * FRACUNIT;
+    }
+    player.deltaviewheight = FixedT(0);
+    world.onground = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } <= match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.floorz, _ => unreachable!() };
+    P_CalcHeight(player);
+    if player.attacker.is_some() && player.attacker != player.mo {
+        angle = R_PointToAngle2(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(player.attacker.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(player.attacker.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });
+        delta = angle - match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() };
+        if delta < ANG5 || delta > ((-(ANG5 as i32)) as u32) {
+            if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle = angle; };
+            if player.damagecount != 0 {
+                player.damagecount -= 1;
+            }
+        } else {
+            if delta < ANG180 {
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle += ANG5; };
+            } else {
+                if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle -= ANG5; };
+            }
+        }
+    } else {
+        if player.damagecount != 0 {
+            player.damagecount -= 1;
+        }
+    }
+    if (player.cmd.buttons & BT_USE) != 0 {
+        player.playerstate = PST_REBORN;
     }
 }";
         assert_eq!(rendered, expected);
