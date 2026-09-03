@@ -1376,6 +1376,19 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `cmd->angleturn`/`.forwardmove`/`.sidemove`/`.buttons`
+        // (`P_MovePlayer`/`P_PlayerThink`) -- `collect_cmd_alias`'s own
+        // read half, the `"CmdAlias"` sibling of `SpawnpointAlias` just
+        // above: `cmd` was never a real Rust binding either, so every
+        // field read (or, via the generic `Expr::Assign` fallback's own
+        // `render_expr(lhs, ..)` call, write) through it resolves
+        // statically straight to `{self_param}.cmd.field` instead.
+        Expr::Member { base, field, .. } if matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("CmdAlias")) => {
+            Ok((
+                format!("{}.cmd.{}", ctx.self_param, rust_field_name(field)?),
+                false,
+            ))
+        }
         // `line->frontsector` -- unlike a self-struct field
         // (`self_field_types`) or a constructor-in-progress field
         // (`ctor_field_types`), a trigger function's own parameter (`line:
@@ -1965,6 +1978,50 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         {
             let (lhs_text, _) = render_expr(shl_lhs, ctx)?;
             Ok((format!("(({lhs_text}) as i32) << MF_TRANSSHIFT"), false))
+        }
+        // `cmd->angleturn<<16` (`P_MovePlayer`, `p_user.c`) -- the same
+        // `i16`-widen-before-shift need as the `FRACBITS`/`MF_TRANSSHIFT`
+        // arms just above (`TicCmd.angleturn: i16`, `struct_fields.rs`),
+        // just a third real corpus shift amount/field. Confirmed a real
+        // `attempt to shift left ... which would overflow` `rustc`
+        // rejection first (a plain `i16` has no bit 16 to shift into at
+        // all, the exact same boundary as the `FRACBITS` arm), not
+        // assumed. Scoped to this exact field name, the same "hand-match
+        // the one real shape" style as its two siblings.
+        Expr::Binary {
+            op: BinaryOp::Shl,
+            lhs: shl_lhs,
+            rhs: shl_rhs,
+        } if matches!(shl_rhs.as_ref(), Expr::IntLiteral(s) if s == "16")
+            && matches!(shl_lhs.as_ref(), Expr::Member { field, .. } if field == "angleturn") =>
+        {
+            let (lhs_text, _) = render_expr(shl_lhs, ctx)?;
+            Ok((format!("(({lhs_text}) as i32) << 16"), false))
+        }
+        // `cmd->forwardmove*2048` / `cmd->sidemove*2048` (`P_MovePlayer`,
+        // `p_user.c`) -- `TicCmd.forwardmove`/`.sidemove: i8`
+        // (`struct_fields.rs`, mapped from C's plain `char`), the first
+        // real corpus example of `i8` arithmetic in this renderer at all.
+        // C promotes `char` to `int` before *any* arithmetic (the same
+        // "usual arithmetic conversions" reasoning the `i16`-widen-before-
+        // shift arms above already rely on for `short`), so the literal
+        // `2048` was never actually meant to fit inside `forwardmove`'s
+        // own 8-bit width -- confirmed a real `rustc` "literal out of
+        // range for `i8`" rejection on the naive translation first (Rust
+        // infers the literal's type from the `i8` operand it's multiplied
+        // against, unlike C's automatic promotion), not assumed. Scoped to
+        // these two exact field names, the same "hand-match the one real
+        // shape" style as `angleturn`/`MF_TRANSSHIFT` above, rather than a
+        // general "every `i8` field needs widening" rule.
+        Expr::Binary {
+            op: BinaryOp::Mul,
+            lhs: mul_lhs,
+            rhs: mul_rhs,
+        } if matches!(mul_rhs.as_ref(), Expr::IntLiteral(s) if s == "2048")
+            && matches!(mul_lhs.as_ref(), Expr::Member { field, .. } if field == "forwardmove" || field == "sidemove") =>
+        {
+            let (lhs_text, _) = render_expr(mul_lhs, ctx)?;
+            Ok((format!("(({lhs_text}) as i32) * 2048"), false))
         }
         // `ANG45 * (mthing->angle/45)` (`P_NightmareRespawn`, also
         // `P_SpawnPlayer`/`P_SpawnMapThing`, not yet translated) -- mixes
@@ -4052,6 +4109,13 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         if ctx.extra_cross_ref_idents.get(&name).map(String::as_str) == Some("SpawnpointAlias") {
             continue;
         }
+        // `ticcmd_t* cmd;` (`P_MovePlayer`/`P_PlayerThink`) -- the
+        // `"CmdAlias"` sibling of `mthing`'s own skip just above, same
+        // "no real value backs this name" reasoning (`collect_cmd_alias`'s
+        // own doc comment).
+        if ctx.extra_cross_ref_idents.get(&name).map(String::as_str) == Some("CmdAlias") {
+            continue;
+        }
         // `player_t* p;` (`P_SpawnPlayer`) -- the `players_index_alias`
         // sibling of `mthing`'s own skip just above: never becomes a real
         // Rust binding either, since every reference to it resolves
@@ -4281,6 +4345,10 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // fires for a statement that collector has *already* registered --
         // never a same-shaped assignment into some other, unrelated local.
         _ if is_spawnpoint_alias_assign(s, ctx.self_param) => Ok(vec![]),
+        // `cmd = &player->cmd;` (`P_MovePlayer`/`P_PlayerThink`) --
+        // discarded entirely, the `"CmdAlias"` sibling of `mthing`'s own
+        // statement-skip just above.
+        _ if is_cmd_alias_assign(s, ctx.self_param) => Ok(vec![]),
         // `p = &players[mthing->type-1];` (`P_SpawnPlayer`) -- discarded
         // entirely, the statement-skip half of `players_index_alias`'s own
         // three-part design (decl-skip, statement-skip, bare-`Ident`-read
@@ -6648,6 +6716,26 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             };
             let (base_text, _) = render_expr(base, ctx)?;
             let field = rust_field_name(lhs_field)?;
+            // `player->mo->angle += (cmd->angleturn<<16);` (`P_MovePlayer`)
+            // -- `Mobj.angle: u32` (`struct_fields.rs`), while the widened
+            // shift on the RHS is genuinely `i32`-valued (the same "usual
+            // arithmetic conversions" reasoning the `angleturn`-widen arm
+            // itself already needed) -- `u32 += i32` doesn't compile in
+            // Rust, the identical gap `lhs_is_u32_self_field` already
+            // closes for a *self*-struct `u32` field's own compound
+            // assignment, just needing the same `as u32` wrap at this
+            // different (`player.mo`-mediated) write site instead. Scoped
+            // to the *exact* `angleturn<<16` RHS shape, not just `field ==
+            // "angle"` -- confirmed a real regression first, not assumed:
+            // `A_Saw`'s own already-shipped `player->mo->angle -=
+            // ANG90/20;` also writes through this same arm, but `ANG90/20`
+            // is already `u32`-valued (`ANG90` an opaque `u32` constant
+            // divided by a literal), so a blanket "every compound write to
+            // `angle`" wrap would have added a redundant, test-breaking
+            // cast there.
+            let needs_u32_wrap = *op != AssignOp::Assign
+                && matches!(rhs.as_ref(), Expr::Binary { op: BinaryOp::Shl, lhs: shl_lhs, .. }
+                    if matches!(shl_lhs.as_ref(), Expr::Member { field, .. } if field == "angleturn"));
             if expr_has_other_target_deref(
                 rhs,
                 ctx.self_param,
@@ -6656,6 +6744,11 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 None,
             ) {
                 let rhs_text = render_expr(rhs, ctx)?.0;
+                let rhs_text = if needs_u32_wrap {
+                    format!("({rhs_text}) as u32")
+                } else {
+                    rhs_text
+                };
                 return Ok(format!(
                     "let __rhs = {rhs_text}; if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} __rhs; }}",
                     render_assign_op(*op)
@@ -6666,6 +6759,11 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                 ..*ctx
             };
             let rhs_text = render_expr(rhs, &rhs_ctx)?.0;
+            let rhs_text = if needs_u32_wrap {
+                format!("({rhs_text}) as u32")
+            } else {
+                rhs_text
+            };
             return Ok(format!(
                 "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {} {rhs_text}; }}",
                 render_assign_op(*op)
@@ -8187,6 +8285,9 @@ fn render_fn_impl_with_two_scalar_params(
     // `mthing = &mobj->spawnpoint;` (`P_NightmareRespawn`) -- see
     // `collect_spawnpoint_alias`'s own doc comment.
     extra_cross_ref_idents.extend(collect_spawnpoint_alias(&f.body.items, &param_name));
+    // `cmd = &player->cmd;` (`P_MovePlayer`/`P_PlayerThink`, `p_user.c`)
+    // -- see `collect_cmd_alias`'s own doc comment.
+    extra_cross_ref_idents.extend(collect_cmd_alias(&f.body.items, &param_name));
     // `linetarget` (`p_local.h`'s own `extern mobj_t* linetarget;`) --
     // `render_weapon_fn`'s own idiom (`A_Punch`/`A_Saw`), needed here too
     // now that a plain `mobj_t*`-self action function references it
@@ -9377,6 +9478,95 @@ fn is_spawnpoint_alias_assign(s: &Stmt, self_param: &str) -> bool {
     matches!(rhs.as_ref(), Expr::Unary { op: UnaryOp::AddrOf, expr }
         if matches!(expr.as_ref(), Expr::Member { base, field, .. }
             if field == "spawnpoint" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
+}
+
+/// `collect_spawnpoint_alias`'s own sibling, for `ticcmd_t* cmd; cmd =
+/// &player->cmd;` (`P_MovePlayer`/`P_PlayerThink`, `p_user.c`) instead of
+/// `mobj->spawnpoint`. `player.cmd: TicCmd` (`struct_fields.rs`) is the
+/// identical shape -- a small, plain value struct embedded directly in
+/// the self-struct, not `Arena`-managed -- so the same "never a real Rust
+/// binding, marker in `extra_cross_ref_idents`" treatment applies for the
+/// identical reason: a real `&player.cmd` reference alias held in a
+/// separate local keeps `player` borrowed for the rest of the function, a
+/// real `rustc` `E0502` the moment a later statement needs `&mut player`
+/// again (`P_Thrust(player, ..)`, confirmed by compiling the naive
+/// version first, not assumed). Registered `"CmdAlias"` instead of
+/// `"SpawnpointAlias"` so the two markers can never be confused at a read
+/// site. Unlike `spawnpoint` (read-only everywhere it's aliased),
+/// `P_PlayerThink`'s own `cmd->angleturn = 0;` branch *writes* through
+/// this alias -- resolving straight to `player.cmd.field` (a plain,
+/// ordinary self-struct field, no `Handle`/`Arena` involved at all) means
+/// an ordinary assignment needs no special write-side arm of its own: the
+/// generic `Expr::Assign` fallback already renders its `lhs` through this
+/// same `render_expr` `Member` arm, giving a real, correctly-propagating
+/// `player.cmd.angleturn = 0;` for free.
+fn collect_cmd_alias(items: &[BlockItem], self_param: &str) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    collect_cmd_alias_in(items, self_param, &mut aliases);
+    aliases
+}
+
+fn collect_cmd_alias_in(
+    items: &[BlockItem],
+    self_param: &str,
+    aliases: &mut HashMap<String, String>,
+) {
+    for item in items {
+        if let BlockItem::Stmt(s) = item {
+            collect_cmd_alias_stmt(s, self_param, aliases);
+        }
+    }
+}
+
+fn collect_cmd_alias_stmt(s: &Stmt, self_param: &str, aliases: &mut HashMap<String, String>) {
+    if is_cmd_alias_assign(s, self_param)
+        && let Stmt::Expr(Some(Expr::Assign { lhs, .. })) = s
+        && let Expr::Ident(name) = lhs.as_ref()
+    {
+        aliases.insert(name.clone(), "CmdAlias".to_string());
+    }
+    match s {
+        Stmt::Compound(c) => collect_cmd_alias_in(&c.items, self_param, aliases),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_cmd_alias_stmt(then_branch, self_param, aliases);
+            if let Some(eb) = else_branch {
+                collect_cmd_alias_stmt(eb, self_param, aliases);
+            }
+        }
+        Stmt::Switch { body, .. } => collect_cmd_alias_stmt(body, self_param, aliases),
+        Stmt::Case { stmt, .. } => collect_cmd_alias_stmt(stmt, self_param, aliases),
+        Stmt::Default(stmt) => collect_cmd_alias_stmt(stmt, self_param, aliases),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            collect_cmd_alias_stmt(body, self_param, aliases)
+        }
+        Stmt::For { body, .. } => collect_cmd_alias_stmt(body, self_param, aliases),
+        _ => {}
+    }
+}
+
+/// Whether `s` is exactly `IDENT = &{self_param}->cmd;` -- shared by
+/// `collect_cmd_alias_stmt` (to register the alias) and `render_stmt` (to
+/// discard the statement itself once registered), the same shared-guard
+/// discipline `is_spawnpoint_alias_assign` already established.
+fn is_cmd_alias_assign(s: &Stmt, self_param: &str) -> bool {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+    else {
+        return false;
+    };
+    if !matches!(lhs.as_ref(), Expr::Ident(_)) {
+        return false;
+    }
+    matches!(rhs.as_ref(), Expr::Unary { op: UnaryOp::AddrOf, expr }
+        if matches!(expr.as_ref(), Expr::Member { base, field, .. }
+            if field == "cmd" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
 }
 
 /// Whether `s` is exactly `IDENT = &players[EXPR];` (`P_SpawnPlayer`'s own
@@ -22337,6 +22527,87 @@ pub fn P_CalcHeight(player: &mut Player, world: &mut World, thinkers: &Arena<Thi
     player.viewz = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } + player.viewheight + bob;
     if player.viewz > match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT {
         player.viewz = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.ceilingz, _ => unreachable!() } - 4 * FRACUNIT;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_MovePlayer` (`p_user.c`) -- round 32's own fresh-sweep pickup:
+    /// blocked in round 12/13's own read purely because its three real
+    /// callees (`P_Thrust`/`P_CalcHeight`/`P_MovePsprites`) weren't
+    /// translated yet at the time, all three landed since (rounds 12/13
+    /// themselves and round 21) -- re-verified rather than trusted, and a
+    /// real render attempt confirms nothing else stands in the way. One
+    /// genuinely new mechanism, found only by actually compiling the
+    /// naive translation first: `cmd = &player->cmd;` (`TicCmd`, a small
+    /// plain value struct embedded directly in `Player`, `struct_fields.rs`)
+    /// can't become a real Rust reference alias the way `psp = &player->
+    /// psprites[position]` does for a *mutable* array element -- a live
+    /// `&player.cmd` borrow would keep `player` borrowed for the rest of
+    /// the function, conflicting with this function's own later `P_Thrust
+    /// (player, ..)` calls (confirmed a real `rustc` `E0502`, not assumed).
+    /// Fixed the same "never a real Rust binding" way `collect_spawnpoint_
+    /// alias` already handles `mthing = &mobj->spawnpoint;`: a new sibling,
+    /// `collect_cmd_alias`, registers `"CmdAlias"` into `extra_cross_ref_
+    /// idents`, and `cmd`'s own declaration/assignment are both discarded
+    /// while every `cmd->field` reference (read *or*, via the ordinary
+    /// `Expr::Assign` fallback's own `render_expr(lhs, ..)` call, write --
+    /// `P_PlayerThink`'s own `cmd->angleturn = 0;` branch needs this)
+    /// resolves straight through to `player.cmd.field` instead. Two more
+    /// real, narrowly-scoped gaps, both confirmed by a genuine `rustc`
+    /// rejection on the naive translation first: (1) `cmd->angleturn<<16`
+    /// -- `TicCmd.angleturn: i16` -- needs the identical `i16`-widen-
+    /// before-shift treatment the `FRACBITS`/`MF_TRANSSHIFT` arms already
+    /// established (`attempt to shift left ... which would overflow`, a
+    /// plain `i16` has no bit 16 to shift into), plus the compound
+    /// assignment it feeds (`player->mo->angle += ..`, `Mobj.angle: u32`)
+    /// needs the same `as u32` wrap `lhs_is_u32_self_field` already gives
+    /// a *self*-struct `u32` field's own compound write, just at the
+    /// `player.mo`-mediated write site instead (`u32 += i32` doesn't
+    /// compile). (2) `cmd->forwardmove*2048`/`cmd->sidemove*2048` --
+    /// `TicCmd.forwardmove`/`.sidemove: i8` (from C's plain `char`), the
+    /// first real corpus `i8` arithmetic this renderer has hit -- C
+    /// promotes `char` to `int` before any arithmetic (the same reasoning
+    /// the `i16` shift arms rely on), but Rust infers `2048`'s type from
+    /// the `i8` operand it's multiplied against and rejects it outright
+    /// (`literal out of range for i8`), so the widen has to happen first
+    /// here too. Both new arms scoped by exact field name, the same
+    /// "hand-match the one real shape" style `angleturn`/`MF_TRANSSHIFT`
+    /// already use. Everything else renders through fully generic,
+    /// already-shipped machinery: `onground` (the `World`-global by-name
+    /// list), `player->mo->z <= player->mo->floorz` (ordinary cross-handle
+    /// reads), `P_Thrust`/`P_SetMobjState` (opaque forward-referenced
+    /// calls, the latter through `state_index(..) == S_PLAY` and
+    /// `Arena::take_out`, both already-shipped). Verified compiling for
+    /// real (`rustc --edition 2021 --crate-type bin`) against a hand-
+    /// written `Player`/`TicCmd`/`Mobj`/`World`/`Handle`/`Arena`/`Thinker`/
+    /// `FixedT` stand-in (a real, non-derived `Handle<T>` `Copy`/`Clone`/
+    /// `PartialEq` impl, avoiding the known `#[derive(Copy)]`-on-a-generic
+    /// pitfall) and stub `P_Thrust`/`P_SetMobjState`/`state_index` -- zero
+    /// errors.
+    #[test]
+    fn test_p_move_player_renders_exactly() {
+        let field_types = field_types(&[("mo", "Option<Handle<Thinker>>"), ("cmd", "TicCmd")]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_user.c",
+            "P_MovePlayer",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_MovePlayer(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.angle += (((player.cmd.angleturn) as i32) << 16) as u32; };
+    world.onground = match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } <= match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.floorz, _ => unreachable!() };
+    if player.cmd.forwardmove != 0 && world.onground {
+        P_Thrust(player, match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() }, ((player.cmd.forwardmove) as i32) * 2048);
+    }
+    if player.cmd.sidemove != 0 && world.onground {
+        P_Thrust(player, match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.angle, _ => unreachable!() } - ANG90, ((player.cmd.sidemove) as i32) * 2048);
+    }
+    if (player.cmd.forwardmove != 0 || player.cmd.sidemove != 0) && state_index(match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == S_PLAY {
+        thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_RUN1, world, h, a); } });
     }
 }";
         assert_eq!(rendered, expected);
