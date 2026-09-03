@@ -7360,6 +7360,42 @@ pub fn render_fn_with_two_scalar_params(
     )
 }
 
+/// `render_fn_with_two_scalar_params`'s own twin for `mobj_t* P_SpawnMissile
+/// (mobj_t* source, mobj_t* dest, mobjtype_t type)` (`p_mobj.c`) -- the
+/// first real corpus function needing a genuine second `mobj_t*` receiver
+/// (`dest`, rendered `Option<Handle<Thinker>>` since every real call site
+/// passes a bare `Option`-typed value like `actor->target`) alongside its
+/// own `mobjtype_t`-typed third parameter (a plain macro-constant scalar,
+/// `"i32"`, the same treatment `MT_ARACHPLAZ`/etc. already get as bare
+/// idents elsewhere) and a real `mobj_t*` return value (the freshly spawned
+/// missile, `"Handle<Thinker>"` -- see `collect_spawn_mobj_locals`'s own
+/// doc comment for why a `P_SpawnMobj`-sourced local is always trusted
+/// bare, never `Option`-wrapped). `render_fn_impl_with_two_scalar_params`'s
+/// own `scalar_param_type` slot already accepts an arbitrary Rust type
+/// string, so passing the sentinel `"Option<Handle<Thinker>>"` through it
+/// (rather than threading a wholly new parameter kind through every layer)
+/// unlocks the one genuinely new piece this needed: registering that
+/// parameter's own name into `extra_cross_ref_idents`, right where
+/// `scalar_param` itself is already computed.
+pub fn render_fn_with_handle_param(
+    corpus_dir: &Path,
+    file: &str,
+    fn_name: &str,
+    self_rust_type: &str,
+    self_field_types: &HashMap<String, String>,
+) -> Result<String, String> {
+    render_fn_impl_with_two_scalar_params(
+        corpus_dir,
+        file,
+        fn_name,
+        self_rust_type,
+        self_field_types,
+        Some("Handle<Thinker>"),
+        Some("Option<Handle<Thinker>>"),
+        Some("i32"),
+    )
+}
+
 /// `render_fn`'s own `boolean`-returning twin -- `P_CheckMeleeRange`/
 /// `P_CheckMissileRange` (`p_enemy.c`) are `boolean P_Check...(mobj_t*
 /// actor)`, the same single-self-struct-parameter shape `render_fn`
@@ -7522,6 +7558,29 @@ fn render_fn_impl_with_two_scalar_params(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone())),
     );
+    // `P_SpawnMissile(mobj_t* source, mobj_t* dest, mobjtype_t type)`'s own
+    // second parameter (`dest`) -- a genuinely new second-parameter shape:
+    // not a plain scalar (`scalar_param_type`'s own established use, always
+    // rendered as opaque identifier text with no cross-reference awareness)
+    // but a real second `mobj_t*` receiver, always passed at every existing
+    // call site (`A_BspiAttack`'s own already-shipped `P_SpawnMissile(actor,
+    // actor.target, MT_ARACHPLAZ)`) as a bare `Option<Handle<Thinker>>`
+    // value. Reusing `scalar_param_type`'s own slot with the sentinel type
+    // string `"Option<Handle<Thinker>>"` (`render_fn_with_handle_param`'s
+    // own thin wrapper) needs no new parameter-threading at all for the
+    // *signature* text (`scalar_part`'s own generic `{ty}` formatting
+    // already renders it correctly) -- only registering the name into
+    // `extra_cross_ref_idents` here is new, which then makes every already-
+    // generic `Option<Handle<Thinker>>`-aware rendering site (`is_target_
+    // tracer_typed`'s own bare-`Ident` arm, `needs_target_deref`/`needs_
+    // target_write`) treat a bare `dest` reference exactly the way it
+    // already treats `linetarget`/`corpsehit` -- no dedicated `dest`-shaped
+    // code anywhere else.
+    if scalar_param_type == Some("Option<Handle<Thinker>>")
+        && let Some((name, _)) = &scalar_param
+    {
+        extra_cross_ref_idents.insert(name.clone(), "Option<Handle<Thinker>>".to_string());
+    }
     // `ss = R_PointInSubsector(x,y);` (`P_NightmareRespawn`) -- see
     // `collect_subsector_locals`'s own doc comment.
     extra_cross_ref_idents.extend(collect_subsector_locals(&f.body.items));
@@ -17161,6 +17220,99 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              if !P_TryMove(th, th.x, th.y) {\n        \
              P_ExplodeMissile(th);\n    \
              }\n\
+             }"
+        );
+    }
+
+    /// `P_SpawnMissile` (`p_mobj.c`) -- the first real corpus function
+    /// needing a genuine *second* `mobj_t*` receiver (`dest`) alongside its
+    /// own self-shaped first parameter (`source`), and the first with a
+    /// real `mobj_t*` return value (the freshly spawned missile itself).
+    /// New `render_fn_with_handle_param` wrapper (see its own doc comment)
+    /// supplies both: `dest` renders `Option<Handle<Thinker>>` (every real
+    /// call site -- `A_BspiAttack`'s own already-shipped `P_SpawnMissile
+    /// (actor, actor->target, MT_ARACHPLAZ)` -- passes a bare `Option`-typed
+    /// value) and needs *no* new rendering code at all: `is_target_tracer_
+    /// typed`'s own bare-`Ident` arm already treats any name registered
+    /// `Option<Handle<Thinker>>` in `extra_cross_ref_idents` uniformly,
+    /// whether it's a self-field alias (`linetarget`) or, for the first
+    /// time, a genuine second function parameter. `th->target = source;`
+    /// (storing the function's own receiver as a value into the freshly-
+    /// spawned `th`) reuses `A_VileTarget`'s own exact `needs_self_handle_
+    /// value` mechanism unchanged. `th->info->seesound`/`th->info->speed`
+    /// (a *spawned-local* `Handle<Thinker>` dereferenced two `Member`
+    /// levels deep, unlike every earlier `th->field` example which only
+    /// ever went one level) needed no new code either -- the existing
+    /// recursive `Member`-base rendering already produces `match thinkers.
+    /// get(th) {{ Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }}
+    /// .seesound`, valid Rust as a sub-expression. `mobjinfo_t.speed` maps
+    /// to plain `i32` (`struct_fields.rs`'s own corpus-verified mapping,
+    /// confirmed by direct read -- every field of `mobjinfo_t` is a bare
+    /// `int` in the corpus, deliberately *not* upgraded to `FixedT` despite
+    /// the name), so `dist = dist / th->info->speed;` (`dist` a plain `int`
+    /// local, unlike `A_Tracer`'s own genuinely `fixed_t`-declared `dist`)
+    /// is ordinary `i32` division needing no new runtime arithmetic, and
+    /// `FixedMul(th->info->speed, finecosine[an])` reuses the already-
+    /// shipped `Mul<i32, FixedT>`-shaped `FixedMul` overload `A_Tracer`/
+    /// `A_SkullAttack` already established for the identical `mobjinfo_t.
+    /// speed` argument. `source->z + 4*8*FRACUNIT` needed the already-
+    /// shipped `Add<i32> for FixedT` (`A_BrainExplode`'s own addition).
+    /// Verified compiling for real (`rustc --edition 2021 --crate-type
+    /// lib`) against hand-written stand-in `World`/`Thinker`/`Mobj`/
+    /// `MobjInfo`/`Arena`/`Handle`/`FixedT` shapes (a manual `Handle<T>:
+    /// Copy`/`Clone` impl, not `#[derive(..)]` -- deriving would wrongly
+    /// require `T: Copy`, and `Thinker` itself isn't) and stub `P_SpawnMobj`/
+    /// `S_StartSound`/`R_PointToAngle2`/`P_AproxDistance`/`FixedMul`/
+    /// `P_Random`/`P_CheckMissileSpawn` functions -- zero errors.
+    #[test]
+    fn test_p_spawn_missile_renders_exactly() {
+        let field_types = field_types(&[
+            ("x", "FixedT"),
+            ("y", "FixedT"),
+            ("z", "FixedT"),
+            ("momx", "FixedT"),
+            ("momy", "FixedT"),
+            ("momz", "FixedT"),
+            ("angle", "u32"),
+            ("target", "Option<Handle<Thinker>>"),
+            ("flags", "i32"),
+            ("info", "&'static MobjInfo"),
+        ]);
+        let rendered = render_fn_with_handle_param(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_SpawnMissile",
+            "Mobj",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_SpawnMissile(source: &mut Mobj, dest: Option<Handle<Thinker>>, r#type: i32, world: &mut World, thinkers: &mut Arena<Thinker>, handle: Handle<Thinker>) -> Handle<Thinker> {\n    \
+             let mut th;\n    \
+             let mut an;\n    \
+             let mut dist;\n    \
+             th = P_SpawnMobj(source.x, source.y, source.z + 4 * 8 * FRACUNIT, r#type);\n    \
+             if match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.seesound != 0 {\n        \
+             S_StartSound(th, match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.seesound);\n    \
+             }\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.target = Some(handle); };\n    \
+             an = R_PointToAngle2(source.x, source.y, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });\n    \
+             if (match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_SHADOW) != 0 {\n        \
+             an += (P_Random() - P_Random() << 20) as u32;\n    \
+             }\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.angle = an; };\n    \
+             an >>= (ANGLETOFINESHIFT) as u32;\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momx = FixedMul(m.info.speed, finecosine[an as usize]); };\n    \
+             if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momy = FixedMul(m.info.speed, finesine[an as usize]); };\n    \
+             dist = (P_AproxDistance(match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() } - source.x, match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() } - source.y)).0;\n    \
+             dist = dist / match thinkers.get(th) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.speed;\n    \
+             if dist < 1 {\n        \
+             dist = 1;\n    \
+             }\n    \
+             let __rhs = (match thinkers.get(dest.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } - source.z) / dist; if let Some(Thinker::Mobj(m)) = thinkers.get_mut(th) { m.momz = __rhs; };\n    \
+             P_CheckMissileSpawn(th);\n    \
+             return th;\n\
              }"
         );
     }
