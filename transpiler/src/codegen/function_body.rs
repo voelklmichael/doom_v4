@@ -3556,6 +3556,26 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "twoSided") => {
             Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
         }
+        // `if (EV_DoDoor(line,normal))`/`if (EV_BuildStairs(line,build8))`
+        // and friends (`P_UseSpecialLine`, `p_switch.c`) -- `twoSided`'s own
+        // sibling shape, a bare (non-negated) call result used for
+        // truthiness, but this time the whole seven-function `EV_*` family
+        // every `line->special` switch arm dispatches to
+        // (`EV_DoDoor`/`EV_DoFloor`/`EV_DoPlat`/`EV_DoCeiling`/
+        // `EV_DoLockedDoor`/`EV_BuildStairs`/`EV_DoDonut`), each corpus-
+        // verified `int`-returning (`p_spec.h`'s own prototypes, not
+        // `boolean`) rather than one single name. `EV_BuildStairs`/
+        // `EV_DoDonut` join the list on equal footing with the other five,
+        // already-shipped ones: a *call site* reaching either only needs
+        // its name and this truthiness shape, not a real translated body
+        // behind it -- the same "opaque forward reference" treatment every
+        // other not-yet-shipped callee in this module already gets (e.g.
+        // `P_DamageMobj`'s own `P_KillMobj(source, target);`), so neither
+        // one's own genuine original-game UB (round 26/27's finding, still
+        // blocking *their* translation) blocks *this* caller at all.
+        Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n) if n == "EV_DoDoor" || n == "EV_DoFloor" || n == "EV_DoPlat" || n == "EV_DoCeiling" || n == "EV_DoLockedDoor" || n == "EV_BuildStairs" || n == "EV_DoDonut") => {
+            Ok(format!("{} != 0", render_expr(cond, ctx)?.0))
+        }
         // `if (P_CheckMeleeRange (actor))` (`A_TroopAttack` and several
         // other melee-attack action functions) -- unlike `twoSided`,
         // `P_CheckMeleeRange`/`P_CheckSight`'s own real corpus
@@ -22490,6 +22510,361 @@ pub fn P_DamageMobj(target: Handle<Thinker>, inflictor: Option<Handle<Thinker>>,
             thinkers.take_out(target, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, m.info.seestate, world, h, a); } });
         }
     }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_UseSpecialLine` (`p_switch.c`) -- round 26/27's own flagged
+    /// future target, ~65 real (non-comment) lines dispatching a ~35-arm
+    /// `switch (line->special)` to a mix of already-shipped `EV_*`
+    /// functions and opaque forward references, corpus-read in full
+    /// before starting (not trusted from any earlier round's summary).
+    /// `render_trigger_fn` fits with **zero new parameter-shape
+    /// mechanism** -- `thing: Handle<Thinker>`/`line: LineId`/`side: i32`
+    /// are three more `param_types` entries, the identical "independent,
+    /// non-`self` parameters" shape `P_KillMobj`/`P_DamageMobj` already
+    /// proved. The one genuinely new piece: a bare (non-negated) call to
+    /// one of the seven `EV_*` functions this switch dispatches to
+    /// (`EV_DoDoor`/`EV_DoFloor`/`EV_DoPlat`/`EV_DoCeiling`/
+    /// `EV_DoLockedDoor`/`EV_BuildStairs`/`EV_DoDonut`) used for
+    /// truthiness (`if (EV_DoDoor(line,normal)) P_ChangeSwitchTexture
+    /// (line,0);`) -- `twoSided`'s own sibling shape, all seven corpus-
+    /// verified `int`-returning (`p_spec.h`), needing the identical
+    /// `!= 0` cast, added as a new `render_bool_expr` arm. Two of the
+    /// seven (`EV_BuildStairs`/`EV_DoDonut`) are still genuinely blocked
+    /// from ever getting their *own* body translated (round 26/27's
+    /// real original-game-UB finding, unchanged) -- but a *call site*
+    /// reaching either needs only the callee's name and this truthiness
+    /// shape, the same opaque-forward-reference treatment every other
+    /// not-yet-shipped callee in this function already gets
+    /// (`P_ChangeSwitchTexture`/`G_ExitLevel`/`G_SecretExitLevel`/
+    /// `EV_LightTurnOn`, none of them shipped either), so neither
+    /// blocks this function at all -- confirmed by actually rendering
+    /// and compiling the whole thing, not assumed safe.
+    ///
+    /// Everything else needed zero new code. The three top-level
+    /// pieces -- `if (side) { switch(line->special) { case 124: break;
+    /// default: return false; } }`, `if (!thing->player) { if
+    /// (line->flags & ML_SECRET) return false; switch(line->special)
+    /// { case 1/32/33/34: break; default: return false; } }`, then the
+    /// real ~35-arm dispatch switch, `return true;` at the end -- are
+    /// all already-generic machinery: `!thing->player` is the exact
+    /// `is_option_valued`'s unconditional `field == "player"` arm
+    /// combined with the `Handle<Thinker>`-cross-ref `Expr::Member`
+    /// rendering `EV_VerticalDoor`'s own identical re-check already
+    /// proved; `line->flags & ML_SECRET` is a bare non-comparison
+    /// `Binary` in truthiness position, the already-shipped `(...) !=
+    /// 0` fallback (`ML_SECRET` itself an opaque pass-through macro
+    /// name, `ML_TWOSIDED`'s own precedent); every `switch(line->
+    /// special)` -- all three of them, including shared-case-label
+    /// groups (`case 133: case 135: case 137:`) and a `default: return
+    /// false; break;` arm -- is `EV_VerticalDoor`'s/`A_Scream`'s own
+    /// already-proven shared-case and unconditional-`return`-arm
+    /// machinery; `EV_VerticalDoor(line,thing)`/`EV_DoLockedDoor(line,
+    /// blazeOpen,thing)` reuse their own already-shipped signatures
+    /// verbatim; the plat/door/floor/stair/ceiling enum constants
+    /// (`normal`/`close`/`open`/`blazeRaise`/`raiseAndChange`/
+    /// `build8`/`turbo16`/etc.) are bare bare-passthrough `Expr::Ident`
+    /// text, the same "enums are opaque `i32` constants" convention
+    /// this project decided at the very start; `P_ChangeSwitchTexture`/
+    /// `G_ExitLevel`/`G_SecretExitLevel`/`EV_LightTurnOn` all render as
+    /// plain opaque forward-referenced calls, the same documented
+    /// cross-function-signature gap every earlier round's own forward
+    /// references already carry. Compile-verified for real (`rustc
+    /// --edition 2021 --crate-type lib`) against a hand-written
+    /// `Line`/`Mobj`/`World`/`Handle`/`Arena`/`Thinker`/`LineId`
+    /// stand-in, including stub definitions for every opaque callee
+    /// (`EV_BuildStairs`/`EV_DoDonut` included) -- zero errors.
+    /// `test_p_use_special_line_renders_exactly` (new). 493 -> 494
+    /// tests passing, pushed.
+    #[test]
+    fn test_p_use_special_line_renders_exactly() {
+        let params = field_types(&[
+            ("thing", "Handle<Thinker>"),
+            ("line", "LineId"),
+            ("side", "i32"),
+        ]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_switch.c",
+            "P_UseSpecialLine",
+            &params,
+            &HashMap::new(),
+            None,
+            Some("bool"),
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_UseSpecialLine(thing: Handle<Thinker>, line: LineId, side: i32, world: &mut World, thinkers: &mut Arena<Thinker>) -> bool {
+    if side != 0 {
+        match world[line].special {
+            124 => {
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+    if match thinkers.get(thing) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_none() {
+        if (world[line].flags & ML_SECRET) != 0 {
+            return false;
+        }
+        match world[line].special {
+            1 | 32 | 33 | 34 => {
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+    match world[line].special {
+        1 | 26 | 27 | 28 | 31 | 32 | 33 | 34 | 117 | 118 => {
+            EV_VerticalDoor(line, thing);
+        }
+        7 => {
+            if EV_BuildStairs(line, build8) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        9 => {
+            if EV_DoDonut(line) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        11 => {
+            P_ChangeSwitchTexture(line, 0);
+            G_ExitLevel();
+        }
+        14 => {
+            if EV_DoPlat(line, raiseAndChange, 32) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        15 => {
+            if EV_DoPlat(line, raiseAndChange, 24) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        18 => {
+            if EV_DoFloor(line, raiseFloorToNearest) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        20 => {
+            if EV_DoPlat(line, raiseToNearestAndChange, 0) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        21 => {
+            if EV_DoPlat(line, downWaitUpStay, 0) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        23 => {
+            if EV_DoFloor(line, lowerFloorToLowest) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        29 => {
+            if EV_DoDoor(line, normal) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        41 => {
+            if EV_DoCeiling(line, lowerToFloor) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        71 => {
+            if EV_DoFloor(line, turboLower) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        49 => {
+            if EV_DoCeiling(line, crushAndRaise) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        50 => {
+            if EV_DoDoor(line, close) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        51 => {
+            P_ChangeSwitchTexture(line, 0);
+            G_SecretExitLevel();
+        }
+        55 => {
+            if EV_DoFloor(line, raiseFloorCrush) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        101 => {
+            if EV_DoFloor(line, raiseFloor) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        102 => {
+            if EV_DoFloor(line, lowerFloor) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        103 => {
+            if EV_DoDoor(line, open) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        111 => {
+            if EV_DoDoor(line, blazeRaise) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        112 => {
+            if EV_DoDoor(line, blazeOpen) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        113 => {
+            if EV_DoDoor(line, blazeClose) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        122 => {
+            if EV_DoPlat(line, blazeDWUS, 0) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        127 => {
+            if EV_BuildStairs(line, turbo16) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        131 => {
+            if EV_DoFloor(line, raiseFloorTurbo) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        133 | 135 | 137 => {
+            if EV_DoLockedDoor(line, blazeOpen, thing) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        140 => {
+            if EV_DoFloor(line, raiseFloor512) != 0 {
+                P_ChangeSwitchTexture(line, 0);
+            }
+        }
+        42 => {
+            if EV_DoDoor(line, close) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        43 => {
+            if EV_DoCeiling(line, lowerToFloor) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        45 => {
+            if EV_DoFloor(line, lowerFloor) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        60 => {
+            if EV_DoFloor(line, lowerFloorToLowest) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        61 => {
+            if EV_DoDoor(line, open) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        62 => {
+            if EV_DoPlat(line, downWaitUpStay, 1) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        63 => {
+            if EV_DoDoor(line, normal) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        64 => {
+            if EV_DoFloor(line, raiseFloor) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        66 => {
+            if EV_DoPlat(line, raiseAndChange, 24) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        67 => {
+            if EV_DoPlat(line, raiseAndChange, 32) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        65 => {
+            if EV_DoFloor(line, raiseFloorCrush) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        68 => {
+            if EV_DoPlat(line, raiseToNearestAndChange, 0) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        69 => {
+            if EV_DoFloor(line, raiseFloorToNearest) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        70 => {
+            if EV_DoFloor(line, turboLower) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        114 => {
+            if EV_DoDoor(line, blazeRaise) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        115 => {
+            if EV_DoDoor(line, blazeOpen) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        116 => {
+            if EV_DoDoor(line, blazeClose) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        123 => {
+            if EV_DoPlat(line, blazeDWUS, 0) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        132 => {
+            if EV_DoFloor(line, raiseFloorTurbo) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        99 | 134 | 136 => {
+            if EV_DoLockedDoor(line, blazeOpen, thing) != 0 {
+                P_ChangeSwitchTexture(line, 1);
+            }
+        }
+        138 => {
+            EV_LightTurnOn(line, 255);
+            P_ChangeSwitchTexture(line, 1);
+        }
+        139 => {
+            EV_LightTurnOn(line, 35);
+            P_ChangeSwitchTexture(line, 1);
+        }
+        _ => {}
+    }
+    return true;
 }";
         assert_eq!(rendered, expected);
     }
