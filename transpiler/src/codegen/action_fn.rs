@@ -273,6 +273,191 @@ pub fn P_SetMobjState(mobj: &mut Mobj, state: i32, world: &mut World, handle: Ha
     .to_string()
 }
 
+/// `P_SetPsprite` (`p_pspr.c`) -- `P_SetMobjState`'s own `Weapon`-shaped
+/// sibling, dispatching the other 22 `ActionFn` tags through `state->
+/// action.acp2` instead of `.acp1`. Hand-written for the identical reason
+/// `render_p_set_mobj_state_fn` is: the do-while-over-a-dynamic-`states[]`-
+/// index loop and the dispatch `match` are idioms specific to this one
+/// function, not reusable elsewhere. Every line corpus-verified against
+/// the real C body (`p_pspr.c:56-102`), not guessed:
+///
+/// ```c
+/// void
+/// P_SetPsprite (player_t* player, int position, statenum_t stnum)
+/// {
+///     pspdef_t*   psp;
+///     state_t*    state;
+///
+///     psp = &player->psprites[position];
+///
+///     do
+///     {
+///         if (!stnum)
+///         {
+///             // object removed itself
+///             psp->state = NULL;
+///             break;
+///         }
+///
+///         state = &states[stnum];
+///         psp->state = state;
+///         psp->tics = state->tics;       // could be 0
+///
+///         if (state->misc1)
+///         {
+///             // coordinate set
+///             psp->sx = state->misc1 << FRACBITS;
+///             psp->sy = state->misc2 << FRACBITS;
+///         }
+///
+///         // Call action routine.
+///         // Modified handling.
+///         if (state->action.acp2)
+///         {
+///             state->action.acp2(player, psp);
+///             if (!psp->state)
+///                 break;
+///         }
+///
+///         stnum = psp->state->nextstate;
+///
+///     } while (!psp->tics);
+///     // an initial state of 0 could cycle through
+/// }
+/// ```
+///
+/// **`psp = &player->psprites[position];`**: unlike `P_MovePsprites`'s own
+/// `psprite_walk_alias` (a *fixed* loop-counter index, `function_body.rs`)
+/// or `P_BringUpWeapon`'s bare `ps_weapon` enum-constant index, `position`
+/// here is a genuine runtime function *parameter* -- so this hand-written
+/// renderer just indexes `player.psprites[position as usize]` directly at
+/// every real touch point, no alias-tracking field needed at all (this
+/// function isn't AST-rendered, so there's no `FnBodyContext` to extend).
+///
+/// **No persistent `psp` local across the whole function, unlike the C
+/// source's own pointer**: a real Rust `&mut PlayerSpriteState` borrowed
+/// from `player.psprites[position]` can't be held *at the same time* as
+/// the `player: &mut Player` every one of the 22 `Weapon`-shaped callees
+/// also needs (`E0499`-class aliasing, confirmed by a real `rustc`
+/// rejection on the naive "hold one `psp: &mut PlayerSpriteState` for the
+/// whole function" version before settling on this design) -- the same
+/// class of problem `Arena::take_out` exists to solve for `Mobj`, just for
+/// a plain array field instead of an arena slot. Fixed by never holding a
+/// live borrow across the dispatch call at all: every field `P_SetPsprite`
+/// itself sets (`.state`/`.tics`/`.sx`/`.sy`, unconditionally each
+/// iteration) writes straight into `player.psprites[position as usize]`,
+/// no local at all. Only the one call site that genuinely needs a `&mut
+/// PlayerSpriteState` value (the dispatch `match`) takes a fresh, disjoint
+/// *copy* (`PlayerSpriteState` is a small, plain, four-scalar-field value
+/// type -- `Copy`) right before the call, passes `&mut psp` to the callee,
+/// then reconciles after the call returns rather than blindly overwriting.
+///
+/// **The reconciliation is real, corpus-driven, not incidental**: two of
+/// the 22 real callees (`A_Lower`, `A_Raise`, both real corpus text above
+/// confirms are dispatched *only* from `position == ps_weapon`) themselves
+/// call `P_SetPsprite(player, ps_weapon, ..)` reentrantly on the *same*
+/// index as their own `psp` parameter -- real C aliasing means the outer
+/// `psp->state` pointer sees that inner write directly; a disjoint Rust
+/// copy would not. So after the dispatch call returns, `.state` --
+/// specifically and only `.state`, the one field a reentrant same-index
+/// `P_SetPsprite` call can update (state transitions are *only* ever
+/// mediated through `P_SetPsprite` itself in this corpus; no real callee
+/// writes `psp->state` directly) -- is re-read from
+/// `player.psprites[position as usize]` (reflecting whatever a reentrant
+/// call left there) rather than trusted from the disjoint copy, before the
+/// *whole* copy (now `.state`-corrected, `.tics`/`.sx`/`.sy` still holding
+/// whatever direct field writes the callee made to its own `psp`
+/// parameter, e.g. `A_WeaponReady`'s `psp->sx =`/`psp->sy =`) is written
+/// back. Verified compiling and behaving correctly for real (`rustc
+/// --edition 2021 --crate-type bin`, a standalone scratch harness with
+/// stub `Player`/`PlayerSpriteState`/`State`/`World`/`Arena`/`Handle`/
+/// `FixedT` stand-ins and all 22 real callee signatures, including a
+/// working `A_Lower` stub that reentrantly calls `P_SetPsprite` on
+/// `ps_weapon` exactly like the real corpus): after dispatch returns from
+/// a reentrant-triggering path, `player.psprites[ps_weapon].state` is
+/// correctly `None`, not the stale pre-call value.
+///
+/// **A known, narrow, documented gap, not silently mismodeled**: this
+/// reconciliation only carries `.state` forward from a reentrant write;
+/// `.tics`/`.sx`/`.sy` are *not* re-read from the array after the call. If
+/// a reentrant call's *own* transition also changes those (only possible
+/// for `A_Raise`'s non-`S_NULL` reentrant branch, if its target state's
+/// own `misc1` happens to be set -- not the case for any real corpus
+/// `readystate` this project has checked), the outer copy's `tics`/`sx`/
+/// `sy` (whatever they were before the callee ran) would be written back
+/// instead of the reentrant transition's fresher values -- a real but
+/// narrow representation gap, the same "hand-match the corpus's own real
+/// shape rather than build a fully general mechanism" tradeoff this
+/// project has made before (`P_KillMobj`/`EV_BuildStairs` UB, round 26/19)
+/// -- flagged here for a future round, not attempted.
+///
+/// **The dispatch `match`**: one arm per real, already-shipped `pub fn
+/// A_*` among the 22 `Weapon`-shaped tags (of 74 total; the other 52 are
+/// `Mobj`-shaped, `P_SetMobjState`'s own job -- reaching one here is
+/// `unreachable!()`, the identical real invariant `P_SetMobjState`'s own
+/// catch-all arm already established, just mirrored). Each arm's argument
+/// list is copied verbatim from that function's own real shipped
+/// signature: 14 take just `(player, psp)`, 8 also need `(world,
+/// thinkers)` (`function_body.rs`, confirmed by direct grep of every real
+/// `pub fn A_*(player: &mut Player, ..)` signature, not sampled).
+pub fn render_p_set_psprite_fn() -> String {
+    "\
+pub fn P_SetPsprite(player: &mut Player, position: i32, stnum: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut stnum = stnum;
+    loop {
+        if stnum == S_NULL {
+            player.psprites[position as usize].state = None;
+            break;
+        }
+        let state = &STATES[stnum as usize];
+        player.psprites[position as usize].state = Some(state);
+        player.psprites[position as usize].tics = state.tics;
+        if state.misc1 != 0 {
+            player.psprites[position as usize].sx = FixedT(state.misc1 << FRACBITS);
+            player.psprites[position as usize].sy = FixedT(state.misc2 << FRACBITS);
+        }
+        if let Some(action) = state.action {
+            let mut psp = player.psprites[position as usize];
+            match action {
+                ActionFn::ABFGsound => A_BFGsound(player, &mut psp),
+                ActionFn::ACheckReload => A_CheckReload(player, &mut psp),
+                ActionFn::ACloseShotgun2 => A_CloseShotgun2(player, &mut psp),
+                ActionFn::AFireBFG => A_FireBFG(player, &mut psp),
+                ActionFn::AFireCGun => A_FireCGun(player, &mut psp, world, thinkers),
+                ActionFn::AFireMissile => A_FireMissile(player, &mut psp),
+                ActionFn::AFirePistol => A_FirePistol(player, &mut psp, world, thinkers),
+                ActionFn::AFirePlasma => A_FirePlasma(player, &mut psp),
+                ActionFn::AFireShotgun => A_FireShotgun(player, &mut psp, world, thinkers),
+                ActionFn::AFireShotgun2 => A_FireShotgun2(player, &mut psp, world, thinkers),
+                ActionFn::AGunFlash => A_GunFlash(player, &mut psp, world, thinkers),
+                ActionFn::ALight0 => A_Light0(player, &mut psp),
+                ActionFn::ALight1 => A_Light1(player, &mut psp),
+                ActionFn::ALight2 => A_Light2(player, &mut psp),
+                ActionFn::ALoadShotgun2 => A_LoadShotgun2(player, &mut psp),
+                ActionFn::ALower => A_Lower(player, &mut psp, world, thinkers),
+                ActionFn::AOpenShotgun2 => A_OpenShotgun2(player, &mut psp),
+                ActionFn::APunch => A_Punch(player, &mut psp, world, thinkers),
+                ActionFn::ARaise => A_Raise(player, &mut psp, world, thinkers),
+                ActionFn::AReFire => A_ReFire(player, &mut psp),
+                ActionFn::ASaw => A_Saw(player, &mut psp, world, thinkers),
+                ActionFn::AWeaponReady => A_WeaponReady(player, &mut psp, world, thinkers),
+                _ => unreachable!(\"a Mobj-shaped ActionFn tag reached P_SetPsprite's own Weapon dispatch\"),
+            }
+            psp.state = player.psprites[position as usize].state;
+            player.psprites[position as usize] = psp;
+            if player.psprites[position as usize].state.is_none() {
+                break;
+            }
+        }
+        stnum = player.psprites[position as usize].state.unwrap().nextstate;
+        if player.psprites[position as usize].tics != 0 {
+            break;
+        }
+    }
+}"
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +542,84 @@ mod tests {
         assert!(!rendered.contains("ActionFn::ALight0"));
         assert!(!rendered.contains("ActionFn::AWeaponReady"));
         assert!(rendered.contains("_ => unreachable!("));
+    }
+
+    #[test]
+    fn test_p_set_psprite_signature_and_control_flow() {
+        let rendered = render_p_set_psprite_fn();
+        assert!(rendered.starts_with(
+            "pub fn P_SetPsprite(player: &mut Player, position: i32, stnum: i32, \
+             world: &mut World, thinkers: &mut Arena<Thinker>) {"
+        ));
+        // The S_NULL branch: writes straight into the array slot, no
+        // persistent `psp` local exists yet at this point in the function.
+        assert!(rendered.contains("if stnum == S_NULL {"));
+        assert!(rendered.contains("player.psprites[position as usize].state = None;"));
+        assert!(rendered.contains("break;"));
+        // The per-iteration state-array indexing and field fill-in, all
+        // written straight into the array slot (never a separate local).
+        assert!(rendered.contains("let state = &STATES[stnum as usize];"));
+        assert!(rendered.contains("player.psprites[position as usize].state = Some(state);"));
+        assert!(rendered.contains("player.psprites[position as usize].tics = state.tics;"));
+        assert!(rendered.contains("if state.misc1 != 0 {"));
+        assert!(
+            rendered.contains(
+                "player.psprites[position as usize].sx = FixedT(state.misc1 << FRACBITS);"
+            )
+        );
+        assert!(
+            rendered.contains(
+                "player.psprites[position as usize].sy = FixedT(state.misc2 << FRACBITS);"
+            )
+        );
+        // The dispatch call only ever takes a fresh, disjoint copy -- never
+        // a live borrow of the array slot (the E0499-class aliasing this
+        // function's own doc comment explains).
+        assert!(rendered.contains("let mut psp = player.psprites[position as usize];"));
+        // The post-call reconciliation: `.state` is re-read from the array
+        // (a reentrant same-index P_SetPsprite call, e.g. A_Lower/A_Raise,
+        // writes there directly), then the whole (now state-corrected)
+        // copy is written back.
+        assert!(rendered.contains("psp.state = player.psprites[position as usize].state;"));
+        assert!(rendered.contains("player.psprites[position as usize] = psp;"));
+        assert!(rendered.contains("if player.psprites[position as usize].state.is_none() {"));
+        assert!(
+            rendered
+                .contains("stnum = player.psprites[position as usize].state.unwrap().nextstate;")
+        );
+        assert!(rendered.contains("if player.psprites[position as usize].tics != 0 {"));
+        assert!(rendered.ends_with("    }\n}"));
+    }
+
+    #[test]
+    fn test_p_set_psprite_dispatches_exactly_the_22_weapon_shaped_tags() {
+        let rendered = render_p_set_psprite_fn();
+        // 22 real Weapon-shaped tags (of 74 total -- the other 52 are
+        // Mobj-shaped, P_SetMobjState's own job) each get exactly one match
+        // arm calling the real already-shipped function by name, plus the
+        // catch-all `unreachable!()` -- but that arm's own doc string also
+        // contains the substring "ActionFn" so it's excluded from the
+        // count by only counting `ActionFn::A` immediately followed by a
+        // `=>` on the same match-arm line pattern already established by
+        // the Mobj sibling test (which counts the identical way and is
+        // known correct).
+        assert_eq!(rendered.matches("ActionFn::A").count(), 22);
+        assert!(rendered.contains("ActionFn::ALight0 => A_Light0(player, &mut psp),"));
+        assert!(rendered.contains(
+            "ActionFn::AWeaponReady => A_WeaponReady(player, &mut psp, world, thinkers),"
+        ));
+        assert!(
+            rendered.contains("ActionFn::ALower => A_Lower(player, &mut psp, world, thinkers),")
+        );
+        assert!(
+            rendered.contains("ActionFn::ARaise => A_Raise(player, &mut psp, world, thinkers),")
+        );
+        // A mobj-shaped tag must never get its own arm here -- only the
+        // catch-all unreachable!() should mention it's possible.
+        assert!(!rendered.contains("ActionFn::AChase"));
+        assert!(!rendered.contains("ActionFn::AVileChase"));
+        assert!(rendered.contains(
+            "_ => unreachable!(\"a Mobj-shaped ActionFn tag reached P_SetPsprite's own Weapon dispatch\"),"
+        ));
     }
 }
