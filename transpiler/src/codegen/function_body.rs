@@ -1963,15 +1963,25 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             format!("{}.was_self_removed()", ctx.self_removal_ident),
             false,
         )),
+        // `target->state == &states[target->info->spawnstate]`
+        // (`P_DamageMobj`, `p_inter.c`) -- the same `state field ==
+        // &states[N]` shape, but `N` is a computed `Member` chain (`target
+        // ->info->spawnstate`, itself a registered `i32` field, the same
+        // as `painstate`/`seestate`/`deathstate`/`xdeathstate` elsewhere)
+        // rather than a bare `#define`d `Ident` (`S_PLAY_ATK1`/`S_SAW`) --
+        // `state_index`'s own rendering already handles an arbitrary index
+        // expression correctly (`render_expr(state_num, ctx)` was always
+        // fully generic), only the *guard* was narrowed to `Ident` because
+        // no earlier corpus example needed anything else. Widened to any
+        // index expression rather than adding a second, near-identical arm.
         Expr::Binary {
             op: BinaryOp::Eq,
             lhs: eq_lhs,
             rhs: eq_rhs,
         } if matches!(eq_lhs.as_ref(), Expr::Member { field, .. } if field == "state")
             && matches!(eq_rhs.as_ref(), Expr::Unary { op: UnaryOp::AddrOf, expr }
-                if matches!(expr.as_ref(), Expr::Index { base, index }
-                    if matches!(base.as_ref(), Expr::Ident(n) if n == "states")
-                        && matches!(index.as_ref(), Expr::Ident(_)))) =>
+                if matches!(expr.as_ref(), Expr::Index { base, .. }
+                    if matches!(base.as_ref(), Expr::Ident(n) if n == "states"))) =>
         {
             let Expr::Unary {
                 expr: addrof_expr, ..
@@ -2016,6 +2026,44 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 "handle".to_string()
             } else {
                 render_expr(rhs, ctx)?.0
+            };
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
+        // `source != target` (`P_DamageMobj`, `p_inter.c`) -- comparing a
+        // nullable `Option<Handle<Thinker>>` cross-reference against a
+        // bare, non-nullable `Handle<Thinker>` one, with *neither* side
+        // `ctx.self_param` -- `render_trigger_fn`'s own "independent,
+        // non-`self` parameters" shape (`target` is just another
+        // registered parameter here, not a `&mut Mobj` receiver), unlike
+        // `thing == tmthing`'s self-vs-`Handle<Thinker>` arm just above,
+        // which only ever fires when one side literally *is*
+        // `self_param`. Every real corpus reach of this shape is already
+        // known non-`None` at this point (a preceding `source &&`/`.is_
+        // some()` guard earlier in the same `&&`-chain condition), the
+        // same "unwrap at point of use once liveness is already
+        // established" discipline this module's whole `Option<Handle<
+        // Thinker>>` family already follows throughout -- `.unwrap()` on
+        // whichever side is `Option`-typed, the other side passed through
+        // unchanged.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && ((is_handle_option_ident(lhs, ctx) && is_bare_handle_ident(rhs, ctx))
+                    || (is_bare_handle_ident(lhs, ctx) && is_handle_option_ident(rhs, ctx))) =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let lhs_text = if is_handle_option_ident(lhs, ctx) {
+                format!("{lhs_text}.unwrap()")
+            } else {
+                lhs_text
+            };
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            let rhs_text = if is_handle_option_ident(rhs, ctx) {
+                format!("{rhs_text}.unwrap()")
+            } else {
+                rhs_text
             };
             Ok((
                 format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
@@ -2981,9 +3029,25 @@ fn render_binary_operand(
         if matches!(expr.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).is_some_and(|t| t != "bool" && !t.starts_with("Option<"))));
+    // `!target->threshold` (`P_DamageMobj`, `p_inter.c`) -- the same
+    // ambiguity again, but reached through a bare `Handle<Thinker>`-
+    // registered *parameter* rather than `self_param` (`render_trigger_
+    // fn`'s own "independent, non-`self` parameters" shape -- `target`
+    // isn't a `&mut Mobj` receiver here, just another cross-reference
+    // parameter). `render_trigger_fn` has no `self_field_types` registry
+    // at all (always empty -- there's no self-struct receiver to own
+    // one), so this can't reuse `not_of_known_int_field`'s own registered-
+    // type lookup; hand-matched by field name instead (`threshold`, the
+    // one real corpus instance so far), the same "no general field-type
+    // registry outside self/ctor" discipline `not_of_powers_index`'s own
+    // by-name scoping already established.
+    let not_of_known_int_field_via_handle_param = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
+        if matches!(expr.as_ref(), Expr::Member { base, field, .. }
+            if field == "threshold" && is_bare_handle_ident(base, ctx)));
     let not_of_known_int_local = matches!(operand, Expr::Unary { op: UnaryOp::Not, expr }
         if matches!(expr.as_ref(), Expr::Ident(n) if ctx.plain_int_locals.contains(n.as_str()) || ctx.static_locals.contains_key(n.as_str())))
-        || not_of_known_int_field;
+        || not_of_known_int_field
+        || not_of_known_int_field_via_handle_param;
     // `!player->powers[pw_ironfeet] || (P_Random()<5)` (`P_PlayerInSpecialSector`)
     // -- the `Expr::Index` sibling of `not_of_known_int_field` just above:
     // `!x` where `x` is `player.powers[..]`, a genuine `int` array element
@@ -5688,6 +5752,39 @@ fn expr_is_fixed_t_valued(e: &Expr, ctx: &FnBodyContext) -> bool {
             {
                 return true;
             }
+            // `toucher->height` (`P_TouchSpecialThing`, `p_inter.c`) --
+            // `render_trigger_fn` has no `self_field_types` registry at all
+            // (always empty, the same gap `not_of_known_int_field_via_
+            // handle_param` already hit for `threshold`), so `base_is_self_
+            // or_handle_local`'s own field-type lookup just above can never
+            // confirm a bare `Handle<Thinker>`-registered base's field is
+            // `FixedT` there, even though `Mobj`'s own field-type map
+            // (`struct_fields.rs`) is fixed and known ahead of time. Hand-
+            // matched by name (`Mobj`'s own real `FixedT` fields: `x`/`y`/
+            // `z`/`floorz`/`ceilingz`/`radius`/`height`/`momx`/`momy`/
+            // `momz`) rather than threading a real field-type registry
+            // through this renderer, the same by-name discipline
+            // `floorheight`/`ceilingheight` just above already established
+            // for `Sector`. A real gap, not just extra caution: without
+            // this, `delta > toucher->height` (`delta` newly recognized as
+            // a genuine `fixed_t_locals` member) wrongly wrapped `height`
+            // in `FixedT(..)` a second time, confirmed by the existing test
+            // suite regressing before this arm was added.
+            if matches!(
+                field.as_str(),
+                "x" | "y"
+                    | "z"
+                    | "floorz"
+                    | "ceilingz"
+                    | "radius"
+                    | "height"
+                    | "momx"
+                    | "momy"
+                    | "momz"
+            ) && is_bare_handle_ident(base, ctx)
+            {
+                return true;
+            }
             // `line->dy`/`node->dx` (`P_PointOnDivlineSide`/
             // `P_DivlineSide`) -- a `LineId`/`&DivLine`-typed base's own
             // `dx`/`dy` field, the same real `FixedT` source `is_line_dx_
@@ -7111,7 +7208,19 @@ fn collect_plain_int_locals(items: &[BlockItem]) -> HashSet<String> {
 /// Mirrors `collect_plain_int_locals`, but for a local declared `angle_t`
 /// (`[TypeSpecifier::TypedefName("angle_t")]`, a distinct AST shape from
 /// bare `int`'s `[TypeSpecifier::Int]`) -- see `FnBodyContext::
-/// angle_t_locals`'s own doc comment for why this is needed. Same
+/// angle_t_locals`'s own doc comment for why this is needed. Also matches
+/// a bare `unsigned` local (`[TypeSpecifier::Unsigned]`, `P_DamageMobj`'s
+/// own `unsigned ang;`) -- `tables.h`'s own `typedef unsigned angle_t;`
+/// makes the two spellings the exact same real C type, just written out
+/// instead of aliased (the same "genuinely the one type, matched by
+/// either spelling" reasoning `render_decl`'s own doc comment already
+/// gives `unsigned an;`, `A_Fire`'s own local, for declaration-rendering
+/// purposes -- this extends it to the *compound-assign* cast rule too).
+/// Safe for every already-shipped `angle_t_locals` caller: `A_Fire`'s own
+/// `an` (the only existing bare-`unsigned` local in the corpus so far) is
+/// only ever plain-`=`-assigned, never compound-assigned, so widening
+/// this set never changes `lhs_is_angle_t_local`'s own `op != Assign`
+/// gate for it -- confirmed by direct read, not assumed. Same
 /// deliberately shallow, top-level-only scan.
 fn collect_angle_t_locals(items: &[BlockItem]) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -7120,7 +7229,8 @@ fn collect_angle_t_locals(items: &[BlockItem]) -> HashSet<String> {
         if !matches!(
             d.specifiers.type_specifiers.as_slice(),
             [TypeSpecifier::TypedefName(n)] if n == "angle_t"
-        ) {
+        ) && d.specifiers.type_specifiers.as_slice() != [TypeSpecifier::Unsigned]
+        {
             continue;
         }
         for decl in &d.declarators {
@@ -9322,6 +9432,21 @@ fn stmt_has_self_identity_comparison(
     }
 }
 
+/// Whether `e` is a bare identifier registered `"Option<Handle<Thinker>>"`
+/// in `extra_cross_ref_idents` -- `source != target`'s own (`P_DamageMobj`)
+/// new `Eq`/`Ne` arm's own narrow helper, shared between its guard and its
+/// rendering so both agree on exactly what counts.
+fn is_handle_option_ident(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>"))
+}
+
+/// Whether `e` is a bare identifier registered `"Handle<Thinker>"`
+/// (non-`Option`) in `extra_cross_ref_idents` -- `is_handle_option_ident`'s
+/// own non-nullable sibling, same "shared guard/render helper" reasoning.
+fn is_bare_handle_ident(e: &Expr, ctx: &FnBodyContext) -> bool {
+    matches!(e, Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Handle<Thinker>"))
+}
+
 /// Whether `e` is exactly `&players[consoleplayer]` (`p_inter.c`'s own
 /// "is this the local console player" idiom) -- corpus-verified as the
 /// *only* real index this array is ever compared by identity against
@@ -10736,6 +10861,22 @@ pub fn render_trigger_fn(
 
     let mut all_cross_refs = param_types.clone();
     all_cross_refs.extend(local_var_types.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // `P_DamageMobj`'s own `unsigned ang;`/`fixed_t thrust;` -- every
+    // earlier `render_trigger_fn` caller happened to need none of
+    // `render_fn_impl`'s three top-level-local-tracking collections (a
+    // trigger function has no `self` struct, so `plain_int_locals`'s own
+    // u32-self-field-into-plain-int rule can never fire either way), so
+    // these were hardcoded empty rather than actually computed -- masking
+    // the gap harmlessly until now. Switching to the real collectors is
+    // safe for every already-shipped trigger test: each one only returns
+    // a non-empty set for a body that actually declares a matching local,
+    // and `plain_int_locals`'s own cast rule additionally requires a
+    // registered self-struct field (`ctx.self_field_types`, always empty
+    // here) to ever fire at all, so it stays permanently inert for this
+    // renderer regardless of what's collected.
+    let plain_int_locals = collect_plain_int_locals(&f.body.items);
+    let angle_t_locals = collect_angle_t_locals(&f.body.items);
+    let fixed_t_locals = collect_fixed_t_locals(&f.body.items);
     let ctx = FnBodyContext {
         self_param: "",
         self_field_types: &HashMap::new(),
@@ -10748,9 +10889,9 @@ pub fn render_trigger_fn(
         same_handle_write: None,
         same_target_write: None,
         self_removal_ident: "arena",
-        plain_int_locals: &HashSet::new(),
-        angle_t_locals: &HashSet::new(),
-        fixed_t_locals: &HashSet::new(),
+        plain_int_locals: &plain_int_locals,
+        angle_t_locals: &angle_t_locals,
+        fixed_t_locals: &fixed_t_locals,
         thinker_scan_alias: None,
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
@@ -22180,6 +22321,175 @@ pub fn P_KillMobj(source: Option<Handle<Thinker>>, target: Handle<Thinker>, worl
     }
     mo = P_SpawnMobj(match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, ONFLOORZ, item);
     if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mo) { m.flags |= MF_DROPPED; };
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_DamageMobj` (`p_inter.c`) -- round 27's own primary target,
+    /// flagged by round 26's own `P_SpawnMissile` closure: `render_trigger_
+    /// fn`'s existing "independent, non-`self` parameters" shape (already
+    /// proven by `P_KillMobj`/`P_TouchSpecialThing`) turns out to need no
+    /// new parameter-count mechanism at all -- `target: Handle<Thinker>`,
+    /// `inflictor: Option<Handle<Thinker>>`, `source: Option<Handle<
+    /// Thinker>>` are just three more entries in the same `param_types`
+    /// map every earlier caller already threaded through generically, and
+    /// the two nullable ones render through the exact `Option<Handle<
+    /// Thinker>>` truthiness/`.unwrap()` machinery `linetarget`/`source`
+    /// (`P_KillMobj`) already established -- corpus-verified nullable
+    /// against this function's own doc comment ("can be NULL") and every
+    /// real call site (`A_Explode`'s `P_DamageMobj(thing, bomb, bombsource,
+    /// ..)`/`A_VileAttack`'s own `P_DamageMobj(actor->target, actor,
+    /// actor, ..)`, `p_enemy.c`), not assumed. `target` itself is
+    /// genuinely non-nullable (dereferenced unconditionally at the very
+    /// top, `target->flags`, with no earlier guard, matching `P_KillMobj`'s
+    /// own already-landed asymmetric-nullability precedent for the exact
+    /// same `target`/`source` pair).
+    ///
+    /// Two genuinely new pieces, both real `rustc` rejections confirmed by
+    /// compiling the naive translation first: `thrust *= 4;` needs a new
+    /// `MulAssign<i32> for FixedT` impl (`runtime/fixed.rs`, mirroring the
+    /// already-shipped `AddAssign<i32>`), and `ang += ANG180;` (`ang`
+    /// declared bare `unsigned`, not the `angle_t` typedef) needs `collect_
+    /// angle_t_locals` widened to also match `[TypeSpecifier::Unsigned]`
+    /// (`tables.h`'s own `typedef unsigned angle_t;` makes the two
+    /// spellings the same real type) -- confirmed harmless for every
+    /// already-shipped `angle_t_locals` consumer, including `A_Fire`'s own
+    /// pre-existing bare-`unsigned` local (`an`, never compound-assigned,
+    /// so the widened set never changes its own rendering). `render_
+    /// trigger_fn` itself gains real `plain_int_locals`/`angle_t_locals`/
+    /// `fixed_t_locals` (previously hardcoded empty, since no earlier
+    /// trigger-fn caller needed any of the three) -- safe for every
+    /// existing trigger test since each collector returns an empty set
+    /// unless the body actually declares a matching local, and `plain_int_
+    /// locals`'s own cast rule additionally requires a registered self-
+    /// struct field this renderer never has.
+    ///
+    /// Everything else renders through already-shipped, unmodified
+    /// machinery: `player = target->player;` is the identical `Option<
+    /// PlayerId>`-aliasing-a-`Handle<Thinker>`-field idiom `P_KillMobj`'s
+    /// own `source->player` chain already proved, just bound to a local
+    /// first; `player->armortype`/`.armorpoints`/`.health`/`.attacker`/
+    /// `.damagecount`/`.cheats`/`.powers[..]`/`.readyweapon` are every one
+    /// of them already-registered `Player` fields (`struct_fields.rs`);
+    /// `target->subsector->sector->special` is the exact `X->subsector->
+    /// sector` bare-`Handle<Thinker>`-parameter chain arm `A_Look`'s own
+    /// `emmiter->subsector->sector` widening already covers, one more
+    /// `.field` deep through the fully generic `Expr::Member` fallback;
+    /// `player == &players[consoleplayer]` is `P_KillMobj`'s own already-
+    /// shipped console-identity comparison, unchanged; `target->state ==
+    /// &states[..]` is the already-shipped `state_index` comparison arm;
+    /// `damage < 100 ? damage : 100` is `Expr::Conditional`, already
+    /// generic; `P_KillMobj(source, target); return;`/`I_Tactile(..)` are
+    /// opaque forward-referenced calls, rendered verbatim (the same
+    /// already-documented cross-function-signature gap every other
+    /// forward-referenced call in this module carries, not fixed here).
+    /// Compile-verified for real (`rustc --edition 2021 --crate-type bin`)
+    /// against a hand-written `Player`/`Mobj`/`World`/`Handle`/`Arena`/
+    /// `Thinker`/`MobjInfo`/`PlayerId`/`FixedT` stand-in covering every
+    /// shape this function needs -- zero errors.
+    #[test]
+    fn test_p_damage_mobj_renders_exactly() {
+        let params = field_types(&[
+            ("target", "Handle<Thinker>"),
+            ("inflictor", "Option<Handle<Thinker>>"),
+            ("source", "Option<Handle<Thinker>>"),
+            ("damage", "i32"),
+        ]);
+        let locals = field_types(&[("player", "Option<PlayerId>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_inter.c",
+            "P_DamageMobj",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_DamageMobj(target: Handle<Thinker>, inflictor: Option<Handle<Thinker>>, source: Option<Handle<Thinker>>, mut damage: i32, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut ang;
+    let mut saved;
+    let mut player;
+    let mut thrust;
+    let mut temp;
+    if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_SHOOTABLE == 0 {
+        return;
+    }
+    if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 {
+        return;
+    }
+    if (match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_SKULLFLY) != 0 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.momz = 0; };
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.momy = m.momz; };
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.momx = m.momy; };
+    }
+    player = match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.player, _ => None };
+    if player.is_some() && gameskill == sk_baby {
+        damage >>= 1;
+    }
+    if inflictor.is_some() && match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_NOCLIP == 0 && (source.is_none() || match thinkers.get(source.unwrap()) { Some(Thinker::Mobj(m)) => m.player, _ => None }.is_none() || world[match thinkers.get(source.unwrap()) { Some(Thinker::Mobj(m)) => m.player, _ => None }.unwrap()].readyweapon != wp_chainsaw) {
+        ang = R_PointToAngle2(match thinkers.get(inflictor.unwrap()) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(inflictor.unwrap()) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() }, match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.x, _ => unreachable!() }, match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.y, _ => unreachable!() });
+        thrust = damage * (FRACUNIT >> 3) * 100 / match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.mass;
+        if damage < 40 && damage > match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } && match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } - match thinkers.get(inflictor.unwrap()) { Some(Thinker::Mobj(m)) => m.z, _ => unreachable!() } > 64 * FRACUNIT && (P_Random() & 1) != 0 {
+            ang += (ANG180) as u32;
+            thrust *= 4;
+        }
+        ang >>= (ANGLETOFINESHIFT) as u32;
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.momx += FixedMul(thrust, finecosine[ang as usize]); };
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.momy += FixedMul(thrust, finesine[ang as usize]); };
+    }
+    if player.is_some() {
+        if world[world[match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector].special == 11 && damage >= match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } {
+            damage = match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } - 1;
+        }
+        if damage < 1000 && ((world[player.unwrap()].cheats & CF_GODMODE) != 0 || world[player.unwrap()].powers[pw_invulnerability as usize] != 0) {
+            return;
+        }
+        if world[player.unwrap()].armortype != 0 {
+            if world[player.unwrap()].armortype == 1 {
+                saved = damage / 3;
+            } else {
+                saved = damage / 2;
+            }
+            if world[player.unwrap()].armorpoints <= saved {
+                saved = world[player.unwrap()].armorpoints;
+                world[player.unwrap()].armortype = 0;
+            }
+            world[player.unwrap()].armorpoints -= saved;
+            damage -= saved;
+        }
+        world[player.unwrap()].health -= damage;
+        if world[player.unwrap()].health < 0 {
+            world[player.unwrap()].health = 0;
+        }
+        world[player.unwrap()].attacker = source;
+        world[player.unwrap()].damagecount += damage;
+        if world[player.unwrap()].damagecount > 100 {
+            world[player.unwrap()].damagecount = 100;
+        }
+        temp = if damage < 100 { damage } else { 100 };
+        if player.unwrap() == world.consoleplayer {
+            I_Tactile(40, 10, 40 + temp * 2);
+        }
+    }
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.health -= damage; };
+    if match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.health, _ => unreachable!() } <= 0 {
+        P_KillMobj(source, target);
+        return;
+    }
+    if P_Random() < match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.painchance && match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_SKULLFLY == 0 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.flags |= MF_JUSTHIT; };
+        thinkers.take_out(target, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, m.info.painstate, world, h, a); } });
+    }
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.reactiontime = 0; };
+    if (match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.threshold, _ => unreachable!() } == 0 || match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.r#type, _ => unreachable!() } == MT_VILE) && source.is_some() && source.unwrap() != target && match thinkers.get(source.unwrap()) { Some(Thinker::Mobj(m)) => m.r#type, _ => unreachable!() } != MT_VILE {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.target = source; };
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(target) { m.threshold = BASETHRESHOLD; };
+        if state_index(match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.state, _ => unreachable!() }) == match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.spawnstate && match thinkers.get(target) { Some(Thinker::Mobj(m)) => m.info, _ => unreachable!() }.seestate != S_NULL {
+            thinkers.take_out(target, |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, m.info.seestate, world, h, a); } });
+        }
+    }
 }";
         assert_eq!(rendered, expected);
     }
