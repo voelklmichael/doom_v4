@@ -5765,6 +5765,73 @@ fn scan_set_mobj_state_calls_stmt(
     }
 }
 
+/// `P_SetPsprite(<player>, <position>, <stnum>)` in statement position --
+/// `as_p_set_mobj_state_call`'s own `Weapon`-shaped sibling (round 30,
+/// `P_SetPsprite` itself now real -- `action_fn.rs`'s own hand-written
+/// `render_p_set_psprite_fn`), narrowly matched by callee name. Unlike
+/// `P_SetMobjState`'s own two real target shapes (a live self-struct
+/// receiver vs. an `Arena::take_out`-mediated `Handle<Thinker>`), every
+/// real `P_SetPsprite` call site in this corpus passes its own `player_t*`
+/// receiver bare, and it's *always* `self_param` itself (`A_Lower`'s own
+/// `P_SetPsprite (player, ps_weapon, S_NULL)`, `P_BringUpWeapon`'s own
+/// `P_SetPsprite (player, ps_weapon, newstate)`, ... -- confirmed by
+/// direct grep of every real corpus call site, not assumed) -- `Player`
+/// isn't `Arena`-managed the way `Mobj` is, so there's no second,
+/// `Handle`-mediated target shape to handle at all. The retrofit here is
+/// simpler than `P_SetMobjState`'s own: every real call just needs its two
+/// extra arguments (`world`, `thinkers`, `P_SetPsprite`'s own real
+/// signature) appended (`render_expr_stmt`'s own new arm).
+fn as_p_set_psprite_call(e: &Expr) -> Option<(&Expr, &Expr, &Expr)> {
+    let Expr::Call { callee, args } = e else {
+        return None;
+    };
+    if !matches!(callee.as_ref(), Expr::Ident(n) if n == "P_SetPsprite") {
+        return None;
+    }
+    let [player, position, stnum] = args.as_slice() else {
+        return None;
+    };
+    Some((player, position, stnum))
+}
+
+/// Whether `items` contains a real `P_SetPsprite(..)` call anywhere
+/// (recursively, mirroring `scan_set_mobj_state_calls`'s own statement
+/// shapes) -- drives whether a caller's own signature needs `world`/
+/// `thinkers` forced into existence for it (`render_weapon_fn`/
+/// `render_fn_impl_with_two_scalar_params`'s own signature-decision
+/// arithmetic), since `P_SetPsprite` is real now and always needs both.
+fn body_calls_p_set_psprite(items: &[BlockItem]) -> bool {
+    items.iter().any(|item| match item {
+        BlockItem::Stmt(s) => stmt_calls_p_set_psprite(s),
+        _ => false,
+    })
+}
+
+fn stmt_calls_p_set_psprite(s: &Stmt) -> bool {
+    if let Stmt::Expr(Some(e)) = s
+        && as_p_set_psprite_call(e).is_some()
+    {
+        return true;
+    }
+    match s {
+        Stmt::Compound(c) => body_calls_p_set_psprite(&c.items),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_calls_p_set_psprite(then_branch)
+                || else_branch.as_deref().is_some_and(stmt_calls_p_set_psprite)
+        }
+        Stmt::Switch { body, .. } => stmt_calls_p_set_psprite(body),
+        Stmt::Case { stmt, .. } => stmt_calls_p_set_psprite(stmt),
+        Stmt::Default(stmt) => stmt_calls_p_set_psprite(stmt),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => stmt_calls_p_set_psprite(body),
+        Stmt::For { body, .. } => stmt_calls_p_set_psprite(body),
+        _ => false,
+    }
+}
+
 /// Whether `e` is built entirely from a known real `FixedT` source
 /// (`FRACUNIT`, or a self-struct/`Handle<Thinker>`-local field
 /// registered `"FixedT"` -- both share `ctx.self_field_types`, since a
@@ -6156,6 +6223,18 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let (state_text, _) = render_expr(state, &state_ctx)?;
         return Ok(format!(
             "thinkers.take_out({target_text}, |t, h, a| {{ if let Thinker::Mobj(m) = t {{ P_SetMobjState(m, {state_text}, world, h, a); }} }})"
+        ));
+    }
+    // `P_SetPsprite(player, ps_weapon, newstate);` (round 30's own retrofit
+    // of `P_SetPsprite` -- see `as_p_set_psprite_call`'s own doc comment
+    // for why every real call site just needs its two extra arguments
+    // appended, no `Handle`/`Arena::take_out` indirection at all).
+    if let Some((player_arg, position, stnum)) = as_p_set_psprite_call(e) {
+        let (player_text, _) = render_expr(player_arg, ctx)?;
+        let (position_text, _) = render_expr(position, ctx)?;
+        let (stnum_text, _) = render_expr(stnum, ctx)?;
+        return Ok(format!(
+            "P_SetPsprite({player_text}, {position_text}, {stnum_text}, world, thinkers)"
         ));
     }
     if let Expr::Assign { op, lhs, rhs } = e {
@@ -8187,6 +8266,15 @@ fn render_fn_impl_with_two_scalar_params(
         &mut needs_self_set_mobj_state_call,
         &mut needs_other_set_mobj_state_call,
     );
+    // `P_SetPsprite(player, ps_weapon, ..)` (`P_DropWeapon`/`P_BringUpWeapon`/
+    // `P_FireWeapon`/`P_MovePsprites`, round 30's own retrofit of
+    // `P_SetPsprite` itself -- see `as_p_set_psprite_call`'s own doc
+    // comment) -- `P_SetPsprite`'s own real signature unconditionally needs
+    // a mutable `Arena` lookup (`thinkers`), so a `Player`-self-shaped
+    // caller reaching it needs one forced into existence too, the same
+    // "measure, don't add speculatively" upgrade every other flag here
+    // already follows.
+    let needs_p_set_psprite_call = body_calls_p_set_psprite(&f.body.items);
     // `mobj->thinker.function.acv == (actionf_v)(-1)` (`P_MobjThinker`) --
     // checking whether a *nested* call (`P_XYMovement`/`P_ZMovement`)
     // already removed this same receiver needs the identical `handle`/
@@ -8256,6 +8344,7 @@ fn render_fn_impl_with_two_scalar_params(
         || needs_target_write
         || needs_self_handle_field_write
         || needs_other_set_mobj_state_call
+        || needs_p_set_psprite_call
     {
         ", thinkers: &mut Arena<Thinker>"
     } else if needs_target_deref
@@ -8445,19 +8534,32 @@ pub fn render_weapon_fn(
         &mut needs_self_set_mobj_state_call,
         &mut needs_set_mobj_state_call,
     );
-    let needs_world = needs_linetarget || needs_bulletslope || needs_set_mobj_state_call;
+    // `P_SetPsprite(player, ps_weapon, S_NULL)`/etc. (`A_Lower`/`A_Raise`/
+    // `A_FirePlasma`/`A_GunFlash`/`A_FirePistol`/`A_FireShotgun`/
+    // `A_FireShotgun2`/`A_FireCGun`/`A_WeaponReady`, round 30's own retrofit
+    // of `P_SetPsprite` itself -- see `as_p_set_psprite_call`'s own doc
+    // comment) -- `P_SetPsprite`'s own real signature unconditionally needs
+    // both `world`/`thinkers`, so any weapon action calling it needs both
+    // forced into existence too, the same "measure, don't add
+    // speculatively" upgrade every other flag here already follows.
+    let needs_p_set_psprite_call = body_calls_p_set_psprite(&f.body.items);
+    let needs_world = needs_linetarget
+        || needs_bulletslope
+        || needs_set_mobj_state_call
+        || needs_p_set_psprite_call;
     let world_part = if needs_world {
         ", world: &mut World"
     } else {
         ""
     };
-    let thinkers_part = if needs_self_handle_write || needs_set_mobj_state_call {
-        ", thinkers: &mut Arena<Thinker>"
-    } else if needs_self_handle_deref || needs_linetarget {
-        ", thinkers: &Arena<Thinker>"
-    } else {
-        ""
-    };
+    let thinkers_part =
+        if needs_self_handle_write || needs_set_mobj_state_call || needs_p_set_psprite_call {
+            ", thinkers: &mut Arena<Thinker>"
+        } else if needs_self_handle_deref || needs_linetarget {
+            ", thinkers: &Arena<Thinker>"
+        } else {
+            ""
+        };
     Ok(format!(
         "pub fn {fn_name}({player_param}: &mut Player, {psp_param}: &mut PlayerSpriteState{world_part}{thinkers_part}) {{\n{}\n}}",
         body_lines.join("\n")
@@ -15472,7 +15574,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_Lower(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+            "pub fn A_Lower(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              psp.sy += LOWERSPEED;\n    \
              if psp.sy < WEAPONBOTTOM {\n        \
              return;\n    \
@@ -15482,7 +15584,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              return;\n    \
              }\n    \
              if player.health == 0 {\n        \
-             P_SetPsprite(player, ps_weapon, S_NULL);\n        \
+             P_SetPsprite(player, ps_weapon, S_NULL, world, thinkers);\n        \
              return;\n    \
              }\n    \
              player.readyweapon = player.pendingweapon;\n    \
@@ -15497,7 +15599,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_Raise(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+            "pub fn A_Raise(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              let mut newstate;\n    \
              psp.sy -= RAISESPEED;\n    \
              if psp.sy > WEAPONTOP {\n        \
@@ -15505,7 +15607,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              }\n    \
              psp.sy = WEAPONTOP;\n    \
              newstate = weaponinfo[player.readyweapon as usize].readystate;\n    \
-             P_SetPsprite(player, ps_weapon, newstate);\n\
+             P_SetPsprite(player, ps_weapon, newstate, world, thinkers);\n\
              }"
         );
     }
@@ -15531,7 +15633,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             rendered,
             "pub fn A_GunFlash(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
-             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n\
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate, world, thinkers);\n\
              }"
         );
     }
@@ -15569,9 +15671,9 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             .expect("should render cleanly");
         assert_eq!(
             rendered,
-            "pub fn A_FirePlasma(player: &mut Player, psp: &mut PlayerSpriteState) {\n    \
+            "pub fn A_FirePlasma(player: &mut Player, psp: &mut PlayerSpriteState, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
-             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + (P_Random() & 1));\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + (P_Random() & 1), world, thinkers);\n    \
              P_SpawnPlayerMissile(player.mo, MT_PLASMA);\n\
              }"
         );
@@ -15609,7 +15711,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              S_StartSound(player.mo, sfx_pistol);\n    \
              thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
-             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate, world, thinkers);\n    \
              P_BulletSlope(player.mo);\n    \
              P_GunShot(player.mo, player.refire == 0);\n\
              }"
@@ -15723,7 +15825,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              S_StartSound(player.mo, sfx_shotgn);\n    \
              thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
-             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate, world, thinkers);\n    \
              P_BulletSlope(player.mo);\n    \
              i = 0;\n    \
              while i < 7 {\n        \
@@ -15803,7 +15905,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
              S_StartSound(player.mo, sfx_dshtgn);\n    \
              thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 2;\n    \
-             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate);\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate, world, thinkers);\n    \
              P_BulletSlope(player.mo);\n    \
              i = 0;\n    \
              while i < 20 {\n        \
@@ -16772,7 +16874,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n    \
              thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK2, world, h, a); } });\n    \
              player.ammo[weaponinfo[player.readyweapon as usize].ammo as usize] -= 1;\n    \
-             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + state_index(psp.state) - S_CHAIN1);\n    \
+             P_SetPsprite(player, ps_flash, weaponinfo[player.readyweapon as usize].flashstate + state_index(psp.state) - S_CHAIN1, world, thinkers);\n    \
              P_BulletSlope(player.mo);\n    \
              P_GunShot(player.mo, player.refire == 0);\n\
              }"
@@ -17367,7 +17469,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n    \
              if player.pendingweapon != wp_nochange || player.health == 0 {\n        \
              newstate = weaponinfo[player.readyweapon as usize].downstate;\n        \
-             P_SetPsprite(player, ps_weapon, newstate);\n        \
+             P_SetPsprite(player, ps_weapon, newstate, world, thinkers);\n        \
              return;\n    \
              }\n    \
              if (player.cmd.buttons & BT_ATTACK) != 0 {\n        \
@@ -20913,8 +21015,8 @@ pub fn P_CalcSwing(player: &mut Player, world: &mut World) {
         )
         .expect("should render cleanly");
         let expected = "\
-pub fn P_DropWeapon(player: &mut Player, world: &mut World) {
-    P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate);
+pub fn P_DropWeapon(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate, world, thinkers);
 }";
         assert_eq!(rendered, expected);
     }
@@ -20975,7 +21077,7 @@ pub fn P_DropWeapon(player: &mut Player, world: &mut World) {
         )
         .expect("should render cleanly");
         let expected = "\
-pub fn P_BringUpWeapon(player: &mut Player, world: &mut World) {
+pub fn P_BringUpWeapon(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) {
     let mut newstate;
     if player.pendingweapon == wp_nochange {
         player.pendingweapon = player.readyweapon;
@@ -20986,7 +21088,7 @@ pub fn P_BringUpWeapon(player: &mut Player, world: &mut World) {
     newstate = weaponinfo[player.pendingweapon as usize].upstate;
     player.pendingweapon = wp_nochange;
     player.psprites[ps_weapon as usize].sy = WEAPONBOTTOM;
-    P_SetPsprite(player, ps_weapon, newstate);
+    P_SetPsprite(player, ps_weapon, newstate, world, thinkers);
 }";
         assert_eq!(rendered, expected);
     }
@@ -21031,7 +21133,7 @@ pub fn P_FireWeapon(player: &mut Player, world: &mut World, thinkers: &mut Arena
     }
     thinkers.take_out(player.mo.unwrap(), |t, h, a| { if let Thinker::Mobj(m) = t { P_SetMobjState(m, S_PLAY_ATK1, world, h, a); } });
     newstate = weaponinfo[player.readyweapon as usize].atkstate;
-    P_SetPsprite(player, ps_weapon, newstate);
+    P_SetPsprite(player, ps_weapon, newstate, world, thinkers);
     P_NoiseAlert(player.mo, player.mo);
 }";
         assert_eq!(rendered, expected);
@@ -21196,7 +21298,7 @@ pub fn P_SetupPsprites(player: &mut Player, world: &mut World) {
         )
         .expect("should render cleanly");
         let expected = "\
-pub fn P_MovePsprites(player: &mut Player, world: &mut World) {
+pub fn P_MovePsprites(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) {
     let mut i;
     let mut state;
     i = 0;
@@ -21206,7 +21308,7 @@ pub fn P_MovePsprites(player: &mut Player, world: &mut World) {
             if player.psprites[i as usize].tics != -1 {
                 player.psprites[i as usize].tics -= 1;
                 if player.psprites[i as usize].tics == 0 {
-                    P_SetPsprite(player, i, player.psprites[i as usize].state.unwrap().nextstate);
+                    P_SetPsprite(player, i, player.psprites[i as usize].state.unwrap().nextstate, world, thinkers);
                 }
             }
         }
@@ -21455,7 +21557,7 @@ pub fn P_GunShot(mo: &mut Mobj, accurate: bool, world: &mut World) {
         )
         .expect("should render cleanly");
         let expected = "\
-pub fn P_CheckAmmo(player: &mut Player, world: &mut World) -> bool {
+pub fn P_CheckAmmo(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) -> bool {
     let mut ammo;
     let mut count;
     ammo = weaponinfo[player.readyweapon as usize].ammo;
@@ -21509,7 +21611,7 @@ pub fn P_CheckAmmo(player: &mut Player, world: &mut World) -> bool {
             break;
         }
     }
-    P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate);
+    P_SetPsprite(player, ps_weapon, weaponinfo[player.readyweapon as usize].downstate, world, thinkers);
     return false;
 }";
         assert_eq!(rendered, expected);
