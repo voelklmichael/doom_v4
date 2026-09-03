@@ -375,6 +375,30 @@ struct FnBodyContext<'a> {
     /// onto unchanged. Maps the pointer-local's own name (`psp`) to the
     /// loop counter's name (`i`). `None` everywhere else.
     psprite_walk_alias: Option<(&'a str, &'a str)>,
+    /// Set only by `render_trigger_fn`, for a body containing exactly
+    /// `IDENT = &players[EXPR];` (`P_SpawnPlayer`'s own `p = &players
+    /// [mthing->type-1];`, `p_mobj.c`) -- a *computed*-index alias into the
+    /// fixed-size `players[]` global array, genuinely different from every
+    /// earlier `PlayerId` shape this module tracks: not a fixed constant
+    /// index (`consoleplayer`, `is_player_console_identity_rhs`'s own
+    /// comparison-only shape) and not derived from a `Handle<Thinker>`'s
+    /// own `.player` field (`collect_self_player_alias`'s `Option<
+    /// PlayerId>`-typed local) -- `mthing->type-1` is an arbitrary runtime
+    /// expression, read/written across roughly fifteen field accesses for
+    /// the rest of the function. Like `SpawnpointAlias`/`psprite_walk_
+    /// alias`, `p` never becomes a real Rust binding at all: `(var,
+    /// idx_text)`, where `idx_text` is the index expression's own already-
+    /// rendered, fully parenthesized text (computed once, before this field
+    /// is set, so every later use just splices it in verbatim rather than
+    /// re-rendering). A bare reference to `var` resolves to `PlayerId
+    /// ({idx_text} as u32)` directly (`render_expr`'s own `Expr::Ident`
+    /// arm) with `is_crossref: true`, so the existing generic `Expr::
+    /// Member` fallback -- the same one `sides[i]`/`sectors[i]`'s own bare,
+    /// crossref-flagged index arms already rely on -- transparently wraps
+    /// any further `.field` chain in `world[..]` with no dedicated `Member`
+    /// arm needed here at all. `None` everywhere else, including every
+    /// isolated-fragment test below that doesn't exercise this shape.
+    players_index_alias: Option<(&'a str, &'a str)>,
     /// Set only while rendering the statements a forward `goto` jumps
     /// *over* (the block `render_compound_items`'s own goto-to-common-
     /// label transform wraps in a Rust labeled block) -- the label name
@@ -1043,6 +1067,19 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             if name == "automapactive" {
                 return Ok(("world.automapactive".to_string(), false));
             }
+            // `playeringame` (`doomstat.h`'s own `extern boolean
+            // playeringame[MAXPLAYERS];`, `P_SpawnPlayer`'s own "not
+            // playing?" early-return guard, `p_mobj.c`) -- the same
+            // "genuine mutable game state, hand-matched by name" category
+            // `braintargets`/`activeplats` already established, just a
+            // fixed-size `bool` array instead of `Handle<Thinker>`-typed --
+            // resolving the bare array name here (rather than a dedicated
+            // `Expr::Index` arm) lets the already-generic `Expr::Index`
+            // fallback further below index straight into it with no
+            // further changes.
+            if name == "playeringame" {
+                return Ok(("world.playeringame".to_string(), false));
+            }
             // `respawnmonsters` (`doomstat.h`'s own `extern boolean
             // respawnmonsters;`, `P_MobjThinker`'s own "-respawn" mode
             // check, `p_mobj.c`) -- the same `netgame`/`onground`/
@@ -1093,6 +1130,26 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                     format!("{}.psprites[{counter} as usize]", ctx.self_param),
                     false,
                 ));
+            }
+            // `p` (`P_SpawnPlayer`'s own `p = &players[mthing->type-1];`)
+            // -- `FnBodyContext::players_index_alias`'s own doc comment: a
+            // bare reference resolves directly to `PlayerId({idx} as u32)`,
+            // *not* `Option`-wrapped (the same "bare identity value" idiom
+            // a `Handle<Thinker>`-registered local already gets, `mobj`/
+            // `th`'s own bare rendering just below) -- only the one real
+            // corpus write site that actually needs an `Option<PlayerId>`
+            // (`mobj->player = p;`) wraps it in `Some(..)` itself, at that
+            // write's own point of use. `is_crossref: true` so the generic
+            // `Expr::Member` fallback further below transparently wraps a
+            // further `.field` chain (`p->health`, etc.) in `world[..]`,
+            // the same `sides[i]`/`sectors[i]` composition `sector_walk_
+            // alias` doesn't need (that one resolves to an *already-
+            // `World`-indexed* expression) but this one, like those two,
+            // does.
+            if let Some((var, idx)) = ctx.players_index_alias
+                && name == var
+            {
+                return Ok((format!("PlayerId({idx} as u32)"), true));
             }
             let is_crossref = ctx
                 .extra_cross_ref_idents
@@ -1882,6 +1939,33 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (lhs_text, _) = render_expr(shl_lhs, ctx)?;
             Ok((format!("(({lhs_text}) as i32) << FRACBITS"), false))
         }
+        // `(mthing->type-1)<<MF_TRANSSHIFT` (`P_SpawnPlayer`, `p_mobj.c`)
+        // -- `MapThing.type: i16` (`struct_fields.rs`), so C's own integer
+        // promotion (`short` -> `int` before *any* arithmetic, including
+        // the shift itself, not just after it) needs the same explicit
+        // widen-*before*-the-shift the `FRACBITS` arm just above already
+        // gets, just for a different shift amount. Confirmed a real
+        // `rustc` rejection (`attempt to shift left ... which would
+        // overflow` -- a plain `i16` has no bit 26 to shift into at all)
+        // by compiling the naive "cast the whole shift result afterward"
+        // version first, not assumed: the cast has to move *inside*,
+        // before the shift, not just wrap the outside. Detected by a bare
+        // reference to `mthing` anywhere in the shifted side
+        // (`expr_has_any_ident_ref`, already used corpus-wide for this
+        // exact "does this expression touch that one name" question)
+        // rather than matching the exact `(mthing->type-1)` shape, since
+        // nothing else in this function shifts by `MF_TRANSSHIFT` for this
+        // arm to ever wrongly fire against.
+        Expr::Binary {
+            op: BinaryOp::Shl,
+            lhs: shl_lhs,
+            rhs: shl_rhs,
+        } if matches!(shl_rhs.as_ref(), Expr::Ident(n) if n == "MF_TRANSSHIFT")
+            && expr_has_any_ident_ref(shl_lhs, &["mthing"]) =>
+        {
+            let (lhs_text, _) = render_expr(shl_lhs, ctx)?;
+            Ok((format!("(({lhs_text}) as i32) << MF_TRANSSHIFT"), false))
+        }
         // `ANG45 * (mthing->angle/45)` (`P_NightmareRespawn`, also
         // `P_SpawnPlayer`/`P_SpawnMapThing`, not yet translated) -- mixes
         // an `ANGxx` macro (rendered opaque `u32`, the same convention the
@@ -2206,6 +2290,41 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
             let (lhs_text, _) = render_expr(lhs, ctx)?;
             Ok((format!("{lhs_text}.unwrap().0 as usize"), false))
         }
+        // `mthing->type-1 == consoleplayer` (`P_SpawnPlayer`, `p_mobj.c`)
+        // -- a genuinely different comparison shape than `player ==
+        // &players[consoleplayer]` above: `consoleplayer` (a `PlayerId`-
+        // typed `World` field, round 14) is compared directly against a
+        // computed player *index* expression here, not against `&players
+        // [consoleplayer]`'s own address-of-index shape -- so the bare
+        // `consoleplayer` identifier itself just resolves to `world.
+        // consoleplayer`, while the raw `int`-valued other side needs
+        // wrapping into a real `PlayerId` for the comparison to type-check
+        // at all (`PlayerId` derives `PartialEq` against itself only, not
+        // `i32`) -- confirmed a real `rustc` rejection by rendering the
+        // naive unwrapped version first, not assumed.
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (matches!(lhs.as_ref(), Expr::Ident(n) if n == "consoleplayer")
+                    || matches!(rhs.as_ref(), Expr::Ident(n) if n == "consoleplayer")) =>
+        {
+            let side_text = |e: &Expr| -> Result<String, String> {
+                if matches!(e, Expr::Ident(n) if n == "consoleplayer") {
+                    Ok("world.consoleplayer".to_string())
+                } else {
+                    let (t, _) = render_expr(e, ctx)?;
+                    Ok(format!("PlayerId(({t}) as u32)"))
+                }
+            };
+            Ok((
+                format!(
+                    "{} {} {}",
+                    side_text(lhs)?,
+                    render_binop(*op),
+                    side_text(rhs)?
+                ),
+                false,
+            ))
+        }
         // `dist > 14*64`/`dist < 196`/`P_Random() < dist` (`P_CheckMissile
         // Range`) -- a comparison between a genuinely `fixed_t`-declared
         // local (`FnBodyContext::fixed_t_locals`) and a plain `int`-valued
@@ -2527,6 +2646,28 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "sectors") => {
             let (index_text, _) = render_expr(index, ctx)?;
             Ok((format!("SectorId({index_text} as u32)"), true))
+        }
+        // `playeringame[mthing->type-1]` (`P_SpawnPlayer`) -- its own
+        // dedicated arm, not the generic by-name-listed `Expr::Index`
+        // fallback further below (`textureheight[..]`/`mobjinfo[..]`/etc.):
+        // that fallback's own `{index_text} as usize` splice has no
+        // surrounding parens, correct for every real corpus index it's
+        // handled so far (always a bare `Expr::Member`/`Expr::Ident`, never
+        // lower-precedence than a cast) but wrong here -- `mthing->type-1`
+        // is a real `Expr::Binary` (`Sub`), and Rust's `as` binds tighter
+        // than `-`, so an unparenthesized splice would parse as `mthing.
+        // r#type - (1 as usize)`, a genuine type mismatch (confirmed by
+        // rendering the naive version through that fallback first, not
+        // assumed). Parenthesizing the whole index expression here sidesteps
+        // the gap without touching that shared, already-proven-correct-for-
+        // its-own-shapes list.
+        Expr::Index { base, index } if matches!(base.as_ref(), Expr::Ident(n) if n == "playeringame") =>
+        {
+            let (index_text, _) = render_expr(index, ctx)?;
+            Ok((
+                format!("world.playeringame[({index_text}) as usize]"),
+                false,
+            ))
         }
         // `sectors[currentSector].lines[line]` (`twoSided`/`getSide`/
         // `getSector`, `p_spec.c`) -- these three functions' own bodies
@@ -3391,6 +3532,21 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         } if matches!(expr.as_ref(), Expr::Member { field, .. } if field == "backpack") => {
             Ok(format!("!{}", render_expr(expr, ctx)?.0))
         }
+        // `if (!playeringame[mthing->type-1]) return;` (`P_SpawnPlayer`,
+        // `p_mobj.c`) -- a *bare top-level* negated index into
+        // `playeringame` (a real Rust `bool` array, `world.playeringame`'s
+        // own `Expr::Ident` rewrite just above), the `cards`/`weaponowned`
+        // arm's own sibling for a bare-`Ident` base (a global array) rather
+        // than a `Member` one (a self-struct field). Checked before the
+        // generic `Unary::Not` `== 0` fallback just below, which would
+        // otherwise wrongly apply plain-`int` truthiness to an already-
+        // `bool` value.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Index { base, .. } if matches!(base.as_ref(), Expr::Ident(n) if n == "playeringame")) => {
+            Ok(format!("!{}", render_expr(expr, ctx)?.0))
+        }
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -3450,6 +3606,20 @@ fn render_bool_expr(cond: &Expr, ctx: &FnBodyContext) -> Result<String, String> 
         // never needed until this first real corpus example (every earlier
         // `boolean`-local truthiness check in this codebase's own corpus
         // so far only ever appeared negated).
+        // `if (deathmatch)` (`P_SpawnPlayer`, `p_mobj.c`) -- deliberately
+        // *not* special-cased here: `deathmatch` is corpus-verified (`P_
+        // GiveWeapon`'s already-shipped `deathmatch != 2`) to be a bare,
+        // unregistered global compared against more than just `0`/`1`
+        // despite its `boolean` C declaration, so a bare top-level
+        // reference correctly falls through to the generic `Expr::Ident =>
+        // != 0` fallback further below (`P_GiveAmmo`'s own `oldammo`
+        // precedent) rather than getting `ctx.bool_locals`'s "already
+        // `bool`" treatment the way `netgame`/`automapactive` do -- adding
+        // a `name == "deathmatch"` rewrite here was tried and is a real
+        // regression (confirmed by running the full suite against it, not
+        // assumed): `deathmatch != 2` would become `world.deathmatch != 2`,
+        // comparing a genuine Rust `bool` against `2`, a real `rustc`
+        // rejection.
         Expr::Ident(n) if ctx.bool_locals.contains(n.as_str()) => Ok(render_expr(cond, ctx)?.0),
         // `while (xmove || ymove)` (`P_XYMovement`'s own `do`/`while`
         // condition, `p_mobj.c`) -- a bare, non-negated `fixed_t`-declared
@@ -3846,6 +4016,14 @@ fn render_decl(d: &Declaration, ctx: &FnBodyContext, depth: usize) -> Result<Vec
         if ctx.extra_cross_ref_idents.get(&name).map(String::as_str) == Some("SpawnpointAlias") {
             continue;
         }
+        // `player_t* p;` (`P_SpawnPlayer`) -- the `players_index_alias`
+        // sibling of `mthing`'s own skip just above: never becomes a real
+        // Rust binding either, since every reference to it resolves
+        // statically through `FnBodyContext::players_index_alias` instead
+        // (see its own doc comment).
+        if ctx.players_index_alias.map(|(v, _)| v) == Some(name.as_str()) {
+            continue;
+        }
         // `mobjtype_t type;` (`A_SpawnFly`'s own monster-selection local)
         // -- a plain local literally named `type`, a real Rust keyword.
         // Every declarator name reaching this point used to render
@@ -4067,6 +4245,16 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // fires for a statement that collector has *already* registered --
         // never a same-shaped assignment into some other, unrelated local.
         _ if is_spawnpoint_alias_assign(s, ctx.self_param) => Ok(vec![]),
+        // `p = &players[mthing->type-1];` (`P_SpawnPlayer`) -- discarded
+        // entirely, the statement-skip half of `players_index_alias`'s own
+        // three-part design (decl-skip, statement-skip, bare-`Ident`-read
+        // rewrite -- see `FnBodyContext::players_index_alias`'s own doc
+        // comment), the exact sibling of `mthing = &mobj->spawnpoint;`'s
+        // own discard just above. Guarded by the same shape predicate
+        // `render_trigger_fn` uses to populate the alias in the first
+        // place (`is_players_index_alias_assign`), so the two can never
+        // drift apart on what counts.
+        _ if is_players_index_alias_assign(s).is_some() => Ok(vec![]),
         Stmt::Expr(Some(e)) => Ok(vec![format!(
             "{}{};",
             indent(depth),
@@ -6062,6 +6250,18 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             let field = rust_field_name(lhs_field)?;
             let is_option_handle_field = lhs_field == "target" || lhs_field == "tracer";
             let rhs_is_self = matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param);
+            // `mobj->player = p;` (`P_SpawnPlayer`) -- `Mobj.player`'s own
+            // `Option<PlayerId>` sibling of `is_option_handle_field`'s
+            // `target`/`tracer` pair just above: `p` (`FnBodyContext::
+            // players_index_alias`) renders bare as a plain, non-`Option`
+            // `PlayerId` value (the same "bare identity" idiom a `Handle<
+            // Thinker>`-registered local already gets), so this one real
+            // corpus write needs its own `Some(..)` wrap, scoped narrowly
+            // to this exact field/alias pairing rather than generalized
+            // ahead of a second real example.
+            let is_option_player_field = lhs_field == "player";
+            let rhs_is_players_index_alias = matches!(rhs.as_ref(), Expr::Ident(n)
+                if ctx.players_index_alias.map(|(v, _)| v) == Some(n.as_str()));
             // `th->momz = P_Random()*512;` (`A_BrainExplode`) -- a plain
             // `i32` expression (no `FixedT` source anywhere in it, see
             // `expr_is_fixed_t_valued`'s own doc comment) assigned into a
@@ -6114,6 +6314,8 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             };
             let rhs_text = if is_option_handle_field && rhs_is_self {
                 "Some(handle)".to_string()
+            } else if is_option_player_field && rhs_is_players_index_alias {
+                format!("Some({})", render_expr(rhs, &rhs_ctx)?.0)
             } else if *op == AssignOp::Assign
                 && is_fixed_t_field
                 && !expr_is_fixed_t_valued(rhs, &rhs_ctx)
@@ -6645,6 +6847,17 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         let lhs_is_option_handle_global = matches!(lhs.as_ref(), Expr::Ident(n)
             if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("Option<Handle<Thinker>>"));
         let rhs_is_self = matches!(rhs.as_ref(), Expr::Ident(n) if n == ctx.self_param);
+        // `p->mo = mobj;` (`P_SpawnPlayer`) -- writing a bare `Handle<
+        // Thinker>`-typed local (`mobj`, fresh out of `P_SpawnMobj`)
+        // straight into `Player.mo: Option<Handle<Thinker>>`, reached
+        // through `p` (`FnBodyContext::players_index_alias`) rather than a
+        // self-struct field or a hand-matched-by-name global -- the same
+        // `Some(..)` wrap `lhs_is_target_or_tracer_self_field`/`lhs_is_
+        // activeplats_index` already need for their own, differently-
+        // based `Option<Handle<Thinker>>` LHS shapes.
+        let lhs_is_players_index_mo_field = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if field == "mo"
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.players_index_alias.map(|(v, _)| v) == Some(n.as_str())));
         // `braintargets[numbraintargets] = m;` (`A_BrainAwake`) -- storing
         // a scanned thinker's own `Handle<Thinker>` (`FnBodyContext::
         // thinker_scan_handle_alias`'s own doc comment covers why this
@@ -6678,6 +6891,7 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             || (lhs_is_target_or_tracer_self_field && rhs_is_handle_local)
             || (lhs_is_activeplats_index && rhs_is_handle_local)
             || (lhs_is_option_handle_global && rhs_is_handle_local)
+            || (lhs_is_players_index_mo_field && rhs_is_handle_local)
         {
             // `soundtarget = target;` (`P_NoiseAlert`) -- the last real
             // gap `lhs_is_option_handle_global`'s own `rhs_is_self` arm
@@ -8013,6 +8227,7 @@ fn render_fn_impl_with_two_scalar_params(
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
         psprite_walk_alias: None,
+        players_index_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         switch_break_label: None,
@@ -8175,6 +8390,7 @@ pub fn render_weapon_fn(
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
         psprite_walk_alias: None,
+        players_index_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         switch_break_label: None,
@@ -8900,12 +9116,90 @@ fn is_spawnpoint_alias_assign(s: &Stmt, self_param: &str) -> bool {
             if field == "spawnpoint" && matches!(base.as_ref(), Expr::Ident(n) if n == self_param)))
 }
 
+/// Whether `s` is exactly `IDENT = &players[EXPR];` (`P_SpawnPlayer`'s own
+/// `p = &players[mthing->type-1];`, `p_mobj.c`) -- shared by `render_
+/// trigger_fn` (to compute `FnBodyContext::players_index_alias`, see its
+/// own doc comment for the full shape) and `render_stmt` (to discard the
+/// statement itself once found), the same "shared guard" discipline `is_
+/// spawnpoint_alias_assign` already established just above for its own,
+/// differently-shaped alias-establishing statement. Returns the aliased
+/// name and the raw (not yet rendered) index expression.
+fn is_players_index_alias_assign(s: &Stmt) -> Option<(&str, &Expr)> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+    else {
+        return None;
+    };
+    let Expr::Ident(name) = lhs.as_ref() else {
+        return None;
+    };
+    let Expr::Unary {
+        op: UnaryOp::AddrOf,
+        expr,
+    } = rhs.as_ref()
+    else {
+        return None;
+    };
+    let Expr::Index { base, index } = expr.as_ref() else {
+        return None;
+    };
+    if !matches!(base.as_ref(), Expr::Ident(n) if n == "players") {
+        return None;
+    }
+    Some((name.as_str(), index.as_ref()))
+}
+
+/// A depth-first search for the one real `is_players_index_alias_assign`
+/// shape anywhere in a trigger function's own body -- `render_trigger_fn`'s
+/// own pre-pass, mirroring every other `collect_*`-family alias scanner's
+/// traversal shape (`collect_spawnpoint_alias_stmt` immediately above),
+/// just returning the first (and, corpus-wide, only ever) match instead of
+/// building a `HashMap` of every one found, since `FnBodyContext::players_
+/// index_alias` only ever holds one alias at a time.
+fn find_players_index_alias(items: &[BlockItem]) -> Option<(&str, &Expr)> {
+    items.iter().find_map(|item| match item {
+        BlockItem::Stmt(s) => players_index_alias_in_stmt(s),
+        BlockItem::Decl(_) => None,
+    })
+}
+
+fn players_index_alias_in_stmt(s: &Stmt) -> Option<(&str, &Expr)> {
+    if let Some(found) = is_players_index_alias_assign(s) {
+        return Some(found);
+    }
+    match s {
+        Stmt::Compound(c) => find_players_index_alias(&c.items),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => players_index_alias_in_stmt(then_branch)
+            .or_else(|| else_branch.as_deref().and_then(players_index_alias_in_stmt)),
+        Stmt::Switch { body, .. } => players_index_alias_in_stmt(body),
+        Stmt::Case { stmt, .. } => players_index_alias_in_stmt(stmt),
+        Stmt::Default(stmt) => players_index_alias_in_stmt(stmt),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => players_index_alias_in_stmt(body),
+        Stmt::For { body, .. } => players_index_alias_in_stmt(body),
+        _ => None,
+    }
+}
+
 /// Whether `e` is exactly `{self_param}->spawnpoint.x << FRACBITS` (or
 /// `.y`) -- shared by `render_expr`'s own `Expr::Binary { op: Shl, .. }`
 /// arm (which renders the widened shift) and `render_expr_stmt`'s own
 /// plain-assignment `FixedT` wrap (which needs to recognize the exact same
 /// shape to know a wrap is safe here without risking `T_MoveCeiling`'s own
-/// `CEILSPEED` regression -- see that arm's own doc comment).
+/// `CEILSPEED` regression -- see that arm's own doc comment). Also matches
+/// `mthing->x << FRACBITS` (or `.y`) directly -- `P_SpawnPlayer`'s own
+/// idiom, `mthing` here a genuine `&MapThing` function *parameter*
+/// (`render_trigger_fn`'s own shape), not `P_NightmareRespawn`'s `mthing =
+/// &mobj->spawnpoint;` alias -- so the same `i16`-widen-before-shift need
+/// (`MapThing.x`/`.y: i16`, `struct_fields.rs`) shows up one `Member` level
+/// shallower, with no `self_param`/`spawnpoint` indirection to match
+/// through at all.
 fn is_spawnpoint_xy_shl_fracbits(e: &Expr, self_param: &str) -> bool {
     let Expr::Binary {
         op: BinaryOp::Shl,
@@ -8921,9 +9215,12 @@ fn is_spawnpoint_xy_shl_fracbits(e: &Expr, self_param: &str) -> bool {
     let Expr::Member { base, field, .. } = shl_lhs.as_ref() else {
         return false;
     };
-    (field == "x" || field == "y")
-        && matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
-            if bf == "spawnpoint" && matches!(bb.as_ref(), Expr::Ident(n) if n == self_param))
+    if field != "x" && field != "y" {
+        return false;
+    }
+    matches!(base.as_ref(), Expr::Member { base: bb, field: bf, .. }
+        if bf == "spawnpoint" && matches!(bb.as_ref(), Expr::Ident(n) if n == self_param))
+        || matches!(base.as_ref(), Expr::Ident(n) if n == "mthing")
 }
 
 /// Locals directly assigned a line's own `frontsector`/`backsector`
@@ -10533,6 +10830,7 @@ pub fn render_spawn_fn(
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
         psprite_walk_alias: None,
+        players_index_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         switch_break_label: None,
@@ -10916,12 +11214,36 @@ pub fn render_trigger_fn(
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
         psprite_walk_alias: None,
+        players_index_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         switch_break_label: None,
         return_type: None,
         static_locals: &HashMap::new(),
         bool_locals: &HashSet::new(),
+    };
+    // `p = &players[mthing->type-1];` (`P_SpawnPlayer`) -- see
+    // `FnBodyContext::players_index_alias`'s own doc comment. Found (if at
+    // all) *before* the real `ctx` used to render the body, then the index
+    // expression is rendered once, right here, against the alias-free
+    // `ctx` above (sound: the index expression itself never references
+    // `p`, so nothing about `players_index_alias` being unset yet affects
+    // its own rendering) -- every later `p`/`p->field` reference then
+    // splices in this same already-rendered, parenthesized text instead of
+    // re-rendering the index expression at each point of use.
+    let players_alias = find_players_index_alias(&f.body.items);
+    let players_alias_idx_text = players_alias
+        .map(|(_, idx_expr)| -> Result<String, String> {
+            let (text, _) = render_expr(idx_expr, &ctx)?;
+            Ok(format!("({text})"))
+        })
+        .transpose()?;
+    let ctx = match (players_alias, &players_alias_idx_text) {
+        (Some((var, _)), Some(idx_text)) => FnBodyContext {
+            players_index_alias: Some((var, idx_text.as_str())),
+            ..ctx
+        },
+        _ => ctx,
     };
 
     let body_lines = render_compound_items(&f.body.items, &ctx, 1)?;
@@ -10981,6 +11303,7 @@ pub fn render_pure_fn(
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
         psprite_walk_alias: None,
+        players_index_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         switch_break_label: None,
@@ -11090,6 +11413,7 @@ pub fn render_world_fn(
         thinker_scan_handle_alias: None,
         sector_walk_alias: None,
         psprite_walk_alias: None,
+        players_index_alias: None,
         active_goto_label: None,
         active_for_continue_step: None,
         switch_break_label: None,
@@ -11823,6 +12147,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -11923,6 +12248,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -11983,6 +12309,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -12064,6 +12391,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -12232,6 +12560,7 @@ pub fn EV_StartLightStrobing(line: LineId, world: &mut World, thinkers: &mut Are
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -13429,6 +13758,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -13505,6 +13835,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -13607,6 +13938,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -13689,6 +14021,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -13772,6 +14105,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -13860,6 +14194,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -15345,6 +15680,7 @@ pub fn EV_VerticalDoor(line: LineId, thing: Handle<Thinker>, world: &mut World, 
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -16146,6 +16482,7 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
             thinker_scan_handle_alias: None,
             sector_walk_alias: None,
             psprite_walk_alias: None,
+            players_index_alias: None,
             active_goto_label: None,
             active_for_continue_step: None,
             switch_break_label: None,
@@ -22865,6 +23202,84 @@ pub fn P_UseSpecialLine(thing: Handle<Thinker>, line: LineId, side: i32, world: 
         _ => {}
     }
     return true;
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    // `P_SpawnPlayer` (`p_mobj.c`, round 29) -- the primary new mechanism
+    // this round lands: `p = &players[mthing->type-1];`, a *computed*-
+    // index alias into the fixed-size `players[]` global array, genuinely
+    // different from every earlier `PlayerId` shape (`FnBodyContext::
+    // players_index_alias`'s own doc comment has the full corpus
+    // reasoning). Everything else composes from already-shipped machinery:
+    // `mthing: &MapThing` is an ordinary `render_trigger_fn` parameter (no
+    // new shape at all, `mthing->field` already resolves generically once
+    // it's a real, unregistered local); `mobj = P_SpawnMobj(..)` reuses
+    // `A_Tracer`'s own `Handle<Thinker>`-local write machinery verbatim
+    // (`local_var_types` registers it manually here, since `render_trigger_
+    // fn` -- unlike `render_fn_impl` -- has no automatic `P_SpawnMobj`-
+    // local collector of its own); `ANG45 * (mthing->angle/45)`/`mthing->x
+    // << FRACBITS` both reuse `P_NightmareRespawn`'s own already-shipped
+    // arms, the latter's own guard widened this round to also match a bare
+    // `mthing` parameter base, not just its `self.spawnpoint` alias shape.
+    fn test_p_spawn_player_renders_exactly() {
+        let params = field_types(&[("mthing", "&MapThing")]);
+        let locals = field_types(&[("mobj", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_mobj.c",
+            "P_SpawnPlayer",
+            &params,
+            &locals,
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_SpawnPlayer(mthing: &MapThing, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut x;
+    let mut y;
+    let mut z;
+    let mut mobj;
+    let mut i;
+    if !world.playeringame[(mthing.r#type - 1) as usize] {
+        return;
+    }
+    if world[PlayerId((mthing.r#type - 1) as u32)].playerstate == PST_REBORN {
+        G_PlayerReborn(mthing.r#type - 1);
+    }
+    x = FixedT(((mthing.x) as i32) << FRACBITS);
+    y = FixedT(((mthing.y) as i32) << FRACBITS);
+    z = ONFLOORZ;
+    mobj = P_SpawnMobj(x, y, z, MT_PLAYER);
+    if mthing.r#type > 1 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mobj) { m.flags |= ((mthing.r#type - 1) as i32) << MF_TRANSSHIFT; };
+    }
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mobj) { m.angle = ANG45 * ((mthing.angle) / 45) as u32; };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mobj) { m.player = Some(PlayerId((mthing.r#type - 1) as u32)); };
+    if let Some(Thinker::Mobj(m)) = thinkers.get_mut(mobj) { m.health = world[PlayerId((mthing.r#type - 1) as u32)].health; };
+    world[PlayerId((mthing.r#type - 1) as u32)].mo = Some(mobj);
+    world[PlayerId((mthing.r#type - 1) as u32)].playerstate = PST_LIVE;
+    world[PlayerId((mthing.r#type - 1) as u32)].refire = 0;
+    world[PlayerId((mthing.r#type - 1) as u32)].message = None;
+    world[PlayerId((mthing.r#type - 1) as u32)].damagecount = 0;
+    world[PlayerId((mthing.r#type - 1) as u32)].bonuscount = 0;
+    world[PlayerId((mthing.r#type - 1) as u32)].extralight = 0;
+    world[PlayerId((mthing.r#type - 1) as u32)].fixedcolormap = 0;
+    world[PlayerId((mthing.r#type - 1) as u32)].viewheight = VIEWHEIGHT;
+    P_SetupPsprites(PlayerId((mthing.r#type - 1) as u32));
+    if deathmatch != 0 {
+        i = 0;
+        while i < NUMCARDS {
+            world[PlayerId((mthing.r#type - 1) as u32)].cards[i as usize] = true;
+            i += 1;
+        }
+    }
+    if PlayerId((mthing.r#type - 1) as u32) == world.consoleplayer {
+        ST_Start();
+        HU_Start();
+    }
 }";
         assert_eq!(rendered, expected);
     }

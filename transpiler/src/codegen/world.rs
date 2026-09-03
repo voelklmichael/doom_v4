@@ -134,6 +134,23 @@
 //! raw C int" reasoning `linetarget`/`corpsehit` already get for their
 //! own `Handle<Thinker>` fields, just for this project's other index
 //! newtype.
+//! `playeringame` joined once `P_SpawnPlayer` (`p_mobj.c`, round 29)
+//! needed somewhere to hold `doomstat.h`'s own file-scope `boolean
+//! playeringame[MAXPLAYERS];` -- the same "genuine mutable game state,
+//! hand-matched by name" category `braintargets`/`consoleplayer` already
+//! established, just a fixed-size `bool` array (each slot "is this player
+//! slot in use", indexed by the same computed player index `players[]`
+//! itself is, see `FnBodyContext::players_index_alias`) instead of an
+//! index newtype or a `Handle<Thinker>`. `deathmatch` (the same file's
+//! `boolean deathmatch;`, `P_SpawnPlayer`'s own "give all cards in death
+//! match mode" check) deliberately does *not* join it here, despite
+//! looking like the identical shape at first glance: `P_GiveWeapon`'s own
+//! already-shipped `deathmatch != 2` (round 14) proves it's genuinely
+//! compared against more than `0`/`1` corpus-wide, so it stays a bare,
+//! unregistered global (`render_bool_expr`'s generic `Expr::Ident => != 0`
+//! fallback already handles `if (deathmatch)` correctly) rather than a
+//! real `World` field this project would have to commit to a `bool` type
+//! for.
 //!
 //! Lives in `p_tick` (`type_placement.rs`), alongside `Thinker`: both are
 //! new, invented infrastructure with no direct corpus counterpart, and
@@ -175,6 +192,7 @@ pub struct World {
     pub validcount: i32,
     pub soundtarget: Option<Handle<Thinker>>,
     pub consoleplayer: PlayerId,
+    pub playeringame: [bool; MAXPLAYERS],
 }
 
 impl std::ops::Index<SectorId> for World {
@@ -293,6 +311,7 @@ mod tests {
         assert!(rendered.contains("pub validcount: i32,"));
         assert!(rendered.contains("pub soundtarget: Option<Handle<Thinker>>,"));
         assert!(rendered.contains("pub consoleplayer: PlayerId,"));
+        assert!(rendered.contains("pub playeringame: [bool; MAXPLAYERS],"));
         assert!(rendered.contains("impl std::ops::Index<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::IndexMut<SectorId> for World"));
         assert!(rendered.contains("impl std::ops::Index<SideId> for World"));
