@@ -582,6 +582,23 @@ fn return_expr_needs_i32_cast(e: &Expr) -> bool {
             lhs,
             ..
         } => matches!(lhs.as_ref(), Expr::Member { field, .. } if field == "flags"),
+        // `newweapon = (cmd->buttons&BT_WEAPONMASK)>>BT_WEAPONSHIFT;`
+        // (`P_PlayerThink`, `p_user.c`) -- `TicCmd.buttons: u8`
+        // (`struct_fields.rs`, from C's `byte`), so the bit-extraction's
+        // own real Rust type is `u8`, but `newweapon` (a plain, deferred-
+        // typed local) is compared against/assigned into real `i32`
+        // fields everywhere else in the same function (`player.readyweapon`/
+        // `.pendingweapon`) -- the same "C's own comparison/bitwise-read
+        // idiom needs an explicit cast Rust doesn't insert for free" gap
+        // this predicate already exists to close for `flags`, just a
+        // `Shr`-of-`BitAnd` shape over a different, narrower-than-`i32`
+        // field instead of a bare `BitAnd`.
+        Expr::Binary {
+            op: BinaryOp::Shr,
+            lhs,
+            ..
+        } => matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::BitAnd, lhs: and_lhs, .. }
+            if matches!(and_lhs.as_ref(), Expr::Member { field, .. } if field == "buttons")),
         _ => false,
     }
 }
@@ -3088,6 +3105,44 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
         // origin`) accepts it, not because the value is actually becoming
         // a `Mobj`.
         Expr::Cast { expr, .. } => render_expr(expr, ctx),
+        // `player->mo->reactiontime--;` (`P_PlayerThink`, `p_user.c`) --
+        // `expr` here is `is_self_bare_handle_field`-shaped (a write
+        // *through* `player.mo`, not a plain self-struct field like
+        // `player->refire` just below), so rendering it with the generic
+        // `PostIncDec`/`PreIncDec` arm's own "read the target, append `+=
+        // 1`" recipe would append onto a read-only `match thinkers.get(..)
+        // {..}` expression -- not a real Rust lvalue at all, a genuine
+        // `rustc` parse/type rejection (`-=` on a `match` value), confirmed
+        // by rendering the naive translation first. Needs the same fresh
+        // `thinkers.get_mut(..)` write this exact field already gets from
+        // its own dedicated `Expr::Assign` arm (`player->mo->angle = ..`)
+        // -- reused verbatim here instead of duplicated, just swapping the
+        // assignment for a compound `+=`/`-= 1`.
+        Expr::PostIncDec { expr, op } | Expr::PreIncDec { expr, op }
+            if matches!(expr.as_ref(), Expr::Member { base, .. }
+                if is_self_bare_handle_field(base, ctx.self_param, ctx.self_field_types)) =>
+        {
+            let Expr::Member {
+                base: mo_field,
+                field,
+                ..
+            } = expr.as_ref()
+            else {
+                unreachable!("guarded above")
+            };
+            let (base_text, _) = render_expr(mo_field, ctx)?;
+            let field = rust_field_name(field)?;
+            let op_text = match op {
+                IncDecOp::Inc => "+= 1",
+                IncDecOp::Dec => "-= 1",
+            };
+            Ok((
+                format!(
+                    "if let Some(Thinker::Mobj(m)) = thinkers.get_mut({base_text}.unwrap()) {{ m.{field} {op_text}; }}"
+                ),
+                false,
+            ))
+        }
         // `player->refire++;` (`A_ReFire`) -- a bare increment/decrement
         // used as its own standalone statement, not as an `if`'s own
         // condition (`hoist_pre_inc_dec`'s own narrower shape, which
@@ -7036,6 +7091,23 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
         // else fails loudly rather than guessing.
         let lhs_is_cards_index = matches!(lhs.as_ref(), Expr::Index { base, .. }
             if matches!(base.as_ref(), Expr::Member { field, .. } if field == "cards"));
+        // `cmd->forwardmove = 0xc800/512;` (`P_PlayerThink`, `p_user.c`) --
+        // `TicCmd.forwardmove`/`.sidemove: i8` (`struct_fields.rs`), the
+        // same narrow-write sibling of `cmd->forwardmove*2048`'s own
+        // widen-before-*read* arm, but going the other direction: `0xc800`
+        // (51200) doesn't fit `i8` on its own, even though the *divided*
+        // result (100) would -- Rust infers both literal operands' types
+        // from the assignment target before dividing, unlike C's own
+        // promote-then-truncate-on-assign, so the naive translation is a
+        // real `rustc` "literal out of range for `i8`" rejection,
+        // confirmed by compiling it first. Scoped to a compound
+        // (non-literal) RHS specifically -- `cmd->sidemove = 0;`'s own
+        // bare-literal sibling assignment needs no cast at all (`0` fits
+        // trivially, wrapping it would just be a redundant, `clippy`-
+        // flagged cast).
+        let lhs_is_cmd_forwardmove_or_sidemove = matches!(lhs.as_ref(), Expr::Member { base, field, .. }
+            if (field == "forwardmove" || field == "sidemove")
+                && matches!(base.as_ref(), Expr::Ident(n) if ctx.extra_cross_ref_idents.get(n.as_str()).map(String::as_str) == Some("CmdAlias")));
         let rhs_is_u32_self_field = matches!(rhs.as_ref(), Expr::Member { base, field, .. }
             if matches!(base.as_ref(), Expr::Ident(n) if n == ctx.self_param)
                 && ctx.self_field_types.get(field.as_str()).map(String::as_str) == Some("u32"));
@@ -7407,7 +7479,8 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
                     ));
                 }
             }
-        } else if lhs_is_plain_int_local
+        } else if (lhs_is_plain_int_local
+            || matches!(lhs.as_ref(), Expr::Ident(n) if n == "newweapon"))
             && *op == AssignOp::Assign
             && return_expr_needs_i32_cast(rhs)
         {
@@ -7420,8 +7493,23 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
             // `Stmt::Return` -- the same "C's own comparison-as-int
             // idiom needs an explicit cast Rust doesn't insert for free"
             // gap that predicate already exists to close, reused verbatim
-            // rather than duplicating its two-shape match.
+            // rather than duplicating its two-shape match. `newweapon`
+            // (`P_PlayerThink`, `p_user.c`) needs the identical fix but
+            // isn't itself in `plain_int_locals` -- its C declaration is
+            // `weapontype_t newweapon;`, an enum-typedef local rather than
+            // a bare `int` one (`render_decl`'s own "any `TypedefName`
+            // gets the same deferred, infer-from-first-use treatment as a
+            // bare `int`" rule, `plain_int_locals` is only ever populated
+            // from genuinely `int`-declared locals) -- hand-matched by its
+            // one real corpus name, the same "no general local-type
+            // registry yet" reasoning several other by-name arms in this
+            // module already rely on.
             format!("({rhs_text}) as i32")
+        } else if lhs_is_cmd_forwardmove_or_sidemove
+            && *op == AssignOp::Assign
+            && matches!(rhs.as_ref(), Expr::Binary { .. })
+        {
+            format!("({rhs_text}) as i8")
         } else {
             rhs_text
         };
@@ -22714,6 +22802,184 @@ pub fn P_DeathThink(player: &mut Player, world: &mut World, thinkers: &mut Arena
     }
     if (player.cmd.buttons & BT_USE) != 0 {
         player.playerstate = PST_REBORN;
+    }
+}";
+        assert_eq!(rendered, expected);
+    }
+
+    /// `P_PlayerThink` (`p_user.c`) -- round 32's own third and final
+    /// player-tick pickup, completing the `P_MovePlayer`/`P_DeathThink`/
+    /// `P_PlayerThink` trio: the top-level function `P_Ticker` calls once
+    /// per player per tic, blocked in round 12/13's own read for the same
+    /// now-resolved "its own callees aren't translated yet" reason as its
+    /// two siblings, all now landed. `cmd->angleturn = 0;`/`cmd->sidemove
+    /// = 0;` are the first real *writes* through `collect_cmd_alias`'s own
+    /// `"CmdAlias"` marker (`P_MovePlayer`'s own `cmd->field` uses were all
+    /// reads) -- resolve for free through the ordinary `Expr::Assign`
+    /// fallback's own `render_expr(lhs, ..)` call, exactly as that
+    /// mechanism's own doc comment predicted. `player->mo->reactiontime--;`
+    /// surfaced a real, load-bearing gap in the *existing*, already-shipped
+    /// generic `PostIncDec`/`PreIncDec` arm (`A_ReFire`'s own `player->
+    /// refire++;`): that arm renders its target through a plain read and
+    /// appends `+= 1`/`-= 1` onto the result, fine for a bare self-struct
+    /// field but not for a field reached *through* `player.mo` -- the read
+    /// side of that chain (`is_self_bare_handle_field`) resolves to a
+    /// read-only `match thinkers.get(..) {..}` expression, not a real
+    /// Rust lvalue, so appending `-= 1` onto it doesn't compile at all
+    /// (confirmed a real `rustc` rejection on the naive translation
+    /// first). Fixed with a new, more specific `PostIncDec`/`PreIncDec`
+    /// arm ahead of the generic one, firing only when the target's own
+    /// base is `is_self_bare_handle_field`-shaped, reusing the exact same
+    /// fresh-`thinkers.get_mut(..)` write `player->mo->angle = ..`
+    /// already gets from its own dedicated `Expr::Assign` arm. Two more
+    /// narrow, real gaps, both confirmed by an actual `rustc` rejection
+    /// first: `cmd->forwardmove = 0xc800/512;` (`TicCmd.forwardmove: i8`)
+    /// -- `0xc800` (51200) doesn't fit `i8` on its own even though the
+    /// *divided* result (100) would, since Rust infers a literal's type
+    /// from its assignment target before evaluating, unlike C's own
+    /// promote-then-truncate-on-assign -- fixed with a new, narrowly-
+    /// scoped `as i8` wrap for a non-literal RHS assigned into `cmd`'s own
+    /// `forwardmove`/`sidemove` (the bare-literal sibling, `cmd->sidemove
+    /// = 0;`, needs no cast at all). `newweapon = (cmd->buttons&
+    /// BT_WEAPONMASK)>>BT_WEAPONSHIFT;` -- `TicCmd.buttons: u8`, but
+    /// `newweapon` (a plain, deferred-typed `weapontype_t` local) is
+    /// compared against/assigned into real `i32` fields everywhere else in
+    /// this same function -- `return_expr_needs_i32_cast` (already
+    /// closing the identical gap for `flags`, a `P_BoxOnLineSide`-era
+    /// mechanism) gains a new `Shr`-of-`BitAnd`-of-`buttons` shape, and the
+    /// `lhs_is_plain_int_local`-driven wrap that already consumes it grows
+    /// a `newweapon`-by-name exception since `weapontype_t` is a typedef,
+    /// not a bare `int` (`plain_int_locals` is only ever populated from
+    /// genuinely `int`-declared locals; `render_decl` gives every
+    /// `TypedefName` local, including this one, the same deferred
+    /// treatment regardless). Everything else -- `player->cheats &
+    /// CF_NOCLIP`, `player->mo->subsector->sector->special` (an ordinary
+    /// two-level cross-reference chain), `player->weaponowned[..]`/
+    /// `.powers[..]` array indexing, `gamemode`/`shareware`/`commercial`
+    /// comparisons, `P_UseLines`/`P_MovePsprites`/etc. as opaque forward-
+    /// referenced calls -- renders through fully generic, already-shipped
+    /// machinery. Verified compiling for real (`rustc --edition 2021
+    /// --crate-type bin`) against a hand-written `Player`/`TicCmd`/`Mobj`/
+    /// `Subsector`/`Sector`/`World`/`Handle`/`Arena`/`Thinker` stand-in,
+    /// including real `Index`/`IndexMut` impls for the two-level
+    /// `world[world[..].sector]` chain -- zero errors.
+    #[test]
+    fn test_p_player_think_renders_exactly() {
+        let field_types = field_types(&[
+            ("mo", "Option<Handle<Thinker>>"),
+            ("cmd", "TicCmd"),
+            ("cheats", "i32"),
+            ("playerstate", "i32"),
+            ("readyweapon", "i32"),
+            ("pendingweapon", "i32"),
+            ("weaponowned", "[bool; NUMWEAPONS]"),
+            ("powers", "[i32; NUMPOWERS]"),
+            ("usedown", "i32"),
+            ("damagecount", "i32"),
+            ("bonuscount", "i32"),
+            ("fixedcolormap", "i32"),
+        ]);
+        let rendered = render_fn(
+            &corpus_dir(),
+            "p_user.c",
+            "P_PlayerThink",
+            "Player",
+            &field_types,
+        )
+        .expect("should render cleanly");
+        let expected = "\
+pub fn P_PlayerThink(player: &mut Player, world: &mut World, thinkers: &mut Arena<Thinker>) {
+    let mut newweapon;
+    if (player.cheats & CF_NOCLIP) != 0 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.flags |= MF_NOCLIP; };
+    } else {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.flags &= !MF_NOCLIP; };
+    }
+    if (match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.flags, _ => unreachable!() } & MF_JUSTATTACKED) != 0 {
+        player.cmd.angleturn = 0;
+        player.cmd.forwardmove = (0xc800 / 512) as i8;
+        player.cmd.sidemove = 0;
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.flags &= !MF_JUSTATTACKED; };
+    }
+    if player.playerstate == PST_DEAD {
+        P_DeathThink(player);
+        return;
+    }
+    if match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.reactiontime, _ => unreachable!() } != 0 {
+        if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.reactiontime -= 1; };
+    } else {
+        P_MovePlayer(player);
+    }
+    P_CalcHeight(player);
+    if world[world[match thinkers.get(player.mo.unwrap()) { Some(Thinker::Mobj(m)) => m.subsector, _ => unreachable!() }].sector].special != 0 {
+        P_PlayerInSpecialSector(player);
+    }
+    if (player.cmd.buttons & BT_SPECIAL) != 0 {
+        player.cmd.buttons = 0;
+    }
+    if (player.cmd.buttons & BT_CHANGE) != 0 {
+        newweapon = ((player.cmd.buttons & BT_WEAPONMASK) >> BT_WEAPONSHIFT) as i32;
+        if newweapon == wp_fist && player.weaponowned[wp_chainsaw as usize] && !(player.readyweapon == wp_chainsaw && player.powers[pw_strength as usize] != 0) {
+            newweapon = wp_chainsaw;
+        }
+        if gamemode == commercial && newweapon == wp_shotgun && player.weaponowned[wp_supershotgun as usize] && player.readyweapon != wp_supershotgun {
+            newweapon = wp_supershotgun;
+        }
+        if player.weaponowned[newweapon as usize] && newweapon != player.readyweapon {
+            if newweapon != wp_plasma && newweapon != wp_bfg || gamemode != shareware {
+                player.pendingweapon = newweapon;
+            }
+        }
+    }
+    if (player.cmd.buttons & BT_USE) != 0 {
+        if player.usedown == 0 {
+            P_UseLines(player);
+            player.usedown = 1;
+        }
+    } else {
+        player.usedown = 0;
+    }
+    P_MovePsprites(player);
+    if player.powers[pw_strength as usize] != 0 {
+        player.powers[pw_strength as usize] += 1;
+    }
+    if player.powers[pw_invulnerability as usize] != 0 {
+        player.powers[pw_invulnerability as usize] -= 1;
+    }
+    if player.powers[pw_invisibility as usize] != 0 {
+        player.powers[pw_invisibility as usize] -= 1;
+        if player.powers[pw_invisibility as usize] == 0 {
+            if let Some(Thinker::Mobj(m)) = thinkers.get_mut(player.mo.unwrap()) { m.flags &= !MF_SHADOW; };
+        }
+    }
+    if player.powers[pw_infrared as usize] != 0 {
+        player.powers[pw_infrared as usize] -= 1;
+    }
+    if player.powers[pw_ironfeet as usize] != 0 {
+        player.powers[pw_ironfeet as usize] -= 1;
+    }
+    if player.damagecount != 0 {
+        player.damagecount -= 1;
+    }
+    if player.bonuscount != 0 {
+        player.bonuscount -= 1;
+    }
+    if player.powers[pw_invulnerability as usize] != 0 {
+        if player.powers[pw_invulnerability as usize] > 4 * 32 || (player.powers[pw_invulnerability as usize] & 8) != 0 {
+            player.fixedcolormap = INVERSECOLORMAP;
+        } else {
+            player.fixedcolormap = 0;
+        }
+    } else {
+        if player.powers[pw_infrared as usize] != 0 {
+            if player.powers[pw_infrared as usize] > 4 * 32 || (player.powers[pw_infrared as usize] & 8) != 0 {
+                player.fixedcolormap = 1;
+            } else {
+                player.fixedcolormap = 0;
+            }
+        } else {
+            player.fixedcolormap = 0;
+        }
     }
 }";
         assert_eq!(rendered, expected);
