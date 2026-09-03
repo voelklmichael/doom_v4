@@ -2154,6 +2154,42 @@ fn render_expr(e: &Expr, ctx: &FnBodyContext) -> Result<(String, bool), String> 
                 false,
             ))
         }
+        // `activeceilings[i] == c` / `plat == activeplats[i]`
+        // (`P_RemoveActiveCeiling`/`P_RemoveActivePlat`) -- comparing the
+        // `Option<Handle<Thinker>>`-typed "active movers" array
+        // (`active_array_variant`) against a bare, non-nullable `Handle<
+        // Thinker>`-typed parameter -- genuinely different from `source !=
+        // target`'s own arm just above despite the similar shape: there's
+        // **no** preceding `is_some()`/truthiness guard establishing the
+        // array side is non-`None` first (this scan's own very first per-
+        // iteration check, still `None` on every non-matching slot), so
+        // `.unwrap()`-ing the `Option` side the way that arm does would be
+        // a real, reachable panic here. Wraps the bare handle side in
+        // `Some(..)` instead and compares two `Option<Handle<Thinker>>`
+        // values directly, the read-side mirror of `lhs_is_activeplats_
+        // index`'s own write-side `Some(..)` wrap (`P_AddActivePlat`).
+        Expr::Binary { op, lhs, rhs }
+            if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (active_array_variant(lhs).is_some() || active_array_variant(rhs).is_some())
+                && (is_bare_handle_ident(lhs, ctx) || is_bare_handle_ident(rhs, ctx)) =>
+        {
+            let (lhs_text, _) = render_expr(lhs, ctx)?;
+            let lhs_text = if is_bare_handle_ident(lhs, ctx) {
+                format!("Some({lhs_text})")
+            } else {
+                lhs_text
+            };
+            let (rhs_text, _) = render_expr(rhs, ctx)?;
+            let rhs_text = if is_bare_handle_ident(rhs, ctx) {
+                format!("Some({rhs_text})")
+            } else {
+                rhs_text
+            };
+            Ok((
+                format!("{lhs_text} {} {rhs_text}", render_binop(*op)),
+                false,
+            ))
+        }
         // `player == &players[consoleplayer]` (`P_GiveWeapon`'s own "is
         // this the local console player" check, round 14) -- the
         // `PlayerId` sibling of `thing == tmthing` just above: a self-
@@ -4255,6 +4291,21 @@ fn render_stmt(s: &Stmt, ctx: &FnBodyContext, depth: usize) -> Result<Vec<String
         // place (`is_players_index_alias_assign`), so the two can never
         // drift apart on what counts.
         _ if is_players_index_alias_assign(s).is_some() => Ok(vec![]),
+        // `activeplats[i]->sector->specialdata = NULL;` -- see
+        // `active_array_sector_specialdata_reset`'s own doc comment for
+        // why this needs a real two-statement split rather than one
+        // `world[..]`-nested-in-its-own-index line (a genuine `rustc`
+        // `E0503` otherwise). Checked before the generic `Stmt::Expr`
+        // arm just below.
+        _ if active_array_sector_specialdata_reset(s).is_some() => {
+            let sector_expr = active_array_sector_specialdata_reset(s)
+                .expect("guarded by the arm's own condition above");
+            let (sector_text, _) = render_expr(sector_expr, ctx)?;
+            Ok(vec![
+                format!("{}let sector = {sector_text};", indent(depth)),
+                format!("{}world[sector].specialdata = None;", indent(depth)),
+            ])
+        }
         Stmt::Expr(Some(e)) => Ok(vec![format!(
             "{}{};",
             indent(depth),
@@ -5601,10 +5652,10 @@ fn render_for_step(step: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
 /// *itself* (`T_VerticalDoor`'s own "unlink and free" once a mover
 /// finishes), the single most common self-removal shape in the corpus
 /// (matching `Arena::remove`'s own doc comment on the same pattern). Only
-/// this exact shape is recognized -- removing some *other* handle
-/// (`P_RemoveThinker(&other->thinker)`) is a different, not-yet-attempted
-/// case, since it would need to *name* that other handle somehow rather
-/// than just reusing the receiver's own.
+/// this exact shape is recognized -- removing some *other* handle found
+/// through one of the two "active movers" arrays (`P_RemoveThinker(&
+/// activeplats[i]->thinker)`) is a different case, handled by this
+/// function's own sibling `active_array_removal_index` just below instead.
 fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
     let Expr::Call { callee, args } = e else {
         return false;
@@ -5644,6 +5695,103 @@ fn is_self_removal_call(e: &Expr, self_param: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// `P_RemoveThinker(&activeplats[i]->thinker);` / `&activeceilings[j]->
+/// thinker` (`P_RemoveActivePlat`/`P_RemoveActiveCeiling`) --
+/// `is_self_removal_call`'s own sibling for removing a *different*
+/// thinker than the receiver, specifically one found through one of the
+/// two "active movers" arrays (`active_array_variant`) -- exactly the
+/// "not-yet-attempted" case that function's own earlier doc comment
+/// flagged. Returns the array-index expression itself (`activeplats[i]`)
+/// when matched, so the caller can render a fresh `thinkers.remove(..)`
+/// naming that handle directly, rather than reusing a fixed `handle`
+/// parameter the way self-removal does (this shape never needs
+/// `render_fn_impl`'s own `handle`/`arena` extra-parameter machinery at
+/// all -- `render_trigger_fn` already always supplies `thinkers`).
+fn active_array_removal_index(e: &Expr) -> Option<&Expr> {
+    let Expr::Call { callee, args } = e else {
+        return None;
+    };
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    if !matches!(callee.as_ref(), Expr::Ident(n) if n == "P_RemoveThinker") {
+        return None;
+    }
+    let Expr::Unary {
+        op: UnaryOp::AddrOf,
+        expr,
+    } = arg
+    else {
+        return None;
+    };
+    let Expr::Member {
+        base,
+        field,
+        arrow: true,
+    } = expr.as_ref()
+    else {
+        return None;
+    };
+    if field != "thinker" {
+        return None;
+    }
+    active_array_variant(base).is_some().then(|| base.as_ref())
+}
+
+/// `activeplats[i]->sector->specialdata = NULL;` / `activeceilings[j]->
+/// sector->specialdata = NULL;` (`P_RemoveActivePlat`/`P_RemoveActive
+/// Ceiling`) -- the two-level `Member` chain off one of the "active
+/// movers" arrays that reads `.sector` (now itself flagged cross-
+/// reference-typed, `active_array_variant`'s own `Expr::Member` arm) and
+/// immediately indexes back into `world` with it in the very same
+/// statement. Rendered directly as one line (`world[<sector-read>].
+/// specialdata = None;`) this is a real, reachable `rustc` `E0503`
+/// rejection, confirmed by trying the naive one-line translation first,
+/// not assumed: the index *argument* to `world`'s own `IndexMut` call
+/// itself reads `world.active{plats,ceilings}[..]` again, and unlike two-
+/// phase borrows' usual `vec.push(vec.len())`-style rescue, that leniency
+/// doesn't extend to the desugared `IndexMut::index_mut` call behind
+/// indexing syntax -- so the `sector` value has to be read into its own
+/// local *before* the mutable index starts. Returns the inner `EXPR->
+/// sector` sub-expression (not yet rendered) so the caller (a dedicated
+/// `render_stmt` arm) can split this into two statements instead of one.
+fn active_array_sector_specialdata_reset(s: &Stmt) -> Option<&Expr> {
+    let Stmt::Expr(Some(Expr::Assign {
+        op: AssignOp::Assign,
+        lhs,
+        rhs,
+    })) = s
+    else {
+        return None;
+    };
+    if !matches!(rhs.as_ref(), Expr::Ident(n) if n == "NULL") {
+        return None;
+    }
+    let Expr::Member {
+        base: outer_base,
+        field: outer_field,
+        arrow: true,
+    } = lhs.as_ref()
+    else {
+        return None;
+    };
+    if outer_field != "specialdata" {
+        return None;
+    }
+    let Expr::Member {
+        base: inner_base,
+        field: inner_field,
+        arrow: true,
+    } = outer_base.as_ref()
+    else {
+        return None;
+    };
+    if inner_field != "sector" || active_array_variant(inner_base).is_none() {
+        return None;
+    }
+    Some(outer_base.as_ref())
 }
 
 /// `P_SetMobjState(<target>, <state>)` in statement position --
@@ -6137,6 +6285,19 @@ fn render_expr_stmt(e: &Expr, ctx: &FnBodyContext) -> Result<String, String> {
     // caller supplies them by hand.
     if is_self_removal_call(e, ctx.self_param) {
         return Ok(format!("{}.remove(handle)", ctx.self_removal_ident));
+    }
+    // `P_RemoveThinker(&activeplats[i]->thinker);` (`P_RemoveActivePlat`/
+    // `P_RemoveActiveCeiling`) -- `is_self_removal_call`'s own sibling
+    // just above, but removing a handle found through one of the two
+    // "active movers" arrays rather than reusing a fixed `handle`
+    // parameter. `render_trigger_fn` already always supplies `thinkers`
+    // (every caller reaching this shape already reads/writes through
+    // `activeplats`/`activeceilings`), so this needs no new signature
+    // machinery at all -- unlike self-removal's own `handle`/`arena`,
+    // still not threaded through a real function signature.
+    if let Some(index_expr) = active_array_removal_index(e) {
+        let (index_text, _) = render_expr(index_expr, ctx)?;
+        return Ok(format!("thinkers.remove({index_text}.unwrap())"));
     }
     // `P_SetMobjState(actor, actor->info->seestate);` -- round 20's own
     // retrofit of round 19's real `P_SetMobjState` translation into its
@@ -18181,6 +18342,128 @@ pub fn T_PlatRaise(plat: &mut Plat, world: &mut World) {
              }\n        \
              i += 1;\n    \
              }\n\
+             }"
+        );
+    }
+
+    /// `P_RemoveActiveCeiling` (`p_ceilng.c`) -- round 30's own flagged
+    /// blocker list item (1): removing a thinker found through
+    /// `activeceilings[i]`, *not* the receiver itself -- `is_self_removal
+    /// _call`'s own doc comment named this exact shape "not-yet-
+    /// attempted". Corpus-verified in full first (`p_ceilng.c:270-286`,
+    /// all ~15 real lines). Three genuinely new pieces: (1) `activeceilings
+    /// [i] == c` -- comparing the `Option<Handle<Thinker>>` array against a
+    /// bare `Handle<Thinker>` parameter with *no* preceding `is_some()`
+    /// guard (unlike `P_DamageMobj`'s own `source != target`, safe to
+    /// `.unwrap()` only because a guard already ran) -- needed its own new
+    /// `Some(..)`-wrap comparison arm rather than reusing that one, since
+    /// `.unwrap()`-ing a scan's own still-`None` slots would be a real,
+    /// reachable panic. (2) `P_RemoveThinker(&activeceilings[i]->thinker)`
+    /// is the new `active_array_removal_index`/`render_expr_stmt` arm (see
+    /// its own doc comment) -- renders straight through the already-generic
+    /// `thinkers.remove(..)` primitive, no new signature machinery needed
+    /// at all (`render_trigger_fn` already always supplies `thinkers`
+    /// here). (3) `activeceilings[i]->sector->specialdata = NULL;` -- the
+    /// naive one-line `world[<sector-read-through-activeceilings>].
+    /// specialdata = None;` translation is a real, reachable `rustc`
+    /// `E0503` (confirmed by trying it first, not assumed): the index
+    /// *argument* to `world`'s own `IndexMut` call itself reads
+    /// `world.activeceilings[..]` again, and unlike two-phase borrows'
+    /// usual `vec.push(vec.len())`-style rescue, that leniency doesn't
+    /// extend to the desugared `IndexMut::index_mut` call behind indexing
+    /// syntax. Fixed with a new `render_stmt` arm
+    /// (`active_array_sector_specialdata_reset`) splitting this into two
+    /// real statements: `let sector = ...;` then `world[sector].
+    /// specialdata = None;`. The match-arm-bound variable
+    /// `active_array_variant` fixes for `Ceiling` (`"c"`) happens to
+    /// collide textually with this function's own `c` parameter name --
+    /// harmless, ordinary Rust shadowing scoped to just that one `match`
+    /// arm's own expression, confirmed by the real `rustc` compile below.
+    /// Compile-verified for real (`rustc --edition 2021 --crate-type bin`)
+    /// against a hand-written `Ceiling`/`Sector`/`World`/`Handle`/`Arena`/
+    /// `Thinker` stand-in, run (not just compiled) to confirm the removal
+    /// and `specialdata` reset actually take effect -- zero errors.
+    /// `test_p_remove_active_ceiling_renders_exactly`.
+    #[test]
+    fn test_p_remove_active_ceiling_renders_exactly() {
+        let params = field_types(&[("c", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_ceilng.c",
+            "P_RemoveActiveCeiling",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_RemoveActiveCeiling(c: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             i = 0;\n    \
+             while i < MAXCEILINGS {\n        \
+             if world.activeceilings[i as usize] == Some(c) {\n            \
+             let sector = match thinkers.get(world.activeceilings[i as usize].unwrap()) { Some(Thinker::Ceiling(c)) => c.sector, _ => unreachable!() };\n            \
+             world[sector].specialdata = None;\n            \
+             thinkers.remove(world.activeceilings[i as usize].unwrap());\n            \
+             world.activeceilings[i as usize] = None;\n            \
+             break;\n        \
+             }\n        \
+             i += 1;\n    \
+             }\n\
+             }"
+        );
+    }
+
+    /// `P_RemoveActivePlat` (`p_plats.c`) -- `P_RemoveActiveCeiling`'s own
+    /// exact twin (`Plat`/`activeplats` over `Ceiling`/`activeceilings`,
+    /// reusing all three of its new pieces -- the `Some(..)`-wrap
+    /// comparison, `active_array_removal_index`, and the `let sector = ..;`
+    /// split), corpus-verified in full first (`p_plats.c:295-307`, all ~13
+    /// real lines) rather than assumed from its sibling's shape. Genuinely
+    /// different in three small, already-proven ways: the comparison is
+    /// written the other way around (`plat == activeplats[i]`, the bare
+    /// handle on the *left* -- the new comparison arm already checks both
+    /// sides); the match exits via a bare `return;` (already-generic, no
+    /// `break`/loop-label machinery needed) instead of `break;`; and a
+    /// trailing `I_Error ("P_RemoveActivePlat: can't find plat!");` after
+    /// the loop for the not-found case, reusing `P_AddActivePlat`'s own
+    /// already-shipped bare-string-literal `I_Error` call rendering
+    /// verbatim. No other new mechanism needed. Compile-verified for real
+    /// (`rustc --edition 2021 --crate-type bin`) against a hand-written
+    /// `Plat`/`Sector`/`World`/`Handle`/`Arena`/`Thinker` stand-in, run (not
+    /// just compiled), including the not-found `I_Error` panic path -- zero
+    /// errors. `test_p_remove_active_plat_renders_exactly`.
+    #[test]
+    fn test_p_remove_active_plat_renders_exactly() {
+        let params = field_types(&[("plat", "Handle<Thinker>")]);
+        let rendered = render_trigger_fn(
+            &corpus_dir(),
+            "p_plats.c",
+            "P_RemoveActivePlat",
+            &params,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("should render cleanly");
+        assert_eq!(
+            rendered,
+            "pub fn P_RemoveActivePlat(plat: Handle<Thinker>, world: &mut World, thinkers: &mut Arena<Thinker>) {\n    \
+             let mut i;\n    \
+             i = 0;\n    \
+             while i < MAXPLATS {\n        \
+             if Some(plat) == world.activeplats[i as usize] {\n            \
+             let sector = match thinkers.get(world.activeplats[i as usize].unwrap()) { Some(Thinker::Plat(p)) => p.sector, _ => unreachable!() };\n            \
+             world[sector].specialdata = None;\n            \
+             thinkers.remove(world.activeplats[i as usize].unwrap());\n            \
+             world.activeplats[i as usize] = None;\n            \
+             return;\n        \
+             }\n        \
+             i += 1;\n    \
+             }\n    \
+             I_Error(\"P_RemoveActivePlat: can't find plat!\");\n\
              }"
         );
     }
