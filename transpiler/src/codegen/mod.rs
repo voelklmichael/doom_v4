@@ -15,7 +15,7 @@ pub mod use_stmt;
 pub mod visibility;
 pub mod world;
 
-pub use action_fn::{render_action_fn_enum, render_p_set_mobj_state_fn};
+pub use action_fn::{render_action_fn_enum, render_p_set_mobj_state_fn, render_p_set_psprite_fn};
 pub use enum_values::{compute_enum_values, fold_const_int, render_enum_consts};
 pub use function_body::{
     CtorSpec, render_fn, render_spawn_fn, render_trigger_fn, render_weapon_fn,

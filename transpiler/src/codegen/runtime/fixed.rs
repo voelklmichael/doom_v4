@@ -40,7 +40,8 @@
 //! and mixing the two meanings under one name would be wrong.
 
 use std::ops::{
-    Add, AddAssign, BitAnd, BitXor, Div, Mul, Neg, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
+    Add, AddAssign, BitAnd, BitXor, Div, Mul, MulAssign, Neg, Shl, ShlAssign, Shr, ShrAssign, Sub,
+    SubAssign,
 };
 
 pub const FRACBITS: u32 = 16;
@@ -161,6 +162,16 @@ impl Mul<i32> for FixedT {
 impl AddAssign<i32> for FixedT {
     fn add_assign(&mut self, rhs: i32) {
         self.0 = self.0.wrapping_add(rhs);
+    }
+}
+
+/// `thrust *= 4;` (`P_DamageMobj`, `p_inter.c`) -- the compound-assign
+/// sibling of `Mul<i32> for FixedT` above, needed for the same "no
+/// rescaling, just raw representation arithmetic" idiom `AddAssign<i32>`
+/// already established for `+=`.
+impl MulAssign<i32> for FixedT {
+    fn mul_assign(&mut self, rhs: i32) {
+        self.0 = self.0.wrapping_mul(rhs);
     }
 }
 
@@ -441,6 +452,15 @@ mod tests {
         let mut z = FixedT(100);
         z += 5;
         assert_eq!(z, FixedT(100) + 5);
+    }
+
+    #[test]
+    fn test_mul_assign_i32_matches_mul_i32() {
+        // `thrust *= 4;` (`P_DamageMobj`) -- the compound-assign sibling
+        // of `Mul<i32>`, staying consistent with it.
+        let mut thrust = FixedT(100);
+        thrust *= 4;
+        assert_eq!(thrust, FixedT(100) * 4);
     }
 
     #[test]
